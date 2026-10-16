@@ -169,7 +169,7 @@ class AuthorizeReplaceTest(MsbctlTest):
         code, _, err = self.run_main("host", "authorize", KEY)
         self.assertNotEqual(code, 0)
         self.assertIn("--replace", err)
-        code, _, err = self.run_main("host", "authorize", "--replace", KEY)
+        code, _, err = self.run_main("host", "authorize", KEY, "--replace")
         self.assertEqual(code, 0, err)
         with open(path, encoding="utf-8") as fh:
             lines = fh.read().splitlines()

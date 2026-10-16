@@ -8179,10 +8179,13 @@ def remote_restrict_key(name, dest):
     if replace:
         warn(f"this key logs in to {name} with a shell now; restricted, it no longer will.")
         warn("Keep another way in first: a password, the console, or an admin key")
-        warn("(`ssh-keygen -t ed25519-sk`, then `msbctl host authorize --admin` on the host).")
+        warn("(`ssh-keygen -t ed25519-sk`, then `msbctl host authorize '<its .pub line>' --admin` on the host).")
         if not confirm("restrict it anyway?"):
             return
-    proc = remote_sh(dest, 'msbctl host authorize "$@"', *(["--replace"] if replace else []), line)
+    # The key line before the flag: before Python 3.12, argparse settles the
+    # optional KEY positional as soon as it sees `authorize`, and a key after
+    # --replace is then an unrecognized argument.
+    proc = remote_sh(dest, 'msbctl host authorize "$@"', line, *(["--replace"] if replace else []))
     if proc.returncode:
         die(f"authorizing the key on {name} failed (above)")
     # The shared connection still has the old key's shell: close it, so the
@@ -8232,7 +8235,7 @@ def cmd_remote(args, config):
         note(f"  msbctl host authorize \"{line}\"")
         note("")
         note("For policy changes from here, use a SEPARATE key the agent does not hold —")
-        note("a FIDO2 one: `ssh-keygen -t ed25519-sk`, then on the host `msbctl host authorize --admin`.")
+        note("a FIDO2 one: `ssh-keygen -t ed25519-sk`, then on the host `msbctl host authorize '<its .pub line>' --admin`.")
         say(f"Testing {name}")
         # Not batch mode, this once: an unknown host key has to be accepted at
         # a prompt, and BatchMode fails on it with a message that does not say so.
