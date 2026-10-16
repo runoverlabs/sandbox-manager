@@ -8,6 +8,11 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- Remote hosts from the menu: bare `msbctl` → **remote hosts** adds, sets up, tests and removes them, and `msbctl remote setup NAME` installs what a host is missing (msb, msbctl, autostart) and restricts your key there, asking before each step.
+- With remotes configured, `msbctl add` asks where the new sandbox should run, and the menu's sidebar lists every remote's sandboxes too.
+- `msbctl host authorize --replace` rewrites a key's existing line, so a key that already has a shell can be restricted.
+
 ### Fixed
 - Bare `msbctl` → "register a new project" crashed with `AttributeError: 'Namespace' object has no attribute 'repo'`, and "refresh version info" likewise.
 

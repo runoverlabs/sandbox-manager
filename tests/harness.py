@@ -110,6 +110,7 @@ class MsbctlTest(TestCase):
             stack.enter_context(mock.patch.object(sys, "argv", ["msbctl", *argv]))
             stack.enter_context(mock.patch.object(sys, "stdin", fake_in))
             stack.enter_context(mock.patch.object(self.m, "preflight", lambda args: None))
+            stack.enter_context(mock.patch.object(self.m, "local_problem", lambda: None))
             stack.enter_context(mock.patch.object(self.m, "ensure_agent_filter", lambda box: None))
             stack.enter_context(mock.patch.object(self.m, "stop_agent_filter", lambda box: None))
             stack.enter_context(mock.patch("urllib.request.urlopen", _no_network))

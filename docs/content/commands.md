@@ -32,9 +32,12 @@ msbctl add --repo owner/name [--ref REF] [--name NAME] [--guest-path PATH]
            [--workspace-disk SIZE] [--identity NAME] [--claude-token NAME] [--autostart] [-y]
 ```
 
-Register a project with the setup wizard. Nothing is started. `--remote HOST`
-registers it on [a remote](remote-hosts.md#on-the-laptop) instead: the rest of
-the arguments are run there. A bare name
+Register a project with the setup wizard. Nothing is started. With
+[remotes](remote-hosts.md#on-the-laptop) configured and no folder given, it
+first asks where the sandbox should run: this machine or one of them. On a
+remote it asks for the repo and the sandbox's name, then runs the host's own
+`add --repo` over ssh for the rest, and offers to start it. `--remote HOST`
+skips the question: the rest of the arguments are run there. A bare name
 resolves under your workspaces folder and is created if missing; a path
 starting with `/`, `~`, `./` or `../` is taken as written. Without an argument
 it asks, defaulting to the current directory. It also asks where the project
@@ -72,7 +75,9 @@ msbctl status [--quick]
 ```
 
 One block per sandbox, as shown beside the menu: state, RAM and CPU, identity,
-image, folder. `--quick` skips reading figures from inside each guest.
+image, folder. Then each remote's sandboxes, one line each, asked for as `ls`
+asks. `--quick` skips reading figures from inside each guest, and shows the
+remotes from what `ls` last cached, with no ssh.
 
 ### `msbctl show`
 
@@ -387,7 +392,7 @@ the same way the installer does. In a git checkout it tells you to `git pull`.
 
 ```text
 msbctl host serve
-msbctl host authorize "PUBLIC KEY LINE" [--admin]
+msbctl host authorize "PUBLIC KEY LINE" [--admin] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
 ```
@@ -397,7 +402,8 @@ forced command a laptop's key runs: it reads `SSH_ORIGINAL_COMMAND`, refuses
 anything outside [its allowlist](remote-hosts.md#what-the-restricted-key-may-run)
 with exit status 126, and runs the rest with `MSB_RESTRICTED=1`. `authorize`
 adds a key to `~/.ssh/authorized_keys` with that forced command, or with
-`--admin` without one. `check` reports the host's hygiene, as heuristics.
+`--admin` without one; a key that's already there is refused unless
+`--replace`, which rewrites its line. `check` reports the host's hygiene, as heuristics.
 `autostart install` writes and enables a systemd user unit that runs `msbctl
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
 
@@ -405,14 +411,20 @@ start --autostart` at boot. Under `host serve`, only `check` is allowed.
 
 ```text
 msbctl remote add NAME user@host
+msbctl remote setup NAME
 msbctl remote ls
 msbctl remote test NAME
 msbctl remote rm NAME
 ```
 
-The other machines this one drives. `add` records `[remotes.NAME]` in
-`config.toml`, prints the `msbctl host authorize` line to run there, and tests
-the connection interactively (so a new host key can be accepted). `test` runs
+The other machines this one drives; the menu's **remote hosts** does the same.
+`add` records `[remotes.NAME]` in `config.toml`. At a terminal it then runs
+`setup`; otherwise it prints the `msbctl host authorize` line to run there and
+tests the connection. `setup` looks at the host over ssh and offers, one
+question each, what's missing: msb, msbctl at this machine's version,
+the kvm group, autostart, and last restricting this machine's key to
+`host serve` (it warns first when that key is the one with a shell there). Then
+it tests. `test` runs
 the host's `host check` and warns about an unrestricted key or a version
 mismatch. `rm` forgets it; the host isn't touched. Then `NAME:sandbox`
 addresses a sandbox there for every verb, and `ls` shows every host. See

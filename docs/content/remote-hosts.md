@@ -71,21 +71,43 @@ whether it found one.
 
 ## On the laptop
 
-Register the host once:
+The quickest way is the menu: bare `msbctl` → **remote hosts** → **add a remote
+host**, then the ssh destination. Or:
 
 ```console
 $ msbctl remote add sbx-01 msb@sbx-01.tailnet.ts.net
 ```
 
-That records `[remotes.sbx-01]` in your `config.toml`, prints the
-`msbctl host authorize` line to run on the host (listing the keys in your agent
-and `~/.ssh`), and tests the connection: this once without ssh's batch mode, so
-you can accept the host key at the prompt. `msbctl remote test sbx-01` runs the
+Either way, at a terminal it goes straight on to `msbctl remote setup sbx-01`,
+which does the host's half from here while your key still has a shell there.
+It looks at the host and asks before each step:
+
+- install msb with microsandbox's installer, and msbctl at this machine's
+  version (a checkout installs the latest release);
+- add the user to the `kvm` group if it can't open `/dev/kvm` (with `sudo -n`,
+  if that works without a password);
+- install autostart, and turn lingering on the same way;
+- restrict one of your keys to `msbctl host serve`. The default is *not now*.
+  If the key you pick is the one you log in with, it warns that you lose its
+  shell, so keep another way in first: a password, the console, or an admin
+  key.
+
+Then it runs `remote test`. Run `remote setup` again whenever you like: it
+asks only about what's still missing, and once your key runs `host serve`
+it just tests.
+
+Without a terminal, `remote add` records `[remotes.sbx-01]` in your
+`config.toml`, prints the `msbctl host authorize` line to run on the host
+(listing the keys in your agent and `~/.ssh`), and tests the connection.
+`msbctl remote test sbx-01` runs the
 host's `host check` again from here and warns if your key isn't the restricted
 one or the two msbctl versions differ. `remote ls` lists them with the last
 test's result, `remote rm` forgets one (the host is untouched).
 
-Then a sandbox there is `sbx-01:name`, for every verb:
+Then `msbctl add` (or the menu's **register a new project**) asks where the
+sandbox should run, and on a remote asks for the repo and its name and hands
+the rest to the host's own wizard. Or skip the question with `--remote`. A
+sandbox there is `sbx-01:name`, for every verb:
 
 ```console
 $ msbctl add --remote sbx-01 --repo acme/webshop -y

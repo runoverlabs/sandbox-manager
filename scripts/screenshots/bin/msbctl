@@ -7,4 +7,5 @@ spec = importlib.util.spec_from_file_location("msbctl", real, loader=loader)
 mod = importlib.util.module_from_spec(spec)
 loader.exec_module(mod)
 mod.preflight = lambda args: None
+mod.local_problem = lambda: None
 mod.main()
