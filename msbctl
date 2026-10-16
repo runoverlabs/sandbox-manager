@@ -21,6 +21,7 @@
     msbctl resize <name>          change cpus / memory / root disk, keeping its state
     msbctl cache <name> [ls|clear [key]]   the package-cache disks
     msbctl allow <name> host…     add egress rules (then rebuild to apply)
+    msbctl policy <name> [approve]   the project policy it is pinned to; approve a change
     msbctl observe <name> [on|off|report]   stop blocking and record what is reached
     msbctl secret add|rm|ls <name>   extra tokens the sandbox can use but not see
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
@@ -861,6 +862,14 @@ class Sandbox:
             # the host. Without it you get files you cannot rm without help.
             "--mount-dir", f"{self.project}:{self.guest_project}:uid={uid},gid={gid}",
         ]
+        # The project's .msb/ again, read-only, over the read-write mount (in
+        # this order: spike 15). It is the policy the host reads at the next
+        # rebuild. A tripwire, not the control: root in the guest can umount
+        # it (spike 15 again), and the policy pin is what actually stops an edit
+        # from inside the sandbox from being applied. This only makes the edit
+        # fail at once, with EROFS, instead of waiting for the operator.
+        if os.path.isdir(os.path.join(self.project, ".msb")):
+            flags += ["--mount-dir", f"{self.project}/.msb:{self.guest_project}/.msb:ro"]
 
         for src, dest, mode in self.extra_mounts:
             if not os.path.isdir(src):
@@ -2050,6 +2059,181 @@ def warn_missing_prereqs(box):
     note("   Continuing; the bootstrap reports what actually failed.")
 
 
+# ---------------------------------------------------------- the policy pin
+#
+# The project's .msb/sandbox.toml decides what may leave the sandbox, which host
+# a stored value is substituted toward, and what the sandbox takes from the
+# host. It is also committed, and writable from inside the sandbox through the
+# project mount. So what it says is not applied just because it says it: the
+# values in PINNED_KEYS are recorded (a digest in the registry entry, the values
+# themselves under STATE_DIR) when the operator approves them, and a create or
+# rebuild that finds them changed shows the difference and asks. Without a
+# terminal, or under `msbctl host serve`, it refuses: a prompt is something code
+# on the other end of a pty can answer as easily as a person.
+#
+# Only the PROJECT layer is pinned. The registry entry and config.toml are the
+# operator's own files, outside every sandbox, and are not re-approved.
+
+PINNED_KEYS = (
+    "rule_groups",          # which egress groups apply
+    "extra_rules",          # and the project's own rules
+    "allow_private_dns",    # whether names may resolve to LAN addresses
+    "secret_binds",         # which host a stored value is substituted toward
+    "secrets",              # whether GH_TOKEN is bound at all
+    # Resources resolve through _pick too, so a commit saying memory = "256G"
+    # or a 4T root disk lands on the next rebuild — on a host that stands alone,
+    # with nobody watching it.
+    "cpus", "memory", "root_disk", "containers_disk", "caches",
+)
+# NOT pinned, on purpose: `image`, [bootstrap] and [env] act only inside the
+# guest, which is what the sandbox is for, and `conf` only names the file the
+# image is read from (and must stay in the project).
+
+POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
+
+
+def restricted():
+    """True under `msbctl host serve`: nothing that approves a policy may ask."""
+    return os.environ.get("MSB_RESTRICTED") == "1"
+
+
+def project_policy(box):
+    """The project-layer values the pin covers."""
+    return {k: box.project_cfg[k] for k in PINNED_KEYS if k in box.project_cfg}
+
+
+def policy_digest(policy):
+    blob = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def approved_path(name):
+    return os.path.join(POLICY_APPROVED_DIR, f"{name}.json")
+
+
+def policy_pinned(box):
+    """Whether the project's current values are the approved ones."""
+    return box.entry.get("policy_pin") == policy_digest(project_policy(box))
+
+
+def _policy_value(value):
+    return json.dumps(value) if not isinstance(value, str) else f'"{value}"'
+
+
+def policy_diff(old, new):
+    """Lines describing what changed from `old` to `new` (None: never recorded)."""
+    if old is None:
+        lines = ["first time this sandbox's policy is recorded:"]
+        lines += [f"  {k} = {_policy_value(v)}" for k, v in sorted(new.items())] or ["  (nothing)"]
+        return lines
+    lines = []
+    for key in sorted(set(old) | set(new)):
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        if key not in old:
+            lines.append(f"+ {key} = {_policy_value(after)}")
+        elif key not in new:
+            lines.append(f"- {key} = {_policy_value(before)}")
+        elif isinstance(before, list) and isinstance(after, list):
+            lines.append(f"  {key}:")
+            lines += [f"+   {item}" for item in after if item not in before]
+            lines += [f"-   {item}" for item in before if item not in after]
+        elif isinstance(before, dict) and isinstance(after, dict):
+            lines.append(f"  [{key}]")
+            for sub in sorted(set(before) | set(after)):
+                if before.get(sub) != after.get(sub):
+                    if sub in before:
+                        lines.append(f"-   {sub} = {_policy_value(before[sub])}")
+                    if sub in after:
+                        lines.append(f"+   {sub} = {_policy_value(after[sub])}")
+        else:
+            lines.append(f"  {key}: {_policy_value(before)} -> {_policy_value(after)}")
+    return lines
+
+
+def approved_policy(name):
+    """The approved values, or None if none were ever recorded for `name`."""
+    path = approved_path(name)
+    if not os.path.isfile(path):
+        return None
+    return read_json(path)
+
+
+def approve_policy(box):
+    """Record the project's current values as approved, for `box` as loaded."""
+    policy = project_policy(box)
+    os.makedirs(POLICY_APPROVED_DIR, mode=0o700, exist_ok=True)
+    path = approved_path(box.name)
+    fd, tmp = tempfile.mkstemp(dir=POLICY_APPROVED_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(policy, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    digest = policy_digest(policy)
+    set_toml_key(registry_path(box), "policy_pin", digest)
+    box.entry["policy_pin"] = digest
+
+
+def check_policy(box, why):
+    """Return if the project's pinned values are the approved ones; otherwise show
+    what changed and ask, or die where nobody may be asked. `why` names what
+    wants to apply them ("create", "allow")."""
+    if policy_pinned(box):
+        return
+    current = project_policy(box)
+    previous = approved_policy(box.name)
+    if previous is None and not current and not box.entry.get("policy_pin"):
+        approve_policy(box)        # nothing to approve: the project sets none of it
+        return
+    say(f"{box.name}: the project's policy changed since it was approved")
+    note(f"from {tilde(project_path(box))}, before {why}:")
+    for line in policy_diff(previous, current):
+        note(f"  {line}")
+    if restricted() or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(f"{box.name}: policy not approved — run `msbctl policy {box.name} approve` on the "
+            "host, or with your admin key")
+    if confirm(f"approve this policy for {box.name}?"):
+        approve_policy(box)
+        note("approved")
+    else:
+        die("not approved, nothing changed")
+
+
+def cmd_policy(args, config):
+    """policy <name> [show|approve] — the project-layer values the pin covers."""
+    box = Sandbox(args.name, config)
+    if args.action == "approve":
+        if restricted():
+            die("approving a policy is refused here — run it on the host, or with your admin key")
+        if policy_pinned(box):
+            note(f"{box.name}: the project's policy is the approved one")
+            return
+        check_policy(box, "approving")
+        return
+    say(f"{box.name}  policy  [{'approved' if policy_pinned(box) else 'NOT APPROVED'}]")
+    note(f"from {tilde(project_path(box))}")
+    current = project_policy(box)
+    for key in PINNED_KEYS:
+        if key in current:
+            note(f"  {key} = {_policy_value(current[key])}")
+    if not current:
+        note("  (the project sets none of the pinned keys)")
+    if not policy_pinned(box):
+        say("Changes since the last approval")
+        for line in policy_diff(approved_policy(box.name), current):
+            note(f"  {line}")
+        note(f"`msbctl policy {box.name} approve` to accept them")
+
+
+def refuse_before_create(box):
+    """Everything that stops a create, checked BEFORE anything is removed: a
+    rebuild or rename that tore the VM down first and then refused would leave
+    nothing where a running sandbox was."""
+    refuse_conf_problems(box)
+    refuse_reserved_bindings(box)
+    check_policy(box, "create")
+
+
 def is_reserved_var(var):
     """Variables with a FIXED binding: GH_TOKEN (github.com, api.github.com) and
     every Claude token (Anthropic's hosts). No `secret_binds` entry, in any
@@ -2089,8 +2273,7 @@ def refuse_conf_problems(box):
 
 def do_create(box):
     say(f"Creating {box.name}")
-    refuse_conf_problems(box)
-    refuse_reserved_bindings(box)
+    refuse_before_create(box)
     warn_missing_prereqs(box)
     ensure_agent_filter(box)
     secret_flags, env = box.secret_env()
@@ -2204,6 +2387,7 @@ def cmd_rebuild(args, config):
     note("`msbctl resize`). Packages installed")
     note("by hand are lost; anything in bootstrap.sh comes back. Package caches,")
     note("container images and the Claude state are kept.")
+    refuse_before_create(box)
     run(["msb", "stop", box.name], check=False, quiet=True)
     run(["msb", "rm", box.name], check=False, quiet=True)
     do_create(box)
@@ -2235,7 +2419,7 @@ def cmd_purge(args, config):
     stop_agent_filter(box)
     shutil.rmtree(box.state, ignore_errors=True)
     remove_sandbox_volumes(box)
-    for path in (secret, entry):
+    for path in (secret, entry, approved_path(box.name)):
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -2297,7 +2481,8 @@ def rename_sandbox(box, new):
     old = box.name
     moves = [(os.path.join(SECRETS_DIR, f"{old}.env"), os.path.join(SECRETS_DIR, f"{new}.env")),
              (box.state, os.path.join(STATE_DIR, "claude", new)),
-             (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log"))]
+             (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log")),
+             (approved_path(old), approved_path(new))]
     # Checked before anything is destroyed, so a refusal leaves it all as it was.
     clash = [dst for src, dst in moves if os.path.exists(src) and os.path.exists(dst)]
     if clash:
@@ -2345,6 +2530,7 @@ def cmd_rename(args, config):
         die(problem)
     say(f"Renaming {box.name} to {args.new}")
     if state_of(box.name) != "absent":
+        refuse_before_create(box)
         explain_rename()
         if not args.yes and not confirm(f"rename {box.name} to {args.new}?"):
             return
@@ -2814,7 +3000,11 @@ def cmd_allow(args, config):
         target = os.path.join(REGISTRY_DIR, f"{box.name}.toml")
     else:
         target = sandbox_toml
+    # Before writing: a change someone else made to the project's policy is
+    # shown and asked about on its own, not approved along with this one.
+    check_policy(box, "adding rules")
     added = append_toml_list(target, "extra_rules", fresh, after_key="rule_groups")
+    approve_policy(Sandbox(box.name, config))
     for rule in added:
         note(f"allowed: {rule}")
     note(f"written to {tilde(target)}")
@@ -3489,7 +3679,9 @@ def cmd_secret(args, config):
         spec = next((x for x in box.secret_binds if secret_var(x) == args.var), None)
         if not spec:
             die(f"{box.name} has no secret {args.var!r} (`msbctl secret ls {box.name}`)")
+        check_policy(box, "removing a secret")
         remove_from_toml_list(target, "secret_binds", spec)
+        approve_policy(Sandbox(box.name, config))
         state = state_of(box.name)
         if state != "absent":
             _, secret_vars = box.secret_env()
@@ -3509,6 +3701,7 @@ def cmd_secret(args, config):
     spec, preset = picked
     if is_reserved_var(secret_var(spec)):
         die(f"{secret_var(spec)} has a fixed binding and cannot be bound again")
+    check_policy(box, "adding a secret")
     if preset:
         note(f"create it at {preset.get('help', '(see the provider)')}")
         if preset.get("usage"):
@@ -3519,6 +3712,7 @@ def cmd_secret(args, config):
         return
     store_secret_value(box.name, secret_var(spec), value)
     append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
+    approve_policy(Sandbox(box.name, config))
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
         return
@@ -4554,6 +4748,7 @@ def section_place(box, config, ctx):
     if problem:
         die(problem)
     if state_of(box.name) != "absent":
+        refuse_before_create(box)
         explain_rename()
         if not confirm(f"rename {box.name} to {new} now?"):
             return
@@ -4634,6 +4829,33 @@ EDIT_SECTIONS = [
 ]
 
 
+# The sections that write a pinned key (PINNED_KEYS). "Secrets" is not here:
+# it goes through cmd_secret, which does the same itself. "Name & folder" is
+# not either: a different folder brings a policy nobody here has looked at,
+# which the next create shows and asks about.
+POLICY_SECTIONS = (section_features, section_resources, section_caches,
+                   section_containers, section_egress, section_github)
+
+
+class approving_edits:
+    """Around an edit section that writes the project's policy: a pending
+    change made by someone else is asked about first, on its own, and what the
+    operator then chooses in the menu is approved as they leave it."""
+
+    def __init__(self, box, config):
+        self.box, self.config = box, config
+
+    def __enter__(self):
+        check_policy(self.box, "editing")
+
+    def __exit__(self, kind, exc, tb):
+        try:
+            approve_policy(Sandbox(self.box.name, self.config))
+        except SystemExit:
+            pass        # the file no longer parses; _recover_broken handles that
+        return False
+
+
 def _recover_broken(name, message):
     """A file this sandbox reads no longer parses, so no menu can be built from it.
     Offer to open the files; True to retry, False to give up."""
@@ -4684,9 +4906,13 @@ def cmd_edit(args, config):
             break
         try:
             if choice.startswith("Edit the files"):
-                section_files(box, config, ctx)
+                with approving_edits(box, config):
+                    section_files(box, config, ctx)
             elif choice.startswith("View the CLAUDE.md"):
                 section_claude_md(box, config, ctx)
+            elif EDIT_SECTIONS[default][1] in POLICY_SECTIONS:
+                with approving_edits(box, config):
+                    EDIT_SECTIONS[default][1](box, config, ctx)
             else:
                 EDIT_SECTIONS[default][1](box, config, ctx)
         except SystemExit as exc:               # a section's escape/die must not end the menu
@@ -6182,6 +6408,10 @@ def cmd_add(args, config):
     # nothing.
     inside_repo = os.path.isdir(os.path.join(project, ".git"))
     sandbox_toml = os.path.join(msb_dir, "sandbox.toml")
+    # The policy is approved below only if the wizard wrote it from what was
+    # just chosen. One kept from a clone is somebody else's, and the first
+    # create shows it and asks.
+    wrote_policy = not os.path.exists(sandbox_toml)
     if os.path.exists(sandbox_toml):
         note(f"kept existing {tilde(sandbox_toml)}")
     else:
@@ -6230,6 +6460,8 @@ def cmd_add(args, config):
         note(f"wrote {tilde(dev_yaml)}" +
              ("  — commit this" if inside_repo else "  (outside the checkout)"))
 
+    if wrote_policy:
+        approve_policy(Sandbox(name, config))
     say("Registered")
     note(f"Nothing has been started. When you want it:  msbctl start {name}")
     note("The first start runs the bootstrap and takes a few minutes.")
@@ -6638,6 +6870,11 @@ def main():
     p.add_argument("name", help=DOT_HELP)
     p.add_argument("var", nargs="?", help="for rm: the variable name")
     p.set_defaults(func=cmd_secret)
+
+    p = sub.add_parser("policy", help="show or approve the project policy a sandbox is pinned to")
+    p.add_argument("name", help=DOT_HELP)
+    p.add_argument("action", nargs="?", choices=["show", "approve"], default="show")
+    p.set_defaults(func=cmd_policy)
 
     p = sub.add_parser("allow", help="add egress rules to a sandbox (host, host:port, or a full rule)")
     p.add_argument("name", help=DOT_HELP)

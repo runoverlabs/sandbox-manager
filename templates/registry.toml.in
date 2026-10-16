@@ -45,6 +45,14 @@ claude_token = "{{CLAUDE_TOKEN}}"
 # ~300 MB, so this is cheap, but a stopped sandbox cannot be version-probed.
 autostart = {{AUTOSTART}}
 
+# WRITTEN BY msbctl. The digest of the project policy last approved for this
+# sandbox: the egress rules, secret bindings and resources in
+# {{PROJECT}}/.msb/sandbox.toml. That file is committed and writable from inside
+# the sandbox, so a create or rebuild that finds it changed shows the
+# difference and asks first (`msbctl policy {{NAME}}` shows it,
+# `msbctl policy {{NAME}} approve` accepts it). Without a terminal it refuses.
+policy_pin = ""
+
 # --------------------------------------------------------------- ssh keys
 #
 # Which keys in your host ssh-agent this sandbox can see and sign with, by

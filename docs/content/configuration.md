@@ -26,6 +26,7 @@ writes are the long-form documentation of every key; this page is the map.
 | `~/.local/state/msb/profile/` | the assembled `CLAUDE.md`, mounted read-only |
 | `~/.local/state/msb/agent/` | the SSH-agent filters' sockets and logs |
 | `~/.local/state/msb/versions.json` | the cached version checks |
+| `~/.local/state/msb/policy-approved/<name>.json` | the project policy last approved for that sandbox |
 
 `MSB_CONFIG_DIR` and `MSB_STATE_DIR` move the two roots.
 
@@ -163,6 +164,20 @@ exists keeps starting.
 be an absolute path, and may not contain `${`. The flags msbctl emits win over
 it.
 
+### The policy pin
+
+These keys in `.msb/sandbox.toml` are applied only once approved on the host
+(see [the policy pin](egress.md#the-policy-pin)): `rule_groups`,
+`extra_rules`, `allow_private_dns`, `secret_binds`, `[secrets]`, `cpus`,
+`memory`, `root_disk`, `containers_disk` and `[caches]`. They decide what may
+leave the sandbox, which host a stored value is sent to, and what the sandbox
+takes from the host: a committed `memory = "256G"` is as much a change as a
+new rule. `image`, `[bootstrap]` and `[env]` aren't pinned; they act only
+inside the guest. The approved values are kept in
+`~/.local/state/msb/policy-approved/<name>.json`, and their digest as
+`policy_pin` in the registry entry. Keys in the registry entry itself are
+yours and are never re-approved.
+
 ## The registry entry
 
 `~/.config/msb/sandboxes/<name>.toml` is machine-local and never committed.
@@ -180,6 +195,7 @@ Any key it sets overrides the project's file.
 | `ports` | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
 | `egress_mode` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
+| `policy_pin` | written by msbctl: the digest of the project policy last approved |
 | `msb_conf` | your own msb config file, passed as `--conf`: an absolute path, never in a project, no `${` in it. See [dev.yaml](#msbdevyaml) |
 | `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides. `conf` must name a file inside the project |
 | `[versions]` | what `msbctl update` installed, so a rebuild reproduces it |

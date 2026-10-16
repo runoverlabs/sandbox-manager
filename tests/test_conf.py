@@ -103,7 +103,7 @@ class ConfTest(MsbctlTest):
         for conf in ("/etc/passwd", "../outside.yaml"):
             with self.subTest(conf=conf):
                 self.fresh()
-                self.make_folder_sandbox("web", sandbox_toml=f'conf = "{conf}"\n')
+                self.make_folder_sandbox("web", sandbox_toml=f'conf = "{conf}"\n', approve=False)
                 code, _, err = self.run_main("start", "web")
                 self.assertNotEqual(code, 0)
                 self.assertIn("outside the project", err)

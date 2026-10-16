@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- Changes to a project's egress rules, secret bindings or resources must be approved on the host (`msbctl policy`) before a create or rebuild applies them, and `.msb/` is read-only inside the sandbox; the first rebuild after upgrading asks once.
+
 ### Changed
 - Sandboxes with Claude Code get `IS_SANDBOX=1` (so bypass-permissions mode is offered, including through `claude-agent-acp` in Zed), `DISABLE_BUG_COMMAND` and `DISABLE_AUTOUPDATER` on top of the telemetry and feedback opt-outs. Those now come from a new `[agent_env.claude]` table and are no longer set in sandboxes without Claude. Needs a rebuild.
 

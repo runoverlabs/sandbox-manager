@@ -87,21 +87,26 @@ class MsbctlTest(unittest.TestCase):
 
     # ---------------------------------------------------------------- running
 
-    def run_main(self, *argv, stdin=""):
+    def run_main(self, *argv, stdin="", tty=False):
         """Run msbctl's main() with argv; returns (exit code, stdout, stderr).
 
         The preflight (msb on PATH, /dev/kvm) and the ssh-agent filter daemon
         are switched off: neither belongs in a unit test. The network is off
         too, so nothing a test does can reach GitHub by accident. stdout and
-        stderr are real files, because msbctl hands them to subprocesses."""
+        stderr are real files, because msbctl hands them to subprocesses.
+        `tty` makes stdin and stdout claim to be a terminal, for the prompts
+        that are only offered on one; the answers still come from `stdin`."""
         out = tempfile.TemporaryFile("w+", encoding="utf-8")
         err = tempfile.TemporaryFile("w+", encoding="utf-8")
+        fake_in = io.StringIO(stdin)
+        if tty:
+            fake_in.isatty = out.isatty = lambda: True
         code = 0
         with contextlib.ExitStack() as stack:
             stack.enter_context(out)
             stack.enter_context(err)
             stack.enter_context(mock.patch.object(sys, "argv", ["msbctl", *argv]))
-            stack.enter_context(mock.patch.object(sys, "stdin", io.StringIO(stdin)))
+            stack.enter_context(mock.patch.object(sys, "stdin", fake_in))
             stack.enter_context(mock.patch.object(self.m, "preflight", lambda args: None))
             stack.enter_context(mock.patch.object(self.m, "ensure_agent_filter", lambda box: None))
             stack.enter_context(mock.patch.object(self.m, "stop_agent_filter", lambda box: None))
@@ -133,9 +138,11 @@ class MsbctlTest(unittest.TestCase):
     def entry_path(self, name):
         return os.path.join(self.m.REGISTRY_DIR, f"{name}.toml")
 
-    def make_folder_sandbox(self, name, sandbox_toml="", dev_yaml=None, entry_extra=""):
+    def make_folder_sandbox(self, name, sandbox_toml="", dev_yaml=None, entry_extra="",
+                            approve=True):
         """A project folder with .msb/ and a minimal registry entry. Returns
-        the project path."""
+        the project path. Its project policy is approved (pinned) unless
+        `approve` is False, as `msbctl add` does for a policy it wrote."""
         project = os.path.join(self.tmp, "projects", name)
         os.makedirs(os.path.join(project, ".msb"), exist_ok=True)
         with open(os.path.join(project, ".msb", "sandbox.toml"), "w", encoding="utf-8") as fh:
@@ -148,7 +155,13 @@ class MsbctlTest(unittest.TestCase):
         with open(self.entry_path(name), "w", encoding="utf-8") as fh:
             fh.write(f'name = "{name}"\nproject = "{project}"\nguest_path = "/work"\n'
                      f'repo = ""\nssh_keys = []\n{entry_extra}\n')
+        if approve:
+            self.approve(name)
         return project
+
+    def approve(self, name):
+        """Pin the sandbox's current project policy, as `msbctl policy approve` would."""
+        self.m.approve_policy(self.m.Sandbox(name, self.m.load_config()))
 
     def store_secret(self, path, var, value):
         self.m.set_env_file_value(path, var, value)

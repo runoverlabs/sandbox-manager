@@ -108,11 +108,46 @@ $ msbctl allow . pypi.example.com --rebuild    # and apply it now
 ```
 
 `allow` appends to `extra_rules` in the project's `.msb/sandbox.toml` (or in
-the registry entry, if that already overrides the list). Rules are fixed at
-create time, so they take effect at the next `msbctl rebuild`.
+the registry entry, if that already overrides the list), and approves the
+change (see [the policy pin](#the-policy-pin)). Rules are fixed at create time,
+so they take effect at the next `msbctl rebuild`.
 
 If more than one project needs the same host, make it a group in your
 `config.toml` instead and add the group to each project's `rule_groups`.
+
+## The policy pin
+
+The project's `.msb/sandbox.toml` is committed, and the project folder is
+writable from inside the sandbox, so code running in there could add its own
+`allow@` rule or a secret binding and wait for the next rebuild. msbctl
+doesn't apply what that file says just because it says it. Its egress rules,
+secret bindings and resources are recorded when you approve them, and a
+create or rebuild that finds them changed shows the difference first:
+
+```console
+$ msbctl rebuild .
+== web: the project's policy changed since it was approved
+     from ~/workspaces/web/.msb/sandbox.toml, before create:
+       extra_rules:
+     +   allow@paste.example:tcp:443
+   approve this policy for web? [y/N]
+```
+
+Answer no and nothing changes. Without a terminal (a script, a cron job) it
+refuses outright, saying to run `msbctl policy <name> approve`, and the
+sandbox is left as it was: the check runs before a rebuild removes anything.
+`msbctl allow`, `msbctl secret` and `msbctl edit` approve what *you* change
+through them, after asking about any change that was already waiting, so a
+pending edit from someone else is never approved along with yours. A policy
+`msbctl add` wrote for you is approved when it's written; one it found in a
+cloned repo is shown at the first start.
+
+Inside the sandbox, `.msb/` is also mounted read-only over the project, so an
+edit fails straight away with "Read-only file system". That's a tripwire, not
+the control: root in the guest can unmount it. The pin is what stops the
+change from being applied.
+
+See [which keys are pinned](configuration.md#the-policy-pin).
 
 ## Finding out what a sandbox needs
 

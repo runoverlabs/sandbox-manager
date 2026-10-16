@@ -243,6 +243,16 @@ Add egress rules. Each target is `host` (HTTPS, :443), `host:port` (TCP),
 address goes in brackets, `[fd00::5]:22`. Written to the project's
 `extra_rules`. See [Adding a host](egress.md#adding-a-host).
 
+### `msbctl policy`
+
+```text
+msbctl policy name|. [show|approve]
+```
+
+`show` (the default) prints the project-layer values the [policy
+pin](egress.md#the-policy-pin) covers, whether they're the approved ones, and
+what changed since. `approve` shows the change and asks; it needs a terminal.
+
 ### `msbctl observe`
 
 ```text
