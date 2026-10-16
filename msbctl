@@ -76,6 +76,7 @@ import termios
 import time
 import tty
 import urllib.error
+import urllib.parse
 import urllib.request
 
 if sys.version_info < (3, 11):
@@ -409,6 +410,19 @@ IMAGE_REF = re.compile(
     r"(?:@sha256:[0-9a-f]{64})?")
 
 
+def conf_image(path):
+    """The `image:` of a dev.yaml, or None (no such line, or no file)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                match = re.match(r"^image:\s*(\S+)\s*$", line)
+                if match:
+                    return match.group(1)
+    except FileNotFoundError:
+        pass  # no file: no image line
+    return None
+
+
 def image_problem(ref):
     """Why `ref` is not an OCI image reference, or None."""
     if not isinstance(ref, str) or not IMAGE_REF.fullmatch(ref):
@@ -433,28 +447,54 @@ class Sandbox:
         self.entry = read_toml(os.path.join(REGISTRY_DIR, f"{name}.toml"))
         if not self.entry:
             die(f"no sandbox named {name!r} — `msbctl ls` to see what exists")
-        if "project" not in self.entry:
-            die(f"{name}.toml has no `project` key — it was hand-edited into an "
-                "unusable state, or written by an older msbctl")
-
-        self.project = os.path.realpath(os.path.expanduser(self.entry["project"]))
+        # "folder": the project is a host folder, mounted. "repo": there is no
+        # host folder at all — the code is cloned from GitHub into a disk volume
+        # inside the sandbox, and the project layer is the repo's own .msb/ as
+        # fetched at a recorded commit (policy_dir(), never mounted).
+        self.source = self.entry.get("source", "folder")
+        if self.source not in ("folder", "repo"):
+            die(f"{name}.toml: source is {self.source!r}, expected \"folder\" or \"repo\"")
+        self.is_repo = self.source == "repo"
         self.repo = self.entry.get("repo", "")
+        if self.is_repo:
+            if not self.repo:
+                die(f"{name}.toml has `source = \"repo\"` but no `repo`")
+            self.project = policy_dir(name)
+        else:
+            if "project" not in self.entry:
+                die(f"{name}.toml has no `project` key — it was hand-edited into an "
+                    "unusable state, or written by an older msbctl")
+            self.project = os.path.realpath(os.path.expanduser(self.entry["project"]))
         self.autostart = bool(self.entry.get("autostart", False))
         self.project_cfg = read_toml(os.path.join(self.project, ".msb", "sandbox.toml"))
 
         defaults = config.get("defaults", {})
+        if self.is_repo and ("conf" in self.project_cfg or "conf" in self.entry):
+            # Only .msb/dev.yaml is fetched, so another path would be a missing
+            # file and a silent fall to the default image.
+            die(f"{name}: `conf` cannot be set for a sandbox cloned from {self.repo} — "
+                "only .msb/dev.yaml is read from the repo")
         self.conf = self._pick("conf", ".msb/dev.yaml")
         self.cpus = self._pick("cpus", defaults.get("cpus", 4))
         self.memory = self._pick("memory", defaults.get("memory", "8G"))
         self.root_disk = self._pick("root_disk", defaults.get("root_disk", "16G"))
-        # Size of a dedicated disk for /var/lib/containers, or empty for none.
-        self.secret_binds = self._pick("secret_binds", [])
-        # Which layer the bindings came from decides where their VALUES may come
+        # Which layer a binding came from decides where its VALUE may come
         # from: see secret_env(). The registry entry is the operator's; the
         # project's sandbox.toml is a file the sandbox itself can write.
-        self.bindings_layer = "registry" if "secret_binds" in self.entry else "project"
+        # A folder sandbox's registry list REPLACES the project's, like every
+        # other key. A repo sandbox's ADDS to it: `secret add` and `allow` write
+        # to the registry there, since there is no checkout to edit, and
+        # replacing would silently drop what the repo asks for.
+        if self.is_repo:
+            self.registry_binds = list(self.entry.get("secret_binds", []))
+            self.secret_binds = list(dict.fromkeys(
+                self.project_cfg.get("secret_binds", []) + self.registry_binds))
+        else:
+            self.secret_binds = self._pick("secret_binds", [])
+            self.registry_binds = list(self.secret_binds) if "secret_binds" in self.entry else []
         # {feature: size} for per-package-manager cache disks. See CACHES.
         self.caches = self._pick("caches", {})
+        # Size of a dedicated disk for /var/lib/containers, or empty for none.
         self.containers_disk = self._pick("containers_disk",
                                           defaults.get("containers_disk", ""))
         self.claude_auth = defaults.get("claude_auth", "secret")
@@ -480,6 +520,32 @@ class Sandbox:
         self.state = os.path.join(STATE_DIR, "claude", name)
         self.agent_sock = os.path.join(AGENT_DIR, f"{name}.sock")
 
+    def reload(self):
+        """Read every layer again, after one was rewritten (a fetched policy)."""
+        self.__init__(self.name, self.config)
+
+    @property
+    def repo_meta(self):
+        """What fetch_repo_policy() recorded about the fetch: repo, ref, branch,
+        sha, private, fetched_at. {} for a folder sandbox or before a fetch."""
+        if not self.is_repo:
+            return {}
+        return read_json(os.path.join(self.project, "meta.json"))
+
+    @property
+    def workspace_volume(self):
+        """The disk volume a repo sandbox's clone lives on. Kept across rebuilds,
+        deleted by purge."""
+        return f"{self.volume_prefix}-workspace"
+
+    @property
+    def location(self):
+        """Where the code is, for display: a host folder, or the repo."""
+        if not self.is_repo:
+            return tilde(self.project)
+        ref = self.entry.get("ref") or self.repo_meta.get("branch") or "(default branch)"
+        return f"github:{self.repo}@{ref}"
+
     def wants_component(self, comp):
         """Whether this sandbox is set up to have `comp`. Used to keep bun, gitleaks and a
         claude that was switched off, out of the version display and the probes."""
@@ -502,7 +568,8 @@ class Sandbox:
     def owned_volumes(self, vols=None):
         """Names of the existing disk volumes that belong to this sandbox."""
         return [n for n in (msb_volumes() if vols is None else vols)
-                if n.startswith(f"{self.volume_prefix}-cache-") or n == self.containers_volume]
+                if n.startswith(f"{self.volume_prefix}-cache-")
+                or n in (self.containers_volume, self.workspace_volume)]
 
     def named_disk_flags(self, volume, dest, size):
         """`--mount-named` for a disk volume that OUTLIVES the sandbox, so a rebuild
@@ -555,6 +622,15 @@ class Sandbox:
         memory by this path, so they do not follow a change.
         """
         raw = self.guest_path_setting
+        if self.is_repo and raw == "host":
+            die(f"{self.name}: guest_path \"host\" means the host folder's own path, and a "
+                f"sandbox cloned from {self.repo} has no host folder — fix it in "
+                f"{tilde(registry_path(self))}")
+        if self.is_repo and "." in str(raw):
+            # The clone is a named disk volume, and msb refuses one at a path
+            # with a dot in it ("invalid or reserved device id").
+            die(f"{self.name}: guest_path {raw!r} has a dot in it, which a disk volume "
+                f"cannot be mounted at — fix it in {tilde(registry_path(self))}")
         path = self.project if raw == "host" else raw
         problem = guest_path_problem(path)
         if problem:
@@ -597,16 +673,13 @@ class Sandbox:
         """
         if "image" in self.entry:
             ref, where = self.entry["image"], registry_path(self)
+        elif self.is_repo and not os.path.isfile(self.conf_path):
+            # A repo without .msb/dev.yaml gets the machine's default image.
+            ref, where = self.config.get("defaults", {}).get("image", ""), CONFIG_FILE
         else:
             if not os.path.isfile(self.conf_path):
                 die(f"{tilde(self.conf_path)} does not exist — `msbctl add` writes it")
-            ref, where = None, self.conf_path
-            with open(self.conf_path, encoding="utf-8") as fh:
-                for line in fh:
-                    match = re.match(r"^image:\s*(\S+)\s*$", line)
-                    if match:
-                        ref = match.group(1)
-                        break
+            ref, where = conf_image(self.conf_path), self.conf_path
             if ref is None:
                 die(f"no `image:` line in {tilde(self.conf_path)}")
         problem = image_problem(ref)
@@ -688,6 +761,10 @@ class Sandbox:
 
     @property
     def extra_rules(self):
+        if self.is_repo:
+            # The repo's rules, then the operator's: see registry_binds.
+            return list(dict.fromkeys(self.project_cfg.get("extra_rules", [])
+                                      + self.entry.get("extra_rules", [])))
         return self._pick("extra_rules", [])
 
     @property
@@ -770,7 +847,11 @@ class Sandbox:
         at launch.
         """
         flags, env = [], {}
-        wants_github = self.project_cfg.get("secrets", {}).get("github", bool(self.repo))
+        # A repo sandbox always binds its token when one is stored: it is how
+        # the clone authenticates and how its work gets pushed (there is no
+        # agent to forward), and the binding is the fixed one, to GitHub only.
+        wants_github = self.is_repo or self.project_cfg.get("secrets", {}).get(
+            "github", bool(self.repo))
 
         if self.claude_auth == "secret":
             token = claude_tokens().get(self.claude_token)
@@ -805,8 +886,10 @@ class Sandbox:
                 flags += ["--secret", with_transcript_passthrough(
                     "GH_TOKEN@github.com,api.github.com")]
             else:
-                note(f"no GH_TOKEN for {self.name} — the GitHub API is unavailable "
-                     "in this sandbox (git push over SSH still works)")
+                note(f"no GH_TOKEN for {self.name} — " + (
+                    "the clone of a private repo, git push and the GitHub API need one: "
+                    f"`msbctl secret set {self.name} GH_TOKEN`" if self.is_repo else
+                    "the GitHub API is unavailable in this sandbox (git push over SSH still works)"))
 
         # Extra bindings, in msb's own `ENV[:OPTIONS]@HOST[,HOST]` syntax so a
         # hand-written one works too. Like the others, the value only ever
@@ -828,12 +911,12 @@ class Sandbox:
                 warn(f"{self.name}: secret binding {spec!r} is ignored — {var} has a fixed binding "
                      "and cannot be bound again (a rebuild refuses this)")
                 continue
-            value = own.get(var) or (shared.get(var) if self.bindings_layer == "registry"
-                                     else None)
+            from_registry = spec in self.registry_binds
+            value = own.get(var) or (shared.get(var) if from_registry else None)
             if value:
                 env[var] = value
                 flags += ["--secret", with_transcript_passthrough(spec)]
-            elif self.bindings_layer == "project":
+            elif not from_registry:
                 note(f"no {var} for {self.name} — a binding from the project's sandbox.toml "
                      f"takes its value from {tilde(os.path.join(SECRETS_DIR, self.name + '.env'))} "
                      f"only: `msbctl secret add {self.name}` (skipped for now)")
@@ -857,6 +940,16 @@ class Sandbox:
 
     def mount_flags(self):
         uid, gid = os.getuid(), os.getgid()
+        if self.is_repo:
+            # No host folder: the clone lives on a disk volume that outlives the
+            # sandbox, so a rebuild finds `.git` there and leaves it alone. The
+            # fetched policy is NOT mounted — it is what the host reads, and the
+            # guest's own checkout of .msb/ changes nothing until it is pushed
+            # and `msbctl policy <name> update` is run.
+            return self._mounts_after_project(uid, gid, self.named_disk_flags(
+                self.workspace_volume, self.guest_project,
+                self._pick("workspace_disk", self.config.get("defaults", {})
+                           .get("workspace_disk", "20G"))))
         flags = [
             # uid/gid presentation is what makes guest writes land as you on
             # the host. Without it you get files you cannot rm without help.
@@ -870,7 +963,10 @@ class Sandbox:
         # fail at once, with EROFS, instead of waiting for the operator.
         if os.path.isdir(os.path.join(self.project, ".msb")):
             flags += ["--mount-dir", f"{self.project}/.msb:{self.guest_project}/.msb:ro"]
+        return self._mounts_after_project(uid, gid, flags)
 
+    def _mounts_after_project(self, uid, gid, flags):
+        """Every mount but the project's own, appended to `flags`."""
         for src, dest, mode in self.extra_mounts:
             if not os.path.isdir(src):
                 die(f"{self.name}: extra folder {tilde(src)} does not exist — "
@@ -1279,6 +1375,12 @@ class _AgentFilter(socketserver.BaseRequestHandler):
                 if not permitted:
                     _write_msg(self.request, bytes([AGENT_FAILURE]))
                     continue
+                if not self.server.upstream():
+                    # No host agent (see ensure_agent_filter): an empty list, so
+                    # ssh in the guest says "no identities" rather than hanging.
+                    _write_msg(self.request, bytes([AGENT_IDENTITIES_ANSWER]) + struct.pack(">I", 0)
+                               if kind == AGENTC_REQUEST_IDENTITIES else bytes([AGENT_FAILURE]))
+                    continue
                 if upstream is None:
                     upstream = socket.socket(socket.AF_UNIX)
                     upstream.connect(self.server.upstream())
@@ -1360,7 +1462,12 @@ def ensure_agent_filter(box):
     every start."""
     upstream = os.environ.get("SSH_AUTH_SOCK", "")
     if not upstream or not os.path.exists(upstream):
-        die("no usable SSH_AUTH_SOCK — start an agent and ssh-add a key")
+        if box.ssh_keys != []:
+            die("no usable SSH_AUTH_SOCK — start an agent and ssh-add a key")
+        # A sandbox allowed no keys needs no agent: the filter still answers
+        # (with nothing), so the --vsock baked in at create has a listener. This
+        # is the usual case on a remote host, where nobody's agent is forwarded.
+        upstream = ""
     # Every start path comes through here, so this is where a selected key that
     # is not loaded yet gets added, before the sandbox can ask for it.
     ensure_keys_loaded(box)
@@ -1946,6 +2053,8 @@ def ensure_git_checkstat(box):
     harmless. Only a top-level `.git` is touched: a linked worktree's `.git`
     file names a host path that may not exist in the guest.
     """
+    if box.is_repo:
+        return      # the clone is on a disk volume; no host editor watches it
     script = ('[ -e .git ] || exit 0; '
               'git config --local --get core.checkStat >/dev/null '
               '|| git config --local core.checkStat minimal')
@@ -2037,6 +2146,14 @@ def warn_missing_prereqs(box):
                                               "platform.claude.com"]))
     needs.append(("gh" + (" + gitleaks" if boot.get("gitleaks") else "") + " downloads",
                   ["github.com", "release-assets.githubusercontent.com"]))
+    if box.is_repo:
+        needs.append((f"the clone of {box.repo}", ["github.com"]))
+        # The clone fails inside the bootstrap, one step removed from the cause,
+        # so say it here, before anything is created.
+        if box.repo_meta.get("private") and not read_env_file(
+                os.path.join(SECRETS_DIR, f"{box.name}.env")).get("GH_TOKEN"):
+            warn(f"{box.repo} is private and {box.name} has no GitHub token, so the clone "
+                 f"will fail — `msbctl secret set {box.name} GH_TOKEN` first")
 
     rules = box.net_rules()
     missing = []
@@ -2053,7 +2170,7 @@ def warn_missing_prereqs(box):
         note(f"     {label:<24} {', '.join(absent)}")
     note("")
     note("   Add the rule group that covers them to `rule_groups` in")
-    note(f"   {tilde(os.path.join(box.project, '.msb', 'sandbox.toml'))} — "
+    note(f"   {box.repo + ':.msb/sandbox.toml' if box.is_repo else tilde(project_path(box))} — "
          "`npm` and `claude` are")
     note("   the usual two — or set the feature false under [bootstrap].")
     note("   Continuing; the bootstrap reports what actually failed.")
@@ -2083,7 +2200,7 @@ PINNED_KEYS = (
     # Resources resolve through _pick too, so a commit saying memory = "256G"
     # or a 4T root disk lands on the next rebuild — on a host that stands alone,
     # with nobody watching it.
-    "cpus", "memory", "root_disk", "containers_disk", "caches",
+    "cpus", "memory", "root_disk", "containers_disk", "caches", "workspace_disk",
 )
 # NOT pinned, on purpose: `image`, [bootstrap] and [env] act only inside the
 # guest, which is what the sandbox is for, and `conf` only names the file the
@@ -2098,8 +2215,12 @@ def restricted():
 
 
 def project_policy(box):
-    """The project-layer values the pin covers."""
-    return {k: box.project_cfg[k] for k in PINNED_KEYS if k in box.project_cfg}
+    """The project-layer values the pin covers. For a repo sandbox, also the
+    commit they were read at, so a diff always names the commit being approved."""
+    policy = {k: box.project_cfg[k] for k in PINNED_KEYS if k in box.project_cfg}
+    if box.is_repo:
+        policy["_commit"] = box.repo_meta.get("sha", "")
+    return policy
 
 
 def policy_digest(policy):
@@ -2160,9 +2281,9 @@ def approved_policy(name):
     return read_json(path)
 
 
-def approve_policy(box):
-    """Record the project's current values as approved, for `box` as loaded."""
-    policy = project_policy(box)
+def approve_policy(box, policy=None):
+    """Record `policy` (default: the project's current values) as approved."""
+    policy = project_policy(box) if policy is None else policy
     os.makedirs(POLICY_APPROVED_DIR, mode=0o700, exist_ok=True)
     path = approved_path(box.name)
     fd, tmp = tempfile.mkstemp(dir=POLICY_APPROVED_DIR)
@@ -2174,6 +2295,20 @@ def approve_policy(box):
     box.entry["policy_pin"] = digest
 
 
+def ask_approval(box, policy, why, where):
+    """Show how `policy` differs from the approved one and ask. Dies where
+    nobody may be asked (no terminal, or `host serve`), and when declined."""
+    say(f"{box.name}: the project's policy changed since it was approved")
+    note(f"from {where}, before {why}:")
+    for line in policy_diff(approved_policy(box.name), policy):
+        note(f"  {line}")
+    if restricted() or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(f"{box.name}: policy not approved — run `msbctl policy {box.name} approve` on the "
+            "host, or with your admin key")
+    if not confirm(f"approve this policy for {box.name}?"):
+        die("not approved, nothing changed")
+
+
 def check_policy(box, why):
     """Return if the project's pinned values are the approved ones; otherwise show
     what changed and ask, or die where nobody may be asked. `why` names what
@@ -2181,42 +2316,42 @@ def check_policy(box, why):
     if policy_pinned(box):
         return
     current = project_policy(box)
-    previous = approved_policy(box.name)
-    if previous is None and not current and not box.entry.get("policy_pin"):
+    if approved_policy(box.name) is None and not current and not box.entry.get("policy_pin"):
         approve_policy(box)        # nothing to approve: the project sets none of it
         return
-    say(f"{box.name}: the project's policy changed since it was approved")
-    note(f"from {tilde(project_path(box))}, before {why}:")
-    for line in policy_diff(previous, current):
-        note(f"  {line}")
-    if restricted() or not (sys.stdin.isatty() and sys.stdout.isatty()):
-        die(f"{box.name}: policy not approved — run `msbctl policy {box.name} approve` on the "
-            "host, or with your admin key")
-    if confirm(f"approve this policy for {box.name}?"):
-        approve_policy(box)
-        note("approved")
-    else:
-        die("not approved, nothing changed")
+    ask_approval(box, current, why, tilde(project_path(box)))
+    approve_policy(box, current)
+    note("approved")
 
 
 def cmd_policy(args, config):
-    """policy <name> [show|approve] — the project-layer values the pin covers."""
+    """policy <name> [show|approve|update [REF]] — the project-layer values the pin covers."""
     box = Sandbox(args.name, config)
+    if args.action in ("approve", "update") and restricted():
+        die(f"`policy {args.action}` is refused here — run it on the host, or with your admin key")
+    if args.ref and args.action != "update":
+        die("a ref is only for `policy <name> update [REF]`")
+    if args.action == "update":
+        policy_update(box, args.ref)
+        return
     if args.action == "approve":
-        if restricted():
-            die("approving a policy is refused here — run it on the host, or with your admin key")
         if policy_pinned(box):
             note(f"{box.name}: the project's policy is the approved one")
             return
         check_policy(box, "approving")
         return
     say(f"{box.name}  policy  [{'approved' if policy_pinned(box) else 'NOT APPROVED'}]")
-    note(f"from {tilde(project_path(box))}")
+    if box.is_repo:
+        meta = box.repo_meta
+        note(f"from {box.repo} at {meta.get('sha', '?')[:12]} "
+             f"({meta.get('branch') or meta.get('ref') or '?'}), fetched {meta.get('fetched_at', '?')}")
+    else:
+        note(f"from {tilde(project_path(box))}")
     current = project_policy(box)
     for key in PINNED_KEYS:
         if key in current:
             note(f"  {key} = {_policy_value(current[key])}")
-    if not current:
+    if not any(k in current for k in PINNED_KEYS):
         note("  (the project sets none of the pinned keys)")
     if not policy_pinned(box):
         say("Changes since the last approval")
@@ -2225,10 +2360,214 @@ def cmd_policy(args, config):
         note(f"`msbctl policy {box.name} approve` to accept them")
 
 
+# ------------------------------------------------- sandboxes cloned from a repo
+#
+# A repo sandbox has no host folder. Its code is a clone, made by the bootstrap
+# inside the sandbox, on a disk volume that outlives it. Its project layer is
+# the repo's own .msb/sandbox.toml and .msb/dev.yaml, fetched from the GitHub
+# contents API AT A RECORDED COMMIT into policy_dir(name), which plays the part
+# a project folder plays for a folder sandbox and is never mounted. `rebuild`
+# recreates at that commit and fetches nothing, so an unattended rebuild is
+# possible and the pin means something; `msbctl policy <name> update` moves it,
+# showing what the newer commit changes first.
+
+POLICY_MAX_BYTES = 256 * 1024
+REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+
+
+def policy_dir(name):
+    return os.path.join(STATE_DIR, "policy", name)
+
+
+def github_api(path, token=None):
+    """(status, data) for a GitHub REST call. (404, None) for a 404, and
+    (None, None) for any network or decode failure. Neither the token nor the
+    response body ever goes into an error: http_json's single None for every
+    failure cannot tell "no such file" from "GitHub is down", and a policy fetch
+    must."""
+    req = urllib.request.Request("https://api.github.com" + path, headers={
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "msbctl"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  an https:// constant
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+        return None, None
+
+
+def repo_token(name):
+    """The GitHub token a policy fetch for `name` uses, or None (a public repo
+    needs none). The sandbox's own first, else the machine's global one —
+    except under `host serve`, where `add --repo` is allowed: a 200 against a
+    404 for a repo named by the caller would tell it which private repos the
+    operator's token can read."""
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env")).get("GH_TOKEN")
+    if own or restricted():
+        return own or None
+    return read_env_file(GLOBAL_ENV).get("GH_TOKEN") or None
+
+
+def _api_die(repo, ref, status):
+    hint = (" — a private repo needs a GitHub token with Contents: read on it "
+            "(`msbctl secret set <name> GH_TOKEN`)" if status == 404 else "")
+    die(f"cannot read {repo}@{ref or '(default branch)'}: "
+        f"{status if status is not None else 'GitHub unreachable'}{hint}")
+
+
+def resolve_repo_ref(repo, ref, token):
+    """(sha, branch, private) for `ref` (empty: the default branch)."""
+    status, info = github_api(f"/repos/{repo}", token)
+    if status != 200 or not isinstance(info, dict):
+        _api_die(repo, ref, status)
+    branch = ""
+    target = ref or info.get("default_branch", "")
+    if not ref:
+        branch = target
+    elif not re.fullmatch(r"[0-9a-f]{40}", ref):
+        bstatus, _ = github_api(f"/repos/{repo}/branches/{urllib.parse.quote(ref, safe='')}", token)
+        branch = ref if bstatus == 200 else ""
+    status, commit = github_api(f"/repos/{repo}/commits/{urllib.parse.quote(target, safe='')}", token)
+    if status != 200 or not isinstance(commit, dict) or not commit.get("sha"):
+        _api_die(repo, ref, status)
+    return commit["sha"], branch, bool(info.get("private"))
+
+
+def _fetch_file(repo, path, sha, token):
+    """A file's bytes at `sha`, or None if it does not exist there. Any other
+    failure dies: only a 404 means "no file", never an error, or a repo whose
+    policy could not be read would silently get the defaults."""
+    status, data = github_api(f"/repos/{repo}/contents/{path}?ref={sha}", token)
+    if status == 404:
+        return None
+    if status != 200 or not isinstance(data, dict):
+        _api_die(repo, sha[:12], status)
+    if data.get("type") != "file" or data.get("size", 0) > POLICY_MAX_BYTES:
+        die(f"{repo}: {path} at {sha[:12]} is not a file under {POLICY_MAX_BYTES // 1024} KiB")
+    try:
+        raw = base64.b64decode(data.get("content", ""))
+    except ValueError:
+        die(f"{repo}: {path} at {sha[:12]} did not decode")
+    if len(raw) > POLICY_MAX_BYTES:
+        die(f"{repo}: {path} at {sha[:12]} is over {POLICY_MAX_BYTES // 1024} KiB")
+    return raw
+
+
+def fetch_repo_policy(name, repo, ref, sha=None, token=None):
+    """Fetch .msb/sandbox.toml and .msb/dev.yaml of `repo` at `ref` (or exactly
+    at `sha`) into a new private directory beside policy_dir(name), and return
+    (that directory, meta). install_policy() swaps it in; nothing is replaced
+    here, so a refused or failed fetch changes nothing."""
+    token = token or repo_token(name)
+    if sha:
+        status, info = github_api(f"/repos/{repo}", token)
+        if status != 200 or not isinstance(info, dict):
+            _api_die(repo, sha[:12], status)
+        branch = ref if ref and not re.fullmatch(r"[0-9a-f]{40}", ref) else ""
+        private = bool(info.get("private"))
+        if not ref:
+            branch = info.get("default_branch", "")
+    else:
+        sha, branch, private = resolve_repo_ref(repo, ref, token)
+    files = {}
+    for path in (".msb/sandbox.toml", ".msb/dev.yaml"):
+        files[path] = _fetch_file(repo, path, sha, token)
+    if files[".msb/sandbox.toml"] is not None:
+        try:
+            tomllib.loads(files[".msb/sandbox.toml"].decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            die(f"{repo}: .msb/sandbox.toml at {sha[:12]} does not parse: {exc}")
+    parent = os.path.dirname(policy_dir(name))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f".{name}-", dir=parent)
+    os.makedirs(os.path.join(tmp, ".msb"), exist_ok=True)
+    for path, raw in files.items():
+        if raw is not None:
+            with open(os.path.join(tmp, path), "wb") as fh:
+                fh.write(raw)
+    problems = conf_problems(os.path.join(tmp, ".msb", "dev.yaml"))
+    if problems:
+        shutil.rmtree(tmp, ignore_errors=True)
+        die(f"{repo}: .msb/dev.yaml at {sha[:12]} sets what msbctl does not read: "
+            + "; ".join(problems))
+    meta = {"repo": repo, "ref": ref, "branch": branch, "sha": sha, "private": private,
+            "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    write_json(os.path.join(tmp, "meta.json"), meta)
+    return tmp, meta
+
+
+def install_policy(name, tmp):
+    """Swap a directory fetch_repo_policy() wrote in as policy_dir(name)."""
+    dest = policy_dir(name)
+    old = None
+    if os.path.exists(dest):
+        old = dest + ".old"
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(dest, old)
+    os.replace(tmp, dest)
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def policy_of_dir(path):
+    """project_policy() for a fetched directory that is not installed yet."""
+    cfg = read_toml(os.path.join(path, ".msb", "sandbox.toml"))
+    policy = {k: cfg[k] for k in PINNED_KEYS if k in cfg}
+    policy["_commit"] = read_json(os.path.join(path, "meta.json")).get("sha", "")
+    return policy
+
+
+def ensure_repo_policy(box):
+    """Before a create: a repo sandbox whose policy directory is missing (a new
+    machine, a wiped state directory) fetches it — at the approved commit if one
+    was ever approved, else the tip. Only then; a rebuild never refetches."""
+    if not box.is_repo or os.path.isfile(os.path.join(box.project, "meta.json")):
+        return
+    sha = (approved_policy(box.name) or {}).get("_commit") or None
+    note(f"fetching the policy of {box.repo}" + (f" at {sha[:12]}" if sha else ""))
+    tmp, _ = fetch_repo_policy(box.name, box.repo, box.entry.get("ref", ""), sha=sha)
+    install_policy(box.name, tmp)
+    box.reload()
+
+
+def policy_update(box, ref):
+    """Move a repo sandbox's policy to the tip of its ref (or of REF, which
+    also becomes its ref), showing what that changes and asking first."""
+    if not box.is_repo:
+        die(f"{box.name} is a folder sandbox; its policy is {tilde(project_path(box))} — "
+            f"`msbctl policy {box.name} approve` after changing it")
+    ref = box.entry.get("ref", "") if ref is None else ref
+    tmp, meta = fetch_repo_policy(box.name, box.repo, ref)
+    try:
+        new = policy_of_dir(tmp)
+        if policy_digest(new) == box.entry.get("policy_pin"):
+            note(f"{box.name}: {box.repo} at {meta['sha'][:12]} has the approved policy already")
+            install_policy(box.name, tmp)
+            tmp = None
+        else:
+            ask_approval(box, new, f"moving to {meta['sha'][:12]}", f"{box.repo}")
+            install_policy(box.name, tmp)
+            tmp = None
+            approve_policy(box, new)
+            note("approved")
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if ref != box.entry.get("ref", ""):
+        set_toml_key(registry_path(box), "ref", ref)
+    note(f"a `msbctl rebuild {box.name}` applies it. The clone inside is not touched: it is a")
+    note("git checkout, moved with git (`git fetch && git checkout ...` in the sandbox).")
+
+
 def refuse_before_create(box):
     """Everything that stops a create, checked BEFORE anything is removed: a
     rebuild or rename that tore the VM down first and then refused would leave
     nothing where a running sandbox was."""
+    ensure_repo_policy(box)
     refuse_conf_problems(box)
     refuse_reserved_bindings(box)
     check_policy(box, "create")
@@ -2350,6 +2689,11 @@ def bootstrap_payload(box):
         "MSB_PROJECT_SCRIPT": boot.get("script", ""),
         "MSB_CONTAINERS_STORAGE": boot.get("containers_storage", ""),
         "MSB_CACHE_LINKS": " ".join(f"{src}:{dest}" for src, dest in box.cache_links),
+        # A repo sandbox's code: cloned into the workspace volume on its first
+        # create, left alone after (a rebuild finds .git there).
+        "MSB_CLONE_URL": f"https://github.com/{box.repo}.git" if box.is_repo else "",
+        "MSB_CLONE_REF": (box.entry.get("ref") or box.repo_meta.get("branch", ""))
+                         if box.is_repo else "",
     }
     exports = "\n".join(f"export {k}={shq(v)}" for k, v in env.items())
     return (f"cat >/tmp/bootstrap.sh <<'MSB_BOOTSTRAP_EOF'\n{body}\n"
@@ -2405,12 +2749,20 @@ def cmd_purge(args, config):
     note(f"  its Claude state     {tilde(box.state)}")
     owned = box.owned_volumes()
     if owned:
-        note(f"  its disk volumes     {', '.join(owned)}  (package caches, container images)")
+        note(f"  its disk volumes     {', '.join(owned)}  (package caches, container images"
+             + (", the clone" if box.is_repo else "") + ")")
+    if box.is_repo and box.workspace_volume in owned:
+        warn(f"{box.workspace_volume} holds the clone: work in it that was not pushed is lost")
     if os.path.isfile(secret):
         note(f"  its token            {tilde(secret)}  (revoke it on GitHub too)")
+    if box.is_repo:
+        note(f"  its fetched policy   {tilde(box.project)}")
     note(f"  its registration     {tilde(entry)}")
     note("")
-    note(f"The project itself is NOT touched: {tilde(box.project)}")
+    if box.is_repo:
+        note(f"The repository on GitHub is not touched: {box.repo}")
+    else:
+        note(f"The project itself is NOT touched: {tilde(box.project)}")
     if not args.yes and not confirm(f"purge {box.name}?"):
         return
 
@@ -2418,6 +2770,8 @@ def cmd_purge(args, config):
     run(["msb", "rm", box.name], check=False, quiet=True)
     stop_agent_filter(box)
     shutil.rmtree(box.state, ignore_errors=True)
+    if box.is_repo:
+        shutil.rmtree(box.project, ignore_errors=True)
     remove_sandbox_volumes(box)
     for path in (secret, entry, approved_path(box.name)):
         try:
@@ -2482,7 +2836,8 @@ def rename_sandbox(box, new):
     moves = [(os.path.join(SECRETS_DIR, f"{old}.env"), os.path.join(SECRETS_DIR, f"{new}.env")),
              (box.state, os.path.join(STATE_DIR, "claude", new)),
              (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log")),
-             (approved_path(old), approved_path(new))]
+             (approved_path(old), approved_path(new)),
+             (policy_dir(old), policy_dir(new))]
     # Checked before anything is destroyed, so a refusal leaves it all as it was.
     clash = [dst for src, dst in moves if os.path.exists(src) and os.path.exists(dst)]
     if clash:
@@ -2584,8 +2939,15 @@ def move_project(box, raw, config):
     return True
 
 
+def refuse_repo_sandbox(box, what):
+    if box.is_repo:
+        die(f"{box.name} has no folder on this machine — it is a clone of {box.repo} inside "
+            f"the sandbox, so there is nothing to {what}")
+
+
 def cmd_move(args, config):
     box = Sandbox(args.name, config)
+    refuse_repo_sandbox(box, "move")
     if not move_project(box, args.dir, config):
         return
     if state_of(box.name) == "absent":
@@ -2679,6 +3041,7 @@ def cmd_reclaim(args, config):
 
 def cmd_code(args, config):
     box = Sandbox(args.name, config)
+    refuse_repo_sandbox(box, "open (`msbctl shell` gets you into the clone)")
     editor = os.environ.get("MSB_EDITOR", "codium")
     if not shutil.which(editor):
         die(f"{editor} is not on PATH — set MSB_EDITOR to the one you use")
@@ -2718,7 +3081,7 @@ def write_json(path, data):
 
 
 def print_one(box, table):
-    note(f"{box.name}  {state_of(box.name, table)}  {tilde(box.project)}")
+    note(f"{box.name}  {state_of(box.name, table)}  {box.location}")
 
 
 def _flatten(table, prefix=""):
@@ -2995,8 +3358,10 @@ def cmd_allow(args, config):
 
     # The registry entry REPLACES the project's list when it sets extra_rules
     # (see Sandbox._pick), so write wherever the list effectively lives.
+    # A repo sandbox has no checkout to edit, so its own list is the
+    # registry's, which ADDS to the repo's rather than replacing them.
     sandbox_toml = os.path.join(box.project, ".msb", "sandbox.toml")
-    if "extra_rules" in box.entry or not os.path.isfile(sandbox_toml):
+    if box.is_repo or "extra_rules" in box.entry or not os.path.isfile(sandbox_toml):
         target = os.path.join(REGISTRY_DIR, f"{box.name}.toml")
     else:
         target = sandbox_toml
@@ -3668,7 +4033,8 @@ def cmd_secret(args, config):
     box = Sandbox(args.name, config)
     sandbox_toml = os.path.join(box.project, ".msb", "sandbox.toml")
     target = (os.path.join(REGISTRY_DIR, f"{box.name}.toml")
-              if "secret_binds" in box.entry or not os.path.isfile(sandbox_toml) else sandbox_toml)
+              if box.is_repo or "secret_binds" in box.entry or not os.path.isfile(sandbox_toml)
+              else sandbox_toml)
     if args.action == "ls":
         own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
         for spec in box.secret_binds or ["(none)"]:
@@ -3679,6 +4045,8 @@ def cmd_secret(args, config):
         spec = next((x for x in box.secret_binds if secret_var(x) == args.var), None)
         if not spec:
             die(f"{box.name} has no secret {args.var!r} (`msbctl secret ls {box.name}`)")
+        if box.is_repo and spec not in box.registry_binds:
+            require_project_file(box)       # the repo's own binding: it says where to change it
         check_policy(box, "removing a secret")
         remove_from_toml_list(target, "secret_binds", spec)
         approve_policy(Sandbox(box.name, config))
@@ -4332,12 +4700,15 @@ def project_path(box):
 def edit_target(box, name):
     """Where to write setting `name`: the registry entry if it already overrides it
     there (it would win otherwise), else the project's sandbox.toml."""
-    if name in box.entry or not os.path.isfile(project_path(box)):
+    if box.is_repo or name in box.entry or not os.path.isfile(project_path(box)):
         return registry_path(box)
     return project_path(box)
 
 
 def require_project_file(box):
+    if box.is_repo:
+        die(f"this comes from {box.repo}'s .msb/sandbox.toml — change it there, push, then "
+            f"`msbctl policy {box.name} update` and `msbctl rebuild {box.name}`")
     if not os.path.isfile(project_path(box)):
         die(f"{tilde(project_path(box))} does not exist, and these settings live there")
     return project_path(box)
@@ -4593,7 +4964,7 @@ GH_SPEC = "GH_TOKEN@github.com,api.github.com"
 
 def _github_state(box):
     own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
-    bound = box.project_cfg.get("secrets", {}).get("github", bool(box.repo))
+    bound = box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo))
     return bool(own.get("GH_TOKEN")), bool(bound)
 
 
@@ -4612,7 +4983,9 @@ def section_github(box, config, ctx):
     """This sandbox's fine-grained PAT, for the GitHub API (PRs, CI reads) — git push
     over SSH does not use it. Set, replace or remove; applied to a running sandbox
     with `msb modify`, no rebuild."""
-    project = require_project_file(box)
+    # A repo sandbox always binds a stored token (see secret_env), so there is
+    # no project switch to flip.
+    project = None if box.is_repo else require_project_file(box)
     say("GitHub token")
     if not box.repo:
         raw = ask("GitHub repo this sandbox works on (owner/name or URL, blank to cancel)")
@@ -4631,7 +5004,8 @@ def section_github(box, config, ctx):
         github_token_help(box.repo)
         if not capture_token(box.name):
             return
-        set_toml_key(project, "github", True, table="secrets")
+        if project:
+            set_toml_key(project, "github", True, table="secrets")
         if state == "absent":
             note("not created yet, so it is bound at first start")
             return
@@ -4647,7 +5021,8 @@ def section_github(box, config, ctx):
         run(argv, env=env, check=False)
     elif action.startswith("remove"):
         set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), "GH_TOKEN", None)
-        set_toml_key(project, "github", False, table="secrets")
+        if project:
+            set_toml_key(project, "github", False, table="secrets")
         note("removed; git over SSH is unaffected")
         if state != "absent":
             _, env = Sandbox(box.name, config).secret_env()
@@ -4726,18 +5101,22 @@ def section_identity(box, config, ctx):
 
 
 def _summary_place(box):
-    return f"{box.name}, {tilde(box.project)} at {box.guest_project}"
+    return f"{box.name}, {box.location} at {box.guest_project}"
 
 
 def section_place(box, config, ctx):
     say("Name & project folder")
-    note("a bare name resolves as for `msbctl add`; / ~ ./ ../ are taken as written")
-    raw = ask("project folder", tilde(box.project))
-    if resolve_project(raw, config) != box.project and move_project(box, raw, config):
-        ctx["rebuild"].add("project folder")
-        box = Sandbox(box.name, config)
+    if box.is_repo:
+        note(f"a clone of {box.repo}: there is no host folder to move")
+    else:
+        note("a bare name resolves as for `msbctl add`; / ~ ./ ../ are taken as written")
+        raw = ask("project folder", tilde(box.project))
+        if resolve_project(raw, config) != box.project and move_project(box, raw, config):
+            ctx["rebuild"].add("project folder")
+            box = Sandbox(box.name, config)
     current = box.guest_path_setting
-    chosen = pick_guest_path(box.project, current)
+    chosen = (ask("where the clone is in the sandbox (no dots)", current) if box.is_repo
+              else pick_guest_path(box.project, current))
     if chosen != current and set_toml_key(registry_path(box), "guest_path", chosen):
         ctx["rebuild"].add("project path in the sandbox")
         box = Sandbox(box.name, config)
@@ -5027,7 +5406,7 @@ def cmd_ls(args, config):
                          if isinstance(v, dict) and v.get("available")
                          and v.get("installed")
                          and v["available"] != v["installed"])
-        rows.append((name, state_of(name, table), tilde(box.project),
+        rows.append((name, state_of(name, table), box.location,
                      ",".join(pending) or "-", "yes" if box.autostart else "no"))
 
     if args.porcelain:
@@ -5105,9 +5484,16 @@ def cmd_show(args, config):
     info = read_json(VERSIONS_CACHE).get(box.name, {})
 
     say(f"{box.name}  [{state_of(box.name, table)}]")
-    note(f"project    {tilde(box.project)}")
+    if box.is_repo:
+        meta = box.repo_meta
+        note(f"source     {box.location}, cloned inside the sandbox ({box.workspace_volume})")
+        note(f"policy     .msb/ at {meta.get('sha', '(not fetched yet)')[:12]}"
+             f"{'' if policy_pinned(box) else '  NOT APPROVED — `msbctl policy ' + box.name + '`'}")
+    else:
+        note(f"project    {tilde(box.project)}")
     note(f"in guest   {box.guest_project}")
-    note(f"repo       {box.repo or '(no GitHub remote)'}")
+    if not box.is_repo:
+        note(f"repo       {box.repo or '(no GitHub remote)'}")
     note(f"conf       {box.conf}  (read for the image only)")
     for problem in conf_problems(box.conf_path):
         warn(f"{box.conf} {problem} — ignored by msbctl, and a rebuild will refuse")
@@ -6240,7 +6626,17 @@ def resolve_project(raw, config):
     return os.path.realpath(os.path.join(root, raw) if root else raw)
 
 
+REPO_ONLY_FLAGS = ("ref", "new_name", "guest_path", "workspace_disk", "identity", "claude_token",
+                   "autostart", "yes")
+
+
 def cmd_add(args, config):
+    if args.repo:
+        return cmd_add_repo(args, config)
+    given = [f"--{f.replace('new_', '').replace('_', '-')}" for f in REPO_ONLY_FLAGS
+             if getattr(args, f, None)]
+    if given:
+        die(f"{', '.join(given)}: only with --repo (the folder wizard asks for these)")
     config = maybe_welcome(config)
     say("Register a sandbox")
     # Prompted rather than taken from the cwd when not given, because the
@@ -6467,6 +6863,114 @@ def cmd_add(args, config):
     note("The first start runs the bootstrap and takes a few minutes.")
 
 
+def cmd_add_repo(args, config):
+    """add --repo OWNER/NAME: a sandbox with no host folder. Its code is cloned
+    inside the sandbox at the first create; its policy is the repo's .msb/,
+    fetched here and approved at the commit it was read at. Flags answer the
+    questions; without a terminal, whatever no flag says takes its default.
+    Nothing is written into any folder."""
+    if args.dir:
+        die("give a folder or --repo, not both")
+    raw = args.repo.strip()
+    repo = (parse_github_url(raw) or raw).removesuffix(".git")
+    if not REPO_NAME.fullmatch(repo) or ".." in repo:
+        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    defaults = config.get("defaults", {})
+    say(f"Register a sandbox cloned from {repo}")
+
+    default_name = re.sub(r"[^a-z0-9-]+", "-", repo.split("/")[1].lower()).strip("-")
+    name = args.new_name or (ask("sandbox name", default_name) if interactive else default_name)
+    problem = name_problem(name)
+    if problem:
+        die(problem)
+    ref = args.ref if args.ref is not None else (
+        ask("branch, tag or commit (blank: the default branch)") if interactive else "")
+    # /work even when [defaults] guest_path is "host": there is no host path.
+    guest_path = args.guest_path or GUEST_PROJECT
+    problem = ("there is no host folder to mirror" if guest_path == "host"
+               else "a disk volume cannot be mounted at a path with a dot" if "." in guest_path
+               else guest_path_problem(guest_path))
+    if problem:
+        die(f"--guest-path {guest_path}: {problem}")
+    workspace_disk = args.workspace_disk
+    if workspace_disk:
+        size_bytes(workspace_disk)              # dies on a malformed size
+    idents = config.get("identities", {})
+    identity = args.identity
+    if identity is None:
+        identity = (ask("git identity (blank for none)", defaults.get("identity", ""))
+                    if interactive and idents else defaults.get("identity", "") or "")
+    if identity and identity not in idents:
+        die(f"unknown identity {identity!r} — config.toml defines: {', '.join(sorted(idents)) or '(none)'}")
+    tokens = claude_tokens()
+    claude_token = args.claude_token or ""
+    if claude_token and claude_token not in tokens:
+        die(f"no Claude token named {claude_token!r} is stored (`msbctl setup` → Claude login)")
+    if not args.claude_token and interactive and len(tokens) > 1:
+        follow = f"the default  (now {default_claude_token(config)})"
+        choice = choose_one("which Claude account this sandbox uses", [follow] + list(tokens), 0)
+        claude_token = "" if choice == follow else choice
+    autostart = args.autostart or (interactive and not args.yes
+                                   and confirm("start this one with the others by default?"))
+
+    # Kept in memory until the sandbox is registered, so declining leaves
+    # nothing behind; used for the fetch, in a header, and nowhere else.
+    token = None
+    if interactive:
+        say("GitHub token")
+        github_token_help(repo)
+        token = read_secret_hidden("paste the token") or None
+        if token and any(c.isspace() for c in token):
+            die("that token has whitespace in it — nothing was stored")
+    tmp, meta = fetch_repo_policy(name, repo, ref, token=token)
+    try:
+        cfg = read_toml(os.path.join(tmp, ".msb", "sandbox.toml"))
+        say("What the repo asks for")
+        note(f"commit       {meta['sha'][:12]}  ({meta['branch'] or ref or 'detached'})"
+             f"{'  private' if meta['private'] else ''}")
+        note(f"rule groups  base + {', '.join(cfg.get('rule_groups', defaults.get('rule_groups', []))) or '(none)'}")
+        for rule in cfg.get("extra_rules", []):
+            note(f"extra rule   {rule}")
+        for spec in cfg.get("secret_binds", []):
+            note(f"secret       {spec}")
+        for key in ("cpus", "memory", "root_disk", "containers_disk", "workspace_disk"):
+            if key in cfg:
+                note(f"{key:<12} {cfg[key]}")
+        image = conf_image(os.path.join(tmp, ".msb", "dev.yaml"))
+        note(f"image        {image or defaults.get('image', '?') + '  (the default)'}")
+        if not os.path.isfile(os.path.join(tmp, ".msb", "sandbox.toml")):
+            note("(no .msb/sandbox.toml in the repo: the machine's defaults apply)")
+        if meta["private"] and not token:
+            warn(f"{repo} is private and there is no token for {name}: the clone will fail "
+                 f"until `msbctl secret set {name} GH_TOKEN`")
+        if interactive and not args.yes and not confirm(f"register {name} with this policy?"):
+            die("cancelled — nothing was written")
+
+        os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
+        with open(registry_path_for(name), "w", encoding="utf-8") as fh:
+            fh.write(render("registry-repo.toml.in", NAME=name, REPO=repo, REF=ref,
+                            DATE=dt.date.today().isoformat(), GUEST_PATH=guest_path,
+                            IDENTITY=identity, CLAUDE_TOKEN=claude_token,
+                            AUTOSTART="true" if autostart else "false",
+                            WORKSPACE_DISK=(f'workspace_disk = "{workspace_disk}"' if workspace_disk
+                                            else f'# workspace_disk = "{defaults.get("workspace_disk", "20G")}"')))
+        install_policy(name, tmp)
+        tmp = None
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if token:
+        set_env_file_value(os.path.join(SECRETS_DIR, f"{name}.env"), "GH_TOKEN", token)
+    # The operator ran add with these arguments and, at a terminal, said yes to
+    # what was shown: that is the approval.
+    approve_policy(Sandbox(name, config))
+    note(f"wrote {tilde(registry_path_for(name))}")
+    say("Registered")
+    note(f"Nothing has been started. When you want it:  msbctl start {name}")
+    note("The first start clones the repo and runs the bootstrap; it takes a few minutes.")
+
+
 def github_token_help(repo):
     """What to create at GitHub, once per project. There is no API for it."""
     note("GitHub has no API for creating fine-grained PATs, so this part is")
@@ -6596,7 +7100,7 @@ def cmd_status(args, config):
         else:
             print(f"   as     {DIM}no identity — a repo without one cannot commit{RESET}")
         print(f"   image  {image_short(box.image_or_none())}")
-        print(f"   dir    {tilde(box.project)}")
+        print(f"   {'repo' if box.is_repo else 'dir '}   {box.location}")
         if box.observing:
             # Unmissable in the sidebar: this one is not enforcing anything, and
             # a sandbox silently left that way is the failure mode of the whole
@@ -6791,8 +7295,20 @@ def main():
     parser.add_argument("--version", action="version", version=f"msbctl {version_string()}")
     sub = parser.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("add", help="register a project")
+    p = sub.add_parser("add", help="register a project folder, or a repo to clone (--repo)")
     p.add_argument("dir", nargs="?")
+    p.add_argument("--repo", metavar="OWNER/NAME|URL",
+                   help="no host folder: clone this GitHub repo inside the sandbox")
+    p.add_argument("--ref", help="with --repo: branch, tag or commit (default: the default branch)")
+    # dest is not `name`: main() resolves every args.name against the cwd.
+    p.add_argument("--name", dest="new_name",
+                   help="with --repo: the sandbox name (default: the repo's)")
+    p.add_argument("--guest-path", metavar="PATH", help="with --repo: where the clone is (default /work)")
+    p.add_argument("--workspace-disk", metavar="SIZE", help="with --repo: the clone's volume size")
+    p.add_argument("--identity", help="with --repo: an [identities] name")
+    p.add_argument("--claude-token", metavar="NAME", help="with --repo: a stored Claude token's name")
+    p.add_argument("--autostart", action="store_true", help="with --repo: start it with the others")
+    p.add_argument("-y", "--yes", action="store_true", help="with --repo: no confirmation")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("ls", help="one line per sandbox")
@@ -6873,7 +7389,8 @@ def main():
 
     p = sub.add_parser("policy", help="show or approve the project policy a sandbox is pinned to")
     p.add_argument("name", help=DOT_HELP)
-    p.add_argument("action", nargs="?", choices=["show", "approve"], default="show")
+    p.add_argument("action", nargs="?", choices=["show", "approve", "update"], default="show")
+    p.add_argument("ref", nargs="?", help="for update: a branch, tag or commit to move to")
     p.set_defaults(func=cmd_policy)
 
     p = sub.add_parser("allow", help="add egress rules to a sandbox (host, host:port, or a full rule)")

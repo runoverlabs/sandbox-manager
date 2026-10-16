@@ -19,6 +19,10 @@
 #   MSB_CACHE_LINKS       space-separated MOUNT:DEST pairs; DEST becomes a symlink to MOUNT
 #   MSB_PROJECT_DIR       where the project is mounted (default /work)
 #   MSB_PROJECT_SCRIPT    path under the project to run last, if any
+#   MSB_CLONE_URL         https://github.com/<repo>.git for a sandbox with no host
+#                         folder: cloned into MSB_PROJECT_DIR (a disk volume) once.
+#                         Empty for a folder sandbox
+#   MSB_CLONE_REF         the branch, tag or commit to check out
 #
 # msbctl writes this file into the guest over stdin rather than mounting it.
 # The guest can see the project and the read-only profile directory and nothing else,
@@ -42,6 +46,8 @@ PROJECT_DIR="${MSB_PROJECT_DIR:-/work}"
 PROJECT_SCRIPT="${MSB_PROJECT_SCRIPT:-}"
 CONTAINERS_STORAGE="${MSB_CONTAINERS_STORAGE:-}"
 CACHE_LINKS="${MSB_CACHE_LINKS:-}"
+CLONE_URL="${MSB_CLONE_URL:-}"
+CLONE_REF="${MSB_CLONE_REF:-}"
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -115,8 +121,10 @@ do_apt() {
 	# retries that file; the second pass is for a failure that outlasts it,
 	# and only fetches what the first did not, since the rest is in apt's
 	# cache by then.
+	# git: the devcontainers image has it already, a plain one does not, and a
+	# sandbox cloned from a repo cannot do without it.
 	local pkgs=(socat jq curl ca-certificates ripgrep fd-find tree unzip file
-		yamllint shellcheck gnupg openssh-client nano)
+		yamllint shellcheck gnupg openssh-client nano git)
 	# shellcheck disable=SC2206 # deliberate word splitting: a package list
 	pkgs+=($EXTRA_PACKAGES)
 	local attempt rc=1
@@ -288,6 +296,36 @@ do_safe_directories() {
 	return 0
 }
 
+do_clone() {
+	if [ -d "$PROJECT_DIR/.git" ]; then
+		echo "   $PROJECT_DIR already holds a clone; left alone"
+		return 0
+	fi
+	# The placeholder, from the environment, at the moment git asks. msb swaps
+	# it in the Basic header on the way to github.com. Nothing is written to
+	# disk, and `credential.helper store` must never be configured. --system,
+	# on the rootfs: gone after a rebuild, set again by the next bootstrap.
+	# shellcheck disable=SC2016  # expanded when git runs the helper, not here
+	git config --system credential.https://github.com.helper \
+		'!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=${GH_TOKEN:-}"; }; f' || return 1
+	# init + fetch + checkout rather than clone: clone refuses a non-empty
+	# directory, and a fresh disk volume has lost+found in it.
+	git -C "$PROJECT_DIR" init -q || return 1
+	git -C "$PROJECT_DIR" remote add origin "$CLONE_URL" || return 1
+	# The ref first, so a pinned commit that no branch points at still
+	# arrives; then everything, so origin/<branch> exists too.
+	[ -n "$CLONE_REF" ] && git -C "$PROJECT_DIR" fetch -q origin "$CLONE_REF" 2>/dev/null
+	git -C "$PROJECT_DIR" fetch -q origin || return 1
+	echo lost+found >> "$PROJECT_DIR/.git/info/exclude"
+	# A branch name creates the tracking branch from origin/<branch>; a tag or
+	# a SHA gives a detached HEAD, which is right for a pinned ref.
+	if [ -n "$CLONE_REF" ]; then
+		git -C "$PROJECT_DIR" checkout -q "$CLONE_REF"
+	else
+		git -C "$PROJECT_DIR" checkout -q "$(git -C "$PROJECT_DIR" remote show origin | sed -n 's/.*HEAD branch: //p')"
+	fi
+}
+
 do_project_script() {
 	local script="$PROJECT_DIR/$PROJECT_SCRIPT"
 	[ -f "$script" ] || { echo "   $script not found" >&2; return 1; }
@@ -295,6 +333,10 @@ do_project_script() {
 }
 
 step required "apt packages${EXTRA_PACKAGES:+ (+$EXTRA_PACKAGES)}" -- do_apt
+
+# Before everything that works in the project: the project IS the clone.
+CLONE_NAME="${CLONE_URL#https://github.com/}"
+[ -n "$CLONE_URL" ] && step required "clone ${CLONE_NAME%.git}${CLONE_REF:+ @ $CLONE_REF}" -- do_clone
 do_container_storage() {
 	command -v fuse-overlayfs >/dev/null \
 		|| { echo "   fuse-overlayfs is not installed — add it to packages" >&2; return 1; }

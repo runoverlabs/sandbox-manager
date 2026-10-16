@@ -21,6 +21,7 @@ writes are the long-form documentation of every key; this page is the map.
 | `~/.config/msb/secrets/global.env` | the Claude token, and an optional `GH_TOKEN` for version checks (0600) |
 | `~/.config/msb/secrets/<name>.env` | that sandbox's tokens (0600) |
 | `<project>/.msb/sandbox.toml` | the project's portable policy |
+| `~/.local/state/msb/policy/<name>/` | a repo sandbox's `.msb/`, as fetched from GitHub, and `meta.json` |
 | `<project>/.msb/dev.yaml` | the image, and nothing else; read by msbctl, never passed to msb |
 | `~/.local/state/msb/claude/<name>/` | that sandbox's `~/.claude` |
 | `~/.local/state/msb/profile/` | the assembled `CLAUDE.md`, mounted read-only |
@@ -52,6 +53,7 @@ including a whole egress group, replaces the shipped value.
 | `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
 | `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
 | `identity` | `""` | the `[identities]` entry new sandboxes use |
+| `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
 
 ### `[identities.<name>]`
 
@@ -186,6 +188,7 @@ Any key it sets overrides the project's file.
 | Key | Meaning |
 | --- | --- |
 | `name`, `project` | the sandbox's name and the absolute path of its project folder |
+| `source`, `repo`, `ref` | `source = "repo"` for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder), which has `repo` and an optional `ref` instead of `project` |
 | `guest_path` | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
 | `repo` | `owner/name` on GitHub, for the token binding and the picker |
 | `identity` | an `[identities]` name; applied at every start |

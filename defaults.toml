@@ -51,6 +51,12 @@ memory = "8G"
 # layer is ~3.9 GiB, which `npm ci` can exhaust.
 root_disk = "16G"
 
+# The disk volume a sandbox cloned from a repo (`msbctl add --repo`) keeps its
+# clone on. Created once, at the first create, and kept across rebuilds —
+# that is what lets a rebuild keep unpushed work — then deleted by purge.
+# msbctl never resizes it: a volume's size is fixed when it is made.
+workspace_disk = "20G"
+
 # Rule groups every sandbox gets on top of `base`, unless its own entry
 # overrides. `base` is always emitted first and is not listed here.
 rule_groups = ["github", "claude"]

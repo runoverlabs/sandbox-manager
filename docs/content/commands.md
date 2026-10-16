@@ -27,6 +27,8 @@ rules behind this.
 
 ```text
 msbctl add [dir]
+msbctl add --repo owner/name [--ref REF] [--name NAME] [--guest-path PATH]
+           [--workspace-disk SIZE] [--identity NAME] [--claude-token NAME] [--autostart] [-y]
 ```
 
 Register a project with the setup wizard. Nothing is started. A bare name
@@ -36,6 +38,15 @@ it asks, defaulting to the current directory. It also asks where the project
 appears inside the sandbox: [`/work`, the host's own path, or a custom
 one](advanced.md#where-the-project-appears-in-the-sandbox). See
 [Get started](quickstart.md#2-register-a-project).
+
+With `--repo`, there's no folder: the sandbox clones the GitHub repo into a
+disk volume inside itself, and its policy is the repo's own `.msb/`, fetched at
+the commit it resolves to now. The flags answer what it would otherwise ask;
+without a terminal, anything not given takes its default (`/work`, the default
+branch, the repo's name). It shows what the repo asks for (commit, rule groups,
+rules, secret bindings, image) and asks before registering, unless `-y`. At a
+terminal it also asks for the sandbox's GitHub token, which a private repo
+needs. See [Sandboxes without a folder](advanced.md#sandboxes-without-a-folder).
 
 ### `msbctl ls`
 
@@ -246,12 +257,16 @@ address goes in brackets, `[fd00::5]:22`. Written to the project's
 ### `msbctl policy`
 
 ```text
-msbctl policy name|. [show|approve]
+msbctl policy name|. [show|approve|update [REF]]
 ```
 
 `show` (the default) prints the project-layer values the [policy
 pin](egress.md#the-policy-pin) covers, whether they're the approved ones, and
 what changed since. `approve` shows the change and asks; it needs a terminal.
+`update`, for a sandbox cloned from a repo, fetches the repo's `.msb/` at the
+tip of its ref (or of `REF`, which becomes its ref), shows what that commit
+changes, and swaps it in once approved; a `rebuild` then applies it. The clone
+inside the sandbox isn't touched.
 
 ### `msbctl observe`
 

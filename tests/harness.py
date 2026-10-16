@@ -52,6 +52,9 @@ class MsbctlTest(unittest.TestCase):
         self.addCleanup(self._restore_env)
         self.home = os.path.join(self.tmp, "home")
         os.makedirs(self.home)
+        # Not the checkout: its own .msb/ would name a sandbox for the cwd.
+        self.addCleanup(os.chdir, os.getcwd())
+        os.chdir(self.tmp)
         os.environ.update({
             "HOME": self.home,
             "MSB_CONFIG_DIR": os.path.join(self.home, ".config", "msb"),

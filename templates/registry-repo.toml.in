@@ -1,0 +1,66 @@
+# {{NAME}} — registry entry for a sandbox cloned from a repo, written by
+# `msbctl add --repo` on {{DATE}}.
+#
+# Machine-local. Lives in ~/.config/msb/sandboxes/ and is never committed.
+#
+# There is NO `project` here, and no host folder anywhere: the code is cloned
+# from GitHub into a disk volume inside the sandbox ({{NAME}}-workspace), which
+# a rebuild keeps and `msbctl purge {{NAME}}` deletes. Work leaves the sandbox
+# by `git push` from inside it.
+#
+# The project's policy (egress rules, secret bindings, resources, packages) is
+# the repo's own .msb/sandbox.toml and .msb/dev.yaml, read from GitHub at a
+# recorded commit — never the checkout inside the sandbox, which the guest can
+# edit. A rebuild stays on that commit; `msbctl policy {{NAME}} update` moves to
+# a newer one and shows what it changes first. So a change meant to last
+# belongs in the repo: push it, then `policy update`.
+#
+# `msbctl allow`, `secret add` and `edit` write HERE, because there is no
+# checkout on this machine to edit. Their `extra_rules` and `secret_binds` ADD
+# to the repo's lists rather than replacing them.
+
+name     = "{{NAME}}"
+source   = "repo"
+repo     = "{{REPO}}"
+# A branch, tag or commit; empty means the repo's default branch. The policy is
+# read at the commit this resolved to when it was approved; the clone checks
+# out this ref once, at the first create, and after that it is a git checkout
+# like any other, moved with git inside the sandbox.
+ref      = "{{REF}}"
+
+# Where the clone is inside the sandbox. No dots anywhere in it: a disk volume
+# cannot be mounted at such a path. Not "host": there is no host path.
+guest_path = "{{GUEST_PATH}}"
+
+# Git identity, by name from config.toml's [identities], applied with
+# `git config --system` on every start. Empty for none.
+identity = "{{IDENTITY}}"
+
+# Which stored Claude token this sandbox logs in with; empty follows
+# [defaults] claude_token. Read on every start.
+claude_token = "{{CLAUDE_TOKEN}}"
+
+# Started by `msbctl start --autostart` and the picker's "start autostart set".
+autostart = {{AUTOSTART}}
+
+# No ssh-agent is forwarded: on a remote host there is nobody's agent to give
+# it, and git uses HTTPS with this sandbox's GitHub token instead.
+ssh_keys = []
+
+# The size of the clone's volume. Fixed when the volume is first created;
+# msbctl never resizes it. Absent means [defaults] workspace_disk.
+{{WORKSPACE_DISK}}
+
+# WRITTEN BY msbctl. The digest of the repo policy last approved, commit
+# included. `msbctl policy {{NAME}}` shows it.
+policy_pin = ""
+
+# ---------------------------------------------------------------- overrides
+#
+# Optional, as for any sandbox: image, cpus, memory, root_disk, rule_groups,
+# extra_rules (added to the repo's), secret_binds (likewise), egress_mode.
+
+# ----------------------------------------------------------------- versions
+#
+# WRITTEN BY `msbctl update`: what was installed, so a rebuild reproduces it.
+[versions]
