@@ -421,7 +421,7 @@ The other machines this one drives; the menu's **remote hosts** does the same.
 `add` records `[remotes.NAME]` in `config.toml`. At a terminal it then runs
 `setup`; otherwise it prints the `msbctl host authorize` line to run there and
 tests the connection. `setup` looks at the host over ssh and offers, one
-question each, what's missing: msb, msbctl at this machine's version,
+question each, what's missing: msb and msbctl, both at this machine's versions,
 the kvm group, autostart, and last restricting this machine's key to
 `host serve` (it warns first when that key is the one with a shell there). Then
 it tests. `test` runs

@@ -8012,7 +8012,33 @@ def remote_test(name, config, batch=True):
 
 
 RELEASES = "https://github.com/runoverlabs/sandbox-manager/releases"
-MSB_INSTALLER = "https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh"
+MSB_RELEASES = "https://github.com/microsandbox/microsandbox/releases"
+MSB_INSTALLER = f"{MSB_RELEASES}/latest/download/install.sh"
+# microsandbox's installer always installs the LATEST release: it asks the
+# GitHub API and has no version option, even in the copy attached to an older
+# release. So for one version, that release's own install.sh is fetched and its
+# single call to get_latest_version replaced by the version; its download and
+# checksum steps run unchanged. If that line is not there exactly once the
+# installer has changed shape, and nothing runs. $1 the releases URL, $2 the
+# version (checked against MSB_VERSION first).
+MSB_PINNED_INSTALL = r"""set -e
+t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
+curl -fsSL "$1/download/v$2/install.sh" -o "$t/install.sh"
+[ "$(grep -c '^    get_latest_version$' "$t/install.sh")" = 1 ] || {
+	echo "msb's installer has changed shape; install msb $2 there by hand" >&2; exit 1; }
+sed 's/^    get_latest_version$/    VERSION="v'"$2"'"/' "$t/install.sh" > "$t/pinned.sh"
+sh "$t/pinned.sh"
+"""
+MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
+
+
+def local_msb_version():
+    """This machine's msb version (`0.7.6`), or None without one."""
+    if not shutil.which("msb"):
+        return None
+    proc = subprocess.run(["msb", "--version"], capture_output=True, text=True)
+    match = MSB_VERSION.search(proc.stdout or "")
+    return match.group(0) if match else None
 
 # What `remote setup` needs to know about a host, as key=value lines, run by
 # remote_sh().
@@ -8091,11 +8117,25 @@ def remote_setup(name, config):
     wanted = own_release()
     if not probe.get("curl") and (not probe.get("msb") or not probe.get("msbctl")):
         die(f"{name} has no curl, which both installers need — install it there first")
-    if not probe.get("msb"):
+    # The same msb as here: a sandbox's behaviour is msb's (spike 11 is a
+    # difference between two patch releases), and what works here should work
+    # there. Without msb here, the latest release.
+    want = local_msb_version()
+    match = MSB_VERSION.search(probe.get("msb") or "")
+    there = match.group(0) if match else ""
+    if not there or (want and there != want):
         note("")
-        note(f"msb from microsandbox's installer ({MSB_INSTALLER})")
-        if confirm(f"install msb on {name}?"):
-            if remote_sh(dest, f"curl -fsSL {shlex.quote(MSB_INSTALLER)} | sh", tty=wants_tty()).returncode:
+        if there:
+            warn(f"msb {there} on {name}, {want} here")
+            note("installing over it replaces it for every sandbox already there; one")
+            note("created by another msb version may not start under this one")
+        question = (f"install msb {want or '(the latest release)'} on {name}?" if not there
+                    else f"replace msb {there} on {name} with {want}?")
+        if confirm(question):
+            script = (MSB_PINNED_INSTALL if want
+                      else f"curl -fsSL {shlex.quote(MSB_INSTALLER)} | sh")
+            args = (MSB_RELEASES, want) if want else ()
+            if remote_sh(dest, script, *args, tty=wants_tty()).returncode:
                 die(f"installing msb on {name} failed (above)")
     theirs = (probe.get("msbctl") or "").split()[1:2]
     theirs = theirs[0] if theirs else ""
