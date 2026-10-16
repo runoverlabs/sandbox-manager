@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `ls --json`, `show --json`, `msbctl secret set … --stdin` and `msbctl setup --claude-token NAME --stdin` for scripts; no secret value is ever printed.
 - `msbctl add --repo owner/name` creates a sandbox with no host folder: the repo is cloned into a disk volume that survives rebuilds, and its policy is read from the repo's `.msb/` at a recorded commit (`msbctl policy <name> update` moves it).
 - Changes to a project's egress rules, secret bindings or resources must be approved on the host (`msbctl policy`) before a create or rebuild applies them, and `.msb/` is read-only inside the sandbox; the first rebuild after upgrading asks once.
 

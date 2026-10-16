@@ -51,12 +51,15 @@ needs. See [Sandboxes without a folder](advanced.md#sandboxes-without-a-folder).
 ### `msbctl ls`
 
 ```text
-msbctl ls [--refresh] [--porcelain] [--picker]
+msbctl ls [--refresh] [--porcelain] [--picker] [--json]
 ```
 
 One line per sandbox: name, state, project, pending updates, autostart.
 `--refresh` checks upstream versions first. `--porcelain` prints tab-separated
-fields for scripts; `--picker` is the format `msb-picker` reads.
+fields for scripts; `--picker` is the format `msb-picker` reads. `--json` prints
+one JSON document, `{"msbctl": version, "sandboxes": [...]}`, each with
+`name`, `state`, `source`, `location`, `repo`, `ref`, `autostart` and
+`updates`.
 
 ### `msbctl status`
 
@@ -70,12 +73,14 @@ image, folder. `--quick` skips reading figures from inside each guest.
 ### `msbctl show`
 
 ```text
-msbctl show [name]
+msbctl show [name] [--json]
 ```
 
 Everything about one sandbox: resources, disks, extra folders, installed
 versions, environment, every egress rule in the order it's emitted, and the
-identity, keys and secrets bound to it.
+identity, keys and secrets bound to it. `--json` prints the essentials as one
+JSON document; for each secret it says whether a value is **stored**, never
+what it is.
 
 ### `msbctl config`
 
@@ -305,10 +310,16 @@ ports given it lists them, and `--rm` stops publishing one. Needs a rebuild. See
 msbctl secret add name|.
 msbctl secret ls  name|.
 msbctl secret rm  name|. VAR
+msbctl secret set name|. VAR [--stdin] [--restart]
 ```
 
 Tokens the sandbox can use but never see. `add` offers the presets or takes
-your own binding. See [Credentials & SSH](credentials.md#more-secrets).
+your own binding. `set` stores a new value for a variable the sandbox already
+binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt or, with
+`--stdin`, from standard input; binding a new variable is `add`. A running
+sandbox uses the new value from its next start, or now with `--restart`. See
+[Credentials & SSH](credentials.md#more-secrets) and
+[Scripting](credentials.md#scripting-storing-a-token-from-a-password-manager).
 
 ### `msbctl keys`
 
@@ -345,11 +356,14 @@ recorded so a rebuild reproduces them. Run `msbctl ls --refresh` first for
 
 ```text
 msbctl setup [--welcome]
+msbctl setup --claude-token NAME [--stdin]
 ```
 
 Your machine-level settings as a menu: git identities, Claude login, your
 network, new-sandbox defaults, or the config file itself. `--welcome` runs the
-first-time walk-through.
+first-time walk-through. `--claude-token NAME` skips the menu and stores one
+Claude token under that name (`main` is the default one), from a hidden prompt
+or `--stdin`.
 
 ### `msbctl self-update`
 

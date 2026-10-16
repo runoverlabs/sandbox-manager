@@ -23,7 +23,7 @@
     msbctl allow <name> host…     add egress rules (then rebuild to apply)
     msbctl policy <name> [approve]   the project policy it is pinned to; approve a change
     msbctl observe <name> [on|off|report]   stop blocking and record what is reached
-    msbctl secret add|rm|ls <name>   extra tokens the sandbox can use but not see
+    msbctl secret add|rm|ls|set <name>   extra tokens the sandbox can use but not see
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
     msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (then rebuild)
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
@@ -56,6 +56,7 @@ tomllib, so there is no TOML serializer here to rot. The one exception is the
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import hashlib
 import ipaddress
@@ -4027,10 +4028,121 @@ def pick_secrets(config, taken=()):
     return out
 
 
+SECRET_MAX_BYTES = 8 * 1024
+
+
+def read_secret_input(prompt, from_stdin):
+    """A secret value from stdin (one trailing newline dropped) or a hidden
+    prompt. Dies on an empty value, whitespace inside one, or one over 8 KiB,
+    and never says what it read."""
+    if from_stdin:
+        value = sys.stdin.read()
+        value = value[:-1] if value.endswith("\n") else value
+        value = value[:-1] if value.endswith("\r") else value
+    else:
+        value = read_secret_hidden(prompt)
+    if not value:
+        die("no value given — nothing was stored")
+    if any(c.isspace() for c in value):
+        die("the value has whitespace in it — nothing was stored")
+    if len(value.encode()) > SECRET_MAX_BYTES:
+        die(f"the value is over {SECRET_MAX_BYTES // 1024} KiB — nothing was stored")
+    return value
+
+
+def msb_bound_secrets(name):
+    """The variables msb has a binding for in this sandbox, or None if it
+    cannot say. A binding is made at create time, and only for a variable that
+    had a value then (secret_env() skips the rest), so a value stored later
+    may have nothing in msb to substitute it."""
+    proc = subprocess.run(["msb", "inspect", name, "--format", "json"],
+                          capture_output=True, text=True)
+    try:
+        network = json.loads(proc.stdout)["config"]["network"]
+        return {item["env_var"] for item in (network.get("secrets") or {}).get("secrets", [])}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def bind_secret_live(box, config, spec, restart):
+    """After a value for `spec` was stored: make the existing sandbox use it.
+    Already bound, a restart is all it takes (msb reads the value at start);
+    not bound yet, `msb modify --secret` adds the binding, applied at the next
+    start or, with `restart`, now."""
+    state = state_of(box.name)
+    if state == "absent":
+        note("not created yet, so it is bound at first start")
+        return
+    box = Sandbox(box.name, config)
+    _, env = box.secret_env()
+    bound = msb_bound_secrets(box.name)
+    if bound is not None and secret_var(spec) in bound:
+        if restart and state == "running":
+            run(["msb", "stop", box.name], check=False, quiet=True)
+            ensure_running(box)
+            note(f"{box.name} restarted with the new value")
+        else:
+            note(f"used from the next start of {box.name}"
+                 + ("" if state != "running" else f" (`--restart`, or `msbctl stop {box.name}` and start)"))
+        return
+    if ":" in spec.split("@", 1)[0]:
+        note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
+        return
+    argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec)]
+    if state == "running":
+        argv.append("--restart" if restart else "--next-start")
+    run(argv, env=env)
+    note(f"bound; {'applied now' if restart and state == 'running' else 'used from the next start'}")
+
+
+def secret_set(box, config, args):
+    """secret set <name> VAR [--stdin] [--restart]: store a value for a variable
+    this sandbox ALREADY binds (GH_TOKEN, or one of its secret_binds). Storing
+    a value is not a policy change; binding a new variable, or the same one to
+    another host, is `secret add`, which is."""
+    var = args.var or die("secret set needs the variable: `msbctl secret set <name> VAR`")
+    specs = [x for x in box.secret_binds if secret_var(x) == var and not is_reserved_var(var)]
+    if var != "GH_TOKEN" and not specs:
+        if is_reserved_var(var):
+            die(f"{var} is not stored per sandbox — a Claude token is `msbctl setup --claude-token NAME`")
+        die(f"{box.name} does not bind {var} (`msbctl secret ls {box.name}`); binding a new "
+            "variable is `msbctl secret add`")
+    if var != "GH_TOKEN":
+        # The binding says which host the value goes to, and it comes from the
+        # project: an edit nobody approved must not be bound live by this.
+        check_policy(box, f"binding {var}")
+    # A folder sandbox that does not bind GitHub yet: turning that on is
+    # `[secrets] github = true` in the project, a pinned key. Checked before
+    # anything is read or stored.
+    github_off = var == "GH_TOKEN" and not (
+        box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo)))
+    if github_off and restricted():
+        die(f"{box.name} does not bind GH_TOKEN, and turning that on changes the project's "
+            f"policy — on the host: `msbctl edit {box.name}` → GitHub token")
+    value = read_secret_input(f"the {var} value", args.stdin)
+    path = os.path.join(SECRETS_DIR, f"{box.name}.env")
+    set_env_file_value(path, var, value)
+    note(f"{var} stored in {tilde(path)} (0600)")
+    if var != "GH_TOKEN":
+        bind_secret_live(box, config, specs[0], args.restart)
+        return
+    if github_off:
+        project = require_project_file(box)
+        check_policy(box, "binding GitHub")
+        set_toml_key(project, "github", True, table="secrets")
+        approve_policy(Sandbox(box.name, config))
+    bind_secret_live(box, config, GH_SPEC, args.restart)
+
+
 def cmd_secret(args, config):
-    """secret add|rm|ls <name> — extra credentials for an existing sandbox. New
+    """secret add|rm|ls|set <name> — extra credentials for an existing sandbox. New
     ones are registered with `msb modify`, so no rebuild is needed (a restart is)."""
     box = Sandbox(args.name, config)
+    if (getattr(args, "stdin", False) or getattr(args, "restart", False)) and args.action != "set":
+        die("--stdin and --restart are for `msbctl secret set`")
+    if args.action == "set":
+        secret_set(box, config, args)
+        return
     sandbox_toml = os.path.join(box.project, ".msb", "sandbox.toml")
     target = (os.path.join(REGISTRY_DIR, f"{box.name}.toml")
               if box.is_repo or "secret_binds" in box.entry or not os.path.isfile(sandbox_toml)
@@ -4630,7 +4742,24 @@ def cmd_self_update(args, config):
     os.execvp("sh", argv)
 
 
+def store_claude_token(args):
+    """setup --claude-token NAME [--stdin]: no menu, for a host with no one at
+    it — the value arrives over stdin (from a password manager, through ssh)."""
+    name = args.claude_token
+    if not CLAUDE_TOKEN_NAME.fullmatch(name):
+        die(f"{name!r}: a Claude token's name is lowercase letters, digits and _ "
+            f"(`{CLAUDE_TOKEN_MAIN}` is the default one)")
+    value = read_secret_input(f"the Claude token {name!r}", args.stdin)
+    set_env_file_value(GLOBAL_ENV, claude_token_var(name), value)
+    note(f"Claude token {name!r} stored in {tilde(GLOBAL_ENV)} (0600); read at each sandbox's next start")
+
+
 def cmd_setup(args, config):
+    if getattr(args, "claude_token", None):
+        store_claude_token(args)
+        return
+    if getattr(args, "stdin", False):
+        die("--stdin is for `msbctl setup --claude-token NAME --stdin`")
     ensure_local_config()
     welcome = getattr(args, "welcome", False)
     if welcome:
@@ -5006,19 +5135,9 @@ def section_github(box, config, ctx):
             return
         if project:
             set_toml_key(project, "github", True, table="secrets")
-        if state == "absent":
-            note("not created yet, so it is bound at first start")
-            return
-        _, env = Sandbox(box.name, config).secret_env()
-        argv = ["msb", "modify", box.name, "--secret", GH_SPEC]
-        if state == "running":
-            # A running guest keeps its current placeholder bindings until restarted.
-            if confirm(f"apply now — this restarts {box.name}?"):
-                argv.append("--restart")
-            else:
-                note("saved; it is bound on the next restart")
-                return
-        run(argv, env=env, check=False)
+        # A running guest keeps its current placeholder bindings until restarted.
+        restart = state == "running" and confirm(f"apply now — this restarts {box.name}?")
+        bind_secret_live(box, config, GH_SPEC, restart)
     elif action.startswith("remove"):
         set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), "GH_TOKEN", None)
         if project:
@@ -5388,26 +5507,26 @@ def cmd_config(args, config):
         note(f"  {path:<34} {value}   {DIM}{origin}{RESET}")
 
 
+def print_json(data):
+    """Machine-readable output: one JSON document on stdout, and nothing else."""
+    json.dump(data, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+
 def cmd_ls(args, config):
+    if args.json:
+        # Everything a human would read goes to stderr meanwhile, so stdout is
+        # exactly one JSON document whatever a probe or a warning says.
+        with contextlib.redirect_stdout(sys.stderr):
+            data = ls_data(args, config)
+        print_json(data)
+        return
     names = registered()
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
         return
-    table = msb_table()
-    cache = read_json(VERSIONS_CACHE)
-    if args.refresh:
-        cache = refresh_versions(names, config, cache)
-
-    rows = []
-    for name in names:
-        box = Sandbox(name, config)
-        info = cache.get(name, {})
-        pending = sorted(c for c, v in info.items()
-                         if isinstance(v, dict) and v.get("available")
-                         and v.get("installed")
-                         and v["available"] != v["installed"])
-        rows.append((name, state_of(name, table), box.location,
-                     ",".join(pending) or "-", "yes" if box.autostart else "no"))
+    rows = [(r["name"], r["state"], r["location"], ",".join(r["updates"]) or "-",
+             "yes" if r["autostart"] else "no") for r in ls_rows(args, config, names)]
 
     if args.porcelain:
         for row in rows:
@@ -5437,6 +5556,32 @@ def cmd_ls(args, config):
     print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)) + RESET)
     for row in rows:
         print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)))
+
+
+def ls_rows(args, config, names):
+    """One dict per sandbox: what `ls` shows, in every format."""
+    table = msb_table()
+    cache = read_json(VERSIONS_CACHE)
+    if args.refresh:
+        cache = refresh_versions(names, config, cache)
+    rows = []
+    for name in names:
+        box = Sandbox(name, config)
+        info = cache.get(name, {})
+        pending = sorted(c for c, v in info.items()
+                         if isinstance(v, dict) and v.get("available")
+                         and v.get("installed")
+                         and v["available"] != v["installed"])
+        rows.append({"name": name, "state": state_of(name, table), "source": box.source,
+                     "location": box.location, "repo": box.repo,
+                     "ref": box.entry.get("ref", "") if box.is_repo else "",
+                     "autostart": box.autostart, "updates": pending})
+    return rows
+
+
+def ls_data(args, config):
+    """`ls --json`: {"msbctl": version, "sandboxes": [...]}. Never a secret."""
+    return {"msbctl": version_string(), "sandboxes": ls_rows(args, config, registered())}
 
 
 def cmd_entry(args, config):
@@ -5478,7 +5623,45 @@ def version_lines(box, info):
     return lines
 
 
+def show_data(box, table=None):
+    """`show --json`: what one sandbox resolves to. Says whether each secret is
+    STORED, never what it is: no value is ever put in here."""
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
+    shared = read_env_file(GLOBAL_ENV)
+    secrets = []
+    for spec in box.secret_binds:
+        var = secret_var(spec)
+        from_registry = spec in box.registry_binds
+        secrets.append({"var": var, "hosts": spec.rpartition("@")[2].split(","),
+                        "origin": "registry" if from_registry else "project",
+                        "reserved": is_reserved_var(var),
+                        "stored": bool(own.get(var) or (from_registry and shared.get(var)))})
+    data = {
+        "name": box.name, "state": state_of(box.name, table), "source": box.source,
+        "location": box.location, "repo": box.repo,
+        "ref": box.entry.get("ref", "") if box.is_repo else "",
+        "image": box.image_or_none(), "cpus": box.cpus, "memory": str(box.memory),
+        "root_disk": str(box.root_disk), "guest_path": box.guest_project,
+        "egress_mode": box.egress_mode, "rule_groups": box.rule_groups,
+        "extra_rules": box.extra_rules,
+        "ports": [spec for spec, *_ in box.published_ports],
+        "policy_approved": policy_pinned(box),
+        "claude_token": {"name": box.claude_token,
+                         "stored": box.claude_token in claude_tokens(shared)},
+        "github_token_stored": bool(own.get("GH_TOKEN")),
+        "secrets": secrets,
+    }
+    if box.is_repo:
+        data["commit"] = box.repo_meta.get("sha", "")
+    return data
+
+
 def cmd_show(args, config):
+    if args.json:
+        with contextlib.redirect_stdout(sys.stderr):
+            data = show_data(Sandbox(args.name, config))
+        print_json(data)
+        return
     box = Sandbox(args.name, config)
     table = msb_table()
     info = read_json(VERSIONS_CACHE).get(box.name, {})
@@ -7316,6 +7499,7 @@ def main():
     p.add_argument("--porcelain", action="store_true", help="tab-separated, for scripts")
     p.add_argument("--picker", action="store_true",
                    help="name<TAB>padded display text, for msb-picker")
+    p.add_argument("--json", action="store_true", help="one JSON document, for scripts")
     p.set_defaults(func=cmd_ls)
 
     p = sub.add_parser("entry", help="edit a sandbox's registry entry")
@@ -7329,6 +7513,7 @@ def main():
 
     p = sub.add_parser("show", help="everything about one sandbox")
     p.add_argument("name", nargs="?", help=NAME_HELP)
+    p.add_argument("--json", action="store_true", help="one JSON document; no secret values")
     p.set_defaults(func=cmd_show)
 
     # `names` (plural) marks a verb as repeatable: main() loops over them. The
@@ -7382,9 +7567,13 @@ def main():
     p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("secret", help="add, remove or list extra secrets for a sandbox")
-    p.add_argument("action", choices=["add", "rm", "ls"])
+    p.add_argument("action", choices=["add", "rm", "ls", "set"])
     p.add_argument("name", help=DOT_HELP)
-    p.add_argument("var", nargs="?", help="for rm: the variable name")
+    p.add_argument("var", nargs="?", help="for rm and set: the variable name")
+    p.add_argument("--stdin", action="store_true",
+                   help="for set: read the value from stdin (one trailing newline dropped)")
+    p.add_argument("--restart", action="store_true",
+                   help="for set: restart a running sandbox so the value is used now")
     p.set_defaults(func=cmd_secret)
 
     p = sub.add_parser("policy", help="show or approve the project policy a sandbox is pinned to")
@@ -7437,6 +7626,9 @@ def main():
 
     p = sub.add_parser("setup", help="your machine-level settings: identities, Claude login, network, defaults")
     p.add_argument("--welcome", action="store_true", help="the guided first-run walk-through")
+    p.add_argument("--claude-token", metavar="NAME",
+                   help="no menu: store a Claude token under this name (main is the default)")
+    p.add_argument("--stdin", action="store_true", help="with --claude-token: read it from stdin")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("edit", help="edit an existing sandbox, one wizard section at a time")
