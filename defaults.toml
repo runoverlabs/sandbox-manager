@@ -308,7 +308,8 @@ rust = [
 # one fails only after auth and manifests succeed, mid-pull, as "connection
 # refused" on production.cloudfront.docker.com. Codeberg's registry is
 # codeberg.org itself (Forgejo serves its packages and their blobs from the
-# same host). Add quay.io etc. as you need.
+# same host). mcr.microsoft.com is where the devcontainers images (the default
+# image) come from. Add quay.io etc. as you need.
 containers = [
     "allow@registry-1.docker.io:tcp:443",
     "allow@auth.docker.io:tcp:443",
@@ -317,6 +318,7 @@ containers = [
     "allow@ghcr.io:tcp:443",
     "allow@pkg-containers.githubusercontent.com:tcp:443",
     "allow@codeberg.org:tcp:443",
+    "allow@mcr.microsoft.com:tcp:443",
 ]
 
 go = [

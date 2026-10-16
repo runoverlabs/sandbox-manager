@@ -20,3 +20,4 @@ docs/_site/
 
 # ruff, when run by hand (check.sh passes --no-cache)
 .ruff_cache/
+.claude

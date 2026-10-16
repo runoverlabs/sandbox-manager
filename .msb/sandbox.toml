@@ -33,6 +33,7 @@ rule_groups = [
     "containers",
     "github",
     "npm",
+    "python",
 ]
 
 # Allow DNS answers that resolve to private (RFC1918) addresses.
@@ -120,13 +121,17 @@ containers_disk = "20G"
 # ca-certificates, ripgrep, fd-find (as `fd`), tree, unzip, file, yamllint,
 # shellcheck.
 packages = [
+    "python3-venv",
+    "python3-pip",
+    "flake8",
+    "mypy",
     "podman",
     "nftables",
 ]
 
-# bun and gitleaks are off by default — nothing currently needs them.
+# bun is off — nothing here needs it. gitleaks is on: check.sh runs it.
 bun = false
-gitleaks = false
+gitleaks = true
 claude = true
 
 # Run after everything else, inside the guest, with the repo at /work. Use it
