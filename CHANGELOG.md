@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-16
+
 ### Added
 - `msbctl remote add` registers another machine; `host:name` addresses a sandbox there, and `ls` and the picker show every host.
 - `msbctl host serve|authorize|check`: run a machine as a remote sandbox host whose SSH key for everyday use cannot read secrets or change policy.
