@@ -82,8 +82,12 @@ Either way, at a terminal it goes straight on to `msbctl remote setup sbx-01`,
 which does the host's half from here while your key still has a shell there.
 It looks at the host and asks before each step:
 
-- install msb with microsandbox's installer, and msbctl at this machine's
-  version (a checkout installs the latest release);
+- install msb at the version this machine runs, with that release's own
+  installer (without msb here, the latest), and offer to replace a different
+  version already there, warning that sandboxes it made may not start under
+  another;
+- install msbctl at this machine's version (a checkout installs the latest
+  release);
 - add the user to the `kvm` group if it can't open `/dev/kvm` (with `sudo -n`,
   if that works without a password);
 - install autostart, and turn lingering on the same way;
