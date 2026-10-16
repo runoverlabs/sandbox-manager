@@ -15,7 +15,8 @@ CHECK = {"msbctl": "0.0.0", "restricted": True, "checks": []}
 
 def probe(**over):
     # The fake msb here says 0.7.7: the same, so no test meets a mismatch by accident.
-    values = {"user": "msb", "msb": "msb 0.7.7", "msbctl": "", "kvm": "rw", "curl": "/usr/bin/curl",
+    values = {"user": "msb", "path": "", "bare": "", "msb": "msb 0.7.7", "msbctl": "", "kvm": "rw",
+              "curl": "/usr/bin/curl",
               "linger": "yes", "unit": "yes", "sudo": "no", **over}
     return "".join(f"{k}={v}\n" for k, v in values.items())
 
@@ -95,6 +96,61 @@ class RemoteSetupTest(MsbctlTest):
         proc = subprocess.run(["sh", "-n", "-c", self.m.MSB_PINNED_INSTALL])
         self.assertEqual(proc.returncode, 0)
 
+    def program(self):
+        return self.m.load_config()["remotes"]["sbx-01"].get("msbctl", "msbctl")
+
+    def test_msbctl_off_the_ssh_path_is_used_by_its_path(self):
+        found = "/home/msb/.local/bin/msbctl"
+        patch, calls = self.ssh(probe(msbctl=f"msbctl {self.mine}", path=found))
+        with patch:
+            code, out, err = self.run_main("remote", "setup", "sbx-01", stdin="\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.program(), found)
+        self.assertIn(f"using {found}", out)
+        self.assertEqual(calls[-1][-1], f"{found} host check --json")
+        patch, calls = self.ssh()
+        with patch:
+            self.run_main("ls")
+        self.assertEqual(calls[0][-1], f"{found} ls --json")
+
+    def test_on_the_ssh_path_it_stays_bare(self):
+        patch, _ = self.ssh(probe(msbctl=f"msbctl {self.mine}", path="/usr/bin/msbctl", bare="/usr/bin/msbctl"))
+        with patch:
+            self.run_main("remote", "setup", "sbx-01", stdin="\n")
+        self.assertEqual(self.program(), "msbctl")
+
+    def test_restricting_the_key_forgets_the_path(self):
+        found = "/home/msb/.local/bin/msbctl"
+        patch, _ = self.ssh(probe(msbctl=f"msbctl {self.mine}", path=found), grep=KEY + "\n")
+        with patch:
+            code, _, err = self.run_main("remote", "setup", "sbx-01", stdin="1\ny\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.program(), "msbctl")
+
+    def test_ls_says_what_to_do_about_a_missing_msbctl(self):
+        real = subprocess.run
+
+        def fake(argv, *a, **kw):
+            if argv and argv[0] == "ssh":
+                return subprocess.CompletedProcess(argv, 127, "", "bash: line 1: msbctl: command not found\n")
+            return real(argv, *a, **kw)
+        with mock.patch.object(self.m.subprocess, "run", fake):
+            code, out, err = self.run_main("ls")
+        self.assertIn("msbctl remote setup sbx-01", out)
+
+    def test_a_checkout_offers_the_release_it_started_from(self):
+        patch, calls = self.ssh(probe())
+        with patch:
+            code, out, err = self.run_main("remote", "setup", "sbx-01", stdin="n\n")
+        base = self.mine.split("+")[0]
+        self.assertIn(f"install msbctl v{base}", out)
+
+    def test_a_bad_recorded_program_is_refused(self):
+        self.m.set_toml_key(self.m.CONFIG_FILE, "msbctl", "msbctl; rm -rf ~", table="remotes.sbx-01")
+        code, _, err = self.run_main("ls")
+        self.assertNotEqual(code, 0)
+        self.assertIn("not `msbctl` or an absolute path", err)
+
     def test_nothing_runs_without_a_yes(self):
         patch, calls = self.ssh(probe(msb="", msbctl="", unit="no"))
         with patch:
@@ -156,6 +212,21 @@ class RemoteSetupTest(MsbctlTest):
         self.assertIn("msbctl add --repo acme/web-app --name web-app", self.commands(calls))
         self.assertIn("sbx-01:web-app", out)
         self.assertEqual(self.msb_calls(), [])
+
+    def test_add_on_a_host_without_msbctl_offers_setup(self):
+        real = subprocess.run
+
+        def fake(argv, *a, **kw):
+            if argv and argv[0] == "ssh":
+                return subprocess.CompletedProcess(argv, 127, "", "bash: line 1: msbctl: command not found\n")
+            return real(argv, *a, **kw)
+        with mock.patch.object(self.m.subprocess, "run", fake):
+            # where: 2 = sbx-01; set it up now: no.
+            code, out, err = self.run_main("add", stdin="2\nn\n", tty=True)
+        self.assertNotEqual(code, 0)
+        self.assertIn("has no msbctl", err)
+        self.assertIn("remote setup sbx-01", err)
+        self.assertNotIn("GitHub repo", out)
 
     def test_add_here_still_works(self):
         patch, calls = self.ssh()
