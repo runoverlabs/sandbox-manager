@@ -73,6 +73,17 @@ policy_pin = ""
 # `msbctl rebuild {{NAME}}` applies it.
 {{MOUNTS}}
 
+# ------------------------------------------------------ this machine's groups
+#
+# Egress groups only THIS machine defines (your own, in config.toml's [rules],
+# such as one for a homelab's LAN hosts), added to the project's rule_groups.
+# Here and not in the project because nobody who clones it has them: in its
+# sandbox.toml they would make every other machine's create fail with "unknown
+# rule group". `msbctl add` and `msbctl edit {{NAME}}` → Features & agents put
+# them here. A group listed in [defaults] private_dns_groups turns on
+# allow_private_dns for this sandbox as well. Fixed at create time: rebuild.
+{{EXTRA_RULE_GROUPS}}
+
 # --------------------------------------------------------- published ports
 #
 # Host ports that reach a server inside the sandbox, so a browser here can open

@@ -58,7 +58,9 @@ policy_pin = ""
 # ---------------------------------------------------------------- overrides
 #
 # Optional, as for any sandbox: image, cpus, memory, root_disk, rule_groups,
-# extra_rules (added to the repo's), secret_binds (likewise), egress_mode.
+# extra_rules (added to the repo's), secret_binds (likewise), egress_mode, and
+# extra_rule_groups: this machine's own groups (config.toml [rules]), added to
+# the repo's — a homelab group, say, that no repo should have to name.
 
 # ----------------------------------------------------------------- versions
 #

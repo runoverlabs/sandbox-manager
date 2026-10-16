@@ -62,7 +62,7 @@ Four TOML files, later wins:
 3. `<project>/.msb/sandbox.toml` — committed, portable, no host paths or tokens
 4. `~/.config/msb/sandboxes/<name>.toml` — machine-local paths and overrides
 
-Put new defaults and rule groups in `defaults.toml`, never in the template skeleton.
+Put new defaults and rule groups in `defaults.toml`, never in the template skeleton. A group only the operator's `config.toml` defines (`machine_only_groups()`) is machine-local: `add` and `edit` → Features write it to the registry's `extra_rule_groups` (`split_groups()`), which ADDS to `rule_groups`, is not pinned, and brings `allow_private_dns` when listed in `private_dns_groups`; never into a project's `sandbox.toml`, where every other clone would die on "unknown rule group".
 
 A project's `dev.yaml` is **never passed to msb**: msbctl reads its `image:` line (validated as an OCI reference by `image_problem()`, because msb boots a host directory given as the image — spike 12) and nothing else, and create/rebuild refuse a file with any other top-level key than `CONF_KEYS_READ` or any nested line (`conf_problems()`). msb's `--conf` is code, not data: it mounts host paths, copies host files in and interpolates `${VAR}` from msb's own environment, which holds the bound secrets, and the project folder is writable from the guest. Everything is emitted as flags instead (egress as verified `--net-rule` flags from the `sandbox.toml` group list). `conf` must stay inside the project. The operator's escape hatch is `msb_conf` in the registry entry (registry-only, absolute path, no `${`). Env overrides: `MSB_CONFIG_DIR`, `MSB_STATE_DIR`.
 

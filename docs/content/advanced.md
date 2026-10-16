@@ -226,8 +226,18 @@ create-time, like mounts.
 
 For hosts on your LAN (a Git server, a package mirror), define a group once in
 `config.toml`, or use `msbctl setup` → "your network". If those names resolve
-to private addresses, list the group under `private_dns_groups`, so projects
-that use it get `allow_private_dns = true` automatically. See
+to private addresses, list the group under `private_dns_groups`, so sandboxes
+that use it get `allow_private_dns` automatically.
+
+A group of your own stays on your machine. `msbctl add` and `msbctl edit` →
+"Features & agents" put it in the sandbox's registry entry as
+`extra_rule_groups`, which adds to the project's `rule_groups`, rather than
+in the project's committed `.msb/sandbox.toml`: nobody who clones the project
+has that group, and in their copy it would make every create fail with
+"unknown rule group". A shipped group you redefined keeps its name everywhere,
+so it stays in the project. If an older msbctl put one of yours in the
+project, `msbctl show` warns, and `msbctl edit` → "Features & agents" moves
+it. Machine-local groups aren't part of the [policy pin](egress.md#the-policy-pin). See
 [DNS resolution is part of the rule](egress.md#dns-resolution-is-part-of-the-rule).
 
 ## Your CLAUDE.md additions

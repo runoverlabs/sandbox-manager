@@ -722,9 +722,20 @@ class Sandbox:
 
     @property
     def rule_groups(self):
+        """The project's groups (or the registry's, which replace them), then
+        this machine's own: `extra_rule_groups` in the registry entry. Those
+        ADD, and are not part of the project's pinned policy — a group defined
+        only in this machine's config.toml means nothing to anyone else who
+        clones the project, and in their sandbox.toml it would make every other
+        machine's create fail with "unknown rule group"."""
         groups = self._pick("rule_groups",
                             self.config.get("defaults", {}).get("rule_groups", []))
+        groups = list(dict.fromkeys(list(groups) + self.machine_rule_groups))
         return [g for g in groups if g != "base"]
+
+    @property
+    def machine_rule_groups(self):
+        return [g for g in self.entry.get("extra_rule_groups", []) if g != "base"]
 
     @property
     def egress_mode(self):
@@ -792,7 +803,12 @@ class Sandbox:
         still holds either way — it only widens what a *name* can resolve to,
         never what is reachable without a rule.
         """
-        return bool(self._pick("allow_private_dns", False))
+        # A machine-local group that resolves to LAN addresses brings it along,
+        # from the same machine-local place: such a group does not work without
+        # it, and the failure reads as a missing rule.
+        private = self.config.get("defaults", {}).get("private_dns_groups", [])
+        return bool(self._pick("allow_private_dns", False)
+                    or any(g in private for g in self.machine_rule_groups))
 
     def image_or_none(self):
         """image, but None instead of dying when the conf file is missing.
@@ -2569,6 +2585,20 @@ def policy_update(box, ref):
     note("git checkout, moved with git (`git fetch && git checkout ...` in the sandbox).")
 
 
+def warn_local_groups_in_project(box):
+    """A group only this machine defines, listed in the project's own file: it
+    works here and breaks every other clone. Said, not refused — it is not a
+    hole, just in the wrong file, and `msbctl edit` → Features moves it."""
+    if box.is_repo:
+        return
+    stray = [g for g in box.project_cfg.get("rule_groups", []) if g in machine_only_groups()]
+    if stray:
+        warn(f"{', '.join(stray)} in {tilde(project_path(box))}: defined only in this machine's "
+             f"config.toml, so every other clone fails with \"unknown rule group\" — move "
+             f"{'it' if len(stray) == 1 else 'them'} to extra_rule_groups in the registry entry "
+             f"(`msbctl edit {box.name}` → Features & agents does it)")
+
+
 def refuse_before_create(box):
     """Everything that stops a create, checked BEFORE anything is removed: a
     rebuild or rename that tore the VM down first and then refused would leave
@@ -2619,6 +2649,7 @@ def refuse_conf_problems(box):
 def do_create(box):
     say(f"Creating {box.name}")
     refuse_before_create(box)
+    warn_local_groups_in_project(box)
     warn_missing_prereqs(box)
     ensure_agent_filter(box)
     secret_flags, env = box.secret_env()
@@ -4562,6 +4593,21 @@ def _local_groups(config=None):
     return sorted(read_toml(CONFIG_FILE).get("rules", {}))
 
 
+def machine_only_groups():
+    """Groups this machine defines that msb-manager does not ship: a name in
+    your config.toml's [rules] and not in defaults.toml's. Those belong in the
+    registry entry's `extra_rule_groups`, never a project's sandbox.toml. A
+    shipped group you redefined keeps its name everywhere, so it stays portable."""
+    shipped = read_toml(DEFAULTS_FILE).get("rules", {})
+    return {g for g in _local_groups() if g not in shipped}
+
+
+def split_groups(groups):
+    """(portable, machine-only) — the project's list and the registry's."""
+    local = machine_only_groups()
+    return [g for g in groups if g not in local], [g for g in groups if g in local]
+
+
 def _summary_network(config):
     groups = _local_groups()
     return ", ".join(groups) if groups else "none of your own"
@@ -4587,6 +4633,12 @@ def section_network(config, ctx):
             g = choose_one("remove which", groups + ["cancel"], 0)
             if g != "cancel":
                 set_toml_key(CONFIG_FILE, g, None, table="rules")
+                for other in registered():
+                    path = registry_path_for(other)
+                    have = read_toml(path).get("extra_rule_groups", [])
+                    if g in have:
+                        set_toml_key(path, "extra_rule_groups", [x for x in have if x != g] or None)
+                        note(f"  and from {other}'s extra_rule_groups (rebuild it to apply)")
                 for key in ("private_dns_groups", "rule_groups"):
                     cur = list(config.get("defaults", {}).get(key, []))
                     if g in cur:
@@ -4879,15 +4931,20 @@ def section_features(box, config, ctx):
     managed = {p for _, _, spec in FEATURES for p in spec.get("packages", [])}
     extras = [p for p in boot_cfg(box).get("packages", []) if p not in managed]
     packages = list(dict.fromkeys(plan["packages"] + extras))
+    # Groups only this machine defines go to its registry entry, and every
+    # other group to wherever the list lives (normally the project). This also
+    # moves one an older msbctl had written into the project's list.
+    portable, local = split_groups(plan["groups"])
     changed = [
-        set_toml_key(edit_target(box, "rule_groups"), "rule_groups", plan["groups"]),
+        set_toml_key(edit_target(box, "rule_groups"), "rule_groups", portable),
+        set_toml_key(registry_path(box), "extra_rule_groups", local or None),
         set_toml_key(project, "packages", packages, table="bootstrap"),
         set_toml_key(project, "bun", plan["bun"], table="bootstrap"),
         set_toml_key(project, "gitleaks", plan["gitleaks"], table="bootstrap"),
         set_toml_key(project, "claude", "claude" in plan["agents"], table="bootstrap"),
     ]
     private = config.get("defaults", {}).get("private_dns_groups", [])
-    if any(g in private for g in plan["groups"]) and not box.allow_private_dns:
+    if any(g in private for g in portable) and not box.allow_private_dns:
         # Such a group does not work without it, and the failure reads as a
         # missing egress rule, so it is set together with the group.
         if set_toml_key(edit_target(box, "allow_private_dns"), "allow_private_dns", True):
@@ -5771,7 +5828,10 @@ def cmd_show(args, config):
         note(f"{RED}every host is reachable and is being recorded; "
              f"`msbctl observe {box.name}` to read it{RESET}")
         note(f"{DIM}the rules below are kept but NOT enforced{RESET}")
-    note(f"groups     base + {', '.join(box.rule_groups) or '(none)'}")
+    note(f"groups     base + {', '.join(box.rule_groups) or '(none)'}"
+         + (f"  ({', '.join(box.machine_rule_groups)} from this machine only)"
+            if box.machine_rule_groups else ""))
+    warn_local_groups_in_project(box)
     note(f"private DNS answers {'allowed' if box.allow_private_dns or box.observing else 'DROPPED (rebind protection on)'}")
     for rule in box.net_rules():
         note(f"  {rule}")
@@ -6972,7 +7032,8 @@ def cmd_add(args, config):
     pick_caches(plan)
     mounts = pick_mounts(project if guest_path == "host" else guest_path)
     secrets = pick_secrets(config)
-    chosen = plan["groups"]
+    # This machine's own groups go in the registry entry, not the project.
+    chosen, local_groups = split_groups(plan["groups"])
     packages = plan["packages"]
     containers_disk = plan["containers_disk"]
     root_default = config.get("defaults", {}).get("root_disk", "16G")
@@ -7016,9 +7077,11 @@ def cmd_add(args, config):
                         CLAUDE_TOKEN=claude_token,
                         SSH_KEYS=format_ssh_keys(ssh_keys),
                         MOUNTS=format_list("mounts", mounts, '# mounts = ["~/reference:/mnt/reference:ro"]'),
+                        EXTRA_RULE_GROUPS=format_list("extra_rule_groups", local_groups,
+                                                      '# extra_rule_groups = ["homelab"]'),
                         AUTOSTART="true" if autostart else "false"))
     note(f"wrote {tilde(entry_path)}")
-    for var, host in unreachable_secret_hosts(config, chosen, [sp for sp, _ in secrets]):
+    for var, host in unreachable_secret_hosts(config, chosen + local_groups, [sp for sp, _ in secrets]):
         warn(f"{var} is bound to {host}, but no egress rule allows it — "
              f"`msbctl allow {name} {host}` (then rebuild), or it can never be used")
     for spec, value in secrets:

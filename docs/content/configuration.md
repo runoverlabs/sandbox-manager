@@ -195,6 +195,7 @@ Any key it sets overrides the project's file.
 | `autostart` | started when the picker opens |
 | `ssh_keys` | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
+| `extra_rule_groups` | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
 | `ports` | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
 | `egress_mode` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | the disk-volume prefix, set by `msbctl rename` to keep the old disks |

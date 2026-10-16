@@ -113,7 +113,10 @@ change (see [the policy pin](#the-policy-pin)). Rules are fixed at create time,
 so they take effect at the next `msbctl rebuild`.
 
 If more than one project needs the same host, make it a group in your
-`config.toml` instead and add the group to each project's `rule_groups`.
+`config.toml` instead and give it to each sandbox with `msbctl edit` →
+"Features & agents". A group only your machine defines is written to the
+sandbox's registry entry (`extra_rule_groups`), not to the project, so it
+never reaches anyone who clones it; see [Your network](advanced.md#your-network).
 
 ## The policy pin
 
