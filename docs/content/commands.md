@@ -19,7 +19,8 @@ explains them.
   shorthand for the current folder's sandbox.
 
 See [Everyday use](everyday.md#the-current-folder-names-the-sandbox) for the
-rules behind this.
+rules behind this. A name like `sbx-01:webshop`, in any of those places, is a
+sandbox on the [remote](remote-hosts.md) called `sbx-01`.
 
 ## Registering and inspecting
 
@@ -31,7 +32,9 @@ msbctl add --repo owner/name [--ref REF] [--name NAME] [--guest-path PATH]
            [--workspace-disk SIZE] [--identity NAME] [--claude-token NAME] [--autostart] [-y]
 ```
 
-Register a project with the setup wizard. Nothing is started. A bare name
+Register a project with the setup wizard. Nothing is started. `--remote HOST`
+registers it on [a remote](remote-hosts.md#on-the-laptop) instead: the rest of
+the arguments are run there. A bare name
 resolves under your workspaces folder and is created if missing; a path
 starting with `/`, `~`, `./` or `../` is taken as written. Without an argument
 it asks, defaulting to the current directory. It also asks where the project
@@ -59,7 +62,8 @@ One line per sandbox: name, state, project, pending updates, autostart.
 fields for scripts; `--picker` is the format `msb-picker` reads. `--json` prints
 one JSON document, `{"msbctl": version, "sandboxes": [...]}`, each with
 `name`, `state`, `source`, `location`, `repo`, `ref`, `autostart` and
-`updates`.
+`updates`: this machine's sandboxes only, which is what a laptop asks a
+remote for.
 
 ### `msbctl status`
 
@@ -396,6 +400,23 @@ adds a key to `~/.ssh/authorized_keys` with that forced command, or with
 `--admin` without one. `check` reports the host's hygiene, as heuristics.
 `autostart install` writes and enables a systemd user unit that runs `msbctl
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
+
+### `msbctl remote`
+
+```text
+msbctl remote add NAME user@host
+msbctl remote ls
+msbctl remote test NAME
+msbctl remote rm NAME
+```
+
+The other machines this one drives. `add` records `[remotes.NAME]` in
+`config.toml`, prints the `msbctl host authorize` line to run there, and tests
+the connection interactively (so a new host key can be accepted). `test` runs
+the host's `host check` and warns about an unrestricted key or a version
+mismatch. `rm` forgets it; the host isn't touched. Then `NAME:sandbox`
+addresses a sandbox there for every verb, and `ls` shows every host. See
+[Remote hosts](remote-hosts.md#on-the-laptop).
 
 ## Environment variables
 

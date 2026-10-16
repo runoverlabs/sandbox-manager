@@ -69,18 +69,55 @@ autostart unit, and the `msb`, `msbctl` and `/dev/kvm` it finds. Full-disk
 encryption is a prerequisite msb-manager can't provide; `host check` only says
 whether it found one.
 
-## Using it
+## On the laptop
 
-From the laptop it's plain
-ssh. Quote the command as one argument; the host's shell never sees it, `host
-serve` splits it.
+Register the host once:
 
 ```console
-$ ssh msb@host -- 'msbctl add --repo acme/webshop -y'
-$ pass show github/webshop | ssh msb@host -- 'msbctl secret set webshop GH_TOKEN --stdin'
-$ ssh msb@host -- 'msbctl start webshop'
+$ msbctl remote add sbx-01 msb@sbx-01.tailnet.ts.net
+```
+
+That records `[remotes.sbx-01]` in your `config.toml`, prints the
+`msbctl host authorize` line to run on the host (listing the keys in your agent
+and `~/.ssh`), and tests the connection: this once without ssh's batch mode, so
+you can accept the host key at the prompt. `msbctl remote test sbx-01` runs the
+host's `host check` again from here and warns if your key isn't the restricted
+one or the two msbctl versions differ. `remote ls` lists them with the last
+test's result, `remote rm` forgets one (the host is untouched).
+
+Then a sandbox there is `sbx-01:name`, for every verb:
+
+```console
+$ msbctl add --remote sbx-01 --repo acme/webshop -y
+$ pass show github/webshop | msbctl secret set sbx-01:webshop GH_TOKEN --stdin
+$ msbctl start sbx-01:webshop
+$ msbctl shell sbx-01:webshop
+$ msbctl exec sbx-01:webshop -- claude-agent-acp      # from an editor: a clean stdio pipe
+$ msbctl ls                                           # every host, with a HOST column
+```
+
+Each runs `ssh sbx-01 msbctl <the same command>` with that one name made bare,
+and the exit status is the host's (ssh's own failures are 255). ssh gets a tty
+only when both your stdin and stdout are one, so `exec` from a pipe stays a
+byte stream. One connection per host is kept open for ten minutes
+(`ControlMaster`), so the next command doesn't pay for the handshake; a reused
+connection can still only run what `host serve` allows. A name without a colon
+is local, as before. A laptop that only drives remotes needs no msb and no KVM
+at all.
+
+`ls` asks every remote in parallel (batch mode, a five-second connect timeout)
+and caches each answer. A host that doesn't answer gets one `unreachable` line,
+with its sandboxes from the last answer marked `stale`, and isn't tried again
+for a minute, so the picker doesn't wait on it at every reload; `ls --refresh`
+tries it now. In `--porcelain` and `--picker` output a remote sandbox is
+`host:name`, so the picker's keys work on it unchanged. With no remotes
+configured, `ls` is exactly what it was.
+
+The same works with plain ssh, quoting the command as one argument (`host
+serve` splits it, the host's shell never sees it):
+
+```console
 $ ssh -t msb@host -- 'msbctl shell webshop'
-$ ssh msb@host -- 'msbctl exec webshop -- claude-agent-acp'     # a clean stdio pipe
 ```
 
 ### What the restricted key may run

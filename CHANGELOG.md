@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `msbctl remote add` registers another machine; `host:name` addresses a sandbox there, and `ls` and the picker show every host.
 - `msbctl host serve|authorize|check`: run a machine as a remote sandbox host whose SSH key for everyday use cannot read secrets or change policy.
 - `msbctl start --autostart` and `msbctl host autostart install` start the autostart set after a reboot, with no picker or login.
 - `ls --json`, `show --json`, `msbctl secret set … --stdin` and `msbctl setup --claude-token NAME --stdin` for scripts; no secret value is ever printed.

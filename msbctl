@@ -31,6 +31,7 @@
     msbctl code <name>            open the editor on the project, on the host
     msbctl reclaim <name>         give the guest's page cache back to the host
     msbctl host serve|authorize|check|autostart   run this machine as a remote host
+    msbctl remote add|ls|test|rm  the machines this one drives; then HOST:name anywhere
 
 Inside a registered project folder the name can be left out where it is the
 only argument (`msbctl shell`, `msbctl stop`), and `.` stands for it where more
@@ -5526,6 +5527,9 @@ def cmd_ls(args, config):
         print_json(data)
         return
     names = registered()
+    remotes = configured_remotes(config)
+    if remotes:
+        return ls_with_remotes(args, config, names)
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
         return
@@ -5560,6 +5564,47 @@ def cmd_ls(args, config):
     print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)) + RESET)
     for row in rows:
         print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)))
+
+
+def ls_with_remotes(args, config, names):
+    """`ls` across this machine and every remote. A HOST column comes first
+    (`local` for this one); --porcelain and --picker keep their columns and
+    write a remote sandbox as host:name, which every verb understands. This
+    machine's rows are there only if it can run sandboxes itself: a laptop
+    that only drives remotes (any Mac) has no msb at all."""
+    local = ls_rows(args, config, names) if shutil.which("msb") else []
+    rows = [("local", r["name"], r["state"], r["location"],
+             ",".join(r["updates"]) or "-", "yes" if r["autostart"] else "no") for r in local]
+    for host, r, mark in remote_ls_rows(args, config):
+        if r is None:
+            if args.porcelain:
+                print(f"msbctl: {host}: {mark}", file=sys.stderr)
+            else:
+                rows.append((host, "-", mark, "", "", ""))
+            continue
+        state = r.get("state", "?") + (f" ({mark})" if mark else "")
+        rows.append((host, f"{host}:{r.get('name', '?')}" if args.porcelain or args.picker
+                     else r.get("name", "?"), state, r.get("location", ""),
+                     ",".join(r.get("updates", [])) or "-", "yes" if r.get("autostart") else "no"))
+    if args.porcelain:
+        for row in rows:
+            print("\t".join(row[1:]))
+        return
+    if args.picker:
+        # As in cmd_ls: padded here, one tab between the name and the text.
+        # The first field is what every action is given, so a remote row's is
+        # host:name; an unreachable host's line gets one no verb accepts.
+        shown = [(r[0], r[1].split(":")[-1], r[2], r[4], r[3]) for r in rows]
+        widths = [max(len(str(d[i])) for d in shown) for i in range(5)]
+        for row, d in zip(rows, shown, strict=True):
+            key = row[1] if row[1] != "-" else f"{row[0]}:-"
+            print(f"{key}\t" + "  ".join(str(d[i]).ljust(widths[i]) for i in range(5)).rstrip())
+        return
+    header = ("HOST", "NAME", "STATE", "PROJECT", "UPDATES", "AUTOSTART")
+    widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(6)]
+    print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)).rstrip() + RESET)
+    for row in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
 
 
 def ls_rows(args, config, names):
@@ -7575,6 +7620,323 @@ def cmd_host(args, config):
         host_autostart(args)
 
 
+# ----------------------------------------------------------- remotes (laptop)
+#
+# A remote is an ssh destination running msb-manager (see `msbctl host`).
+# `host:name` addresses a sandbox there: the command line is sent as it was
+# typed, that one token made the bare name, over ssh to the host's msbctl,
+# with stdio passed straight through. Nothing else is involved: no daemon, no
+# protocol, no port. ssh authenticates and encrypts; the host's `host serve`
+# decides what the key may run. Local is not special: it is simply the host
+# this command runs on.
+
+REMOTE_NAME = re.compile(r"([a-z0-9][a-z0-9-]*):([a-z0-9][a-z0-9-]*|\.)")
+REMOTE_DEST = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9_][A-Za-z0-9.:_-]*|[A-Za-z0-9_][A-Za-z0-9._:-]*")
+REMOTES_DIR = os.path.join(STATE_DIR, "remotes")
+REMOTE_LS_TIMEOUT = 15
+# How long an unreachable host is left alone before `ls` tries it again. The
+# picker reloads the list after every action, and a host that is down would
+# otherwise cost the full connect timeout on each one; `ls --refresh` tries now.
+REMOTE_RETRY_AFTER = 60
+
+
+def configured_remotes(config=None):
+    """{name: {"ssh": dest}} from config.toml's [remotes.<name>] tables."""
+    if config is None:
+        try:
+            config = load_config()
+        except SystemExit:
+            return {}
+    return {k: v for k, v in (config.get("remotes") or {}).items() if isinstance(v, dict)}
+
+
+def remote_dest(name, config):
+    remote = configured_remotes(config).get(name)
+    if not remote or not remote.get("ssh"):
+        die(f"unknown remote {name!r} — `msbctl remote ls`")
+    dest = str(remote["ssh"])
+    if not REMOTE_DEST.fullmatch(dest):
+        die(f"remote {name}: ssh = {dest!r} is not user@host or host (fix config.toml)")
+    return dest
+
+
+def ssh_argv(dest, tty, batch=False):
+    """ssh to `dest`, sharing one connection per host for ten minutes, ending
+    in `--`: the remote command follows as ONE argument (shlex.join), since ssh
+    joins the rest with spaces for the far side's shell."""
+    os.makedirs(os.path.join(STATE_DIR, "ssh"), mode=0o700, exist_ok=True)
+    return ["ssh", "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={os.path.join(STATE_DIR, 'ssh', '%C')}",
+            "-o", "ControlPersist=600", "-o", "ServerAliveInterval=30",
+            "-t" if tty else "-T",
+            *(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] if batch else []),
+            dest, "--"]
+
+
+def wants_tty():
+    """A pty only when both ends are a terminal: `exec` from a pipe (an ACP
+    client) must be a clean byte stream, and -t would mangle it."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def split_remote(name):
+    """(remote, bare name) for `host:name`, or None for a local name."""
+    match = REMOTE_NAME.fullmatch(name or "")
+    if not match:
+        return None
+    if match.group(2) == ".":
+        die(f"{name}: `.` means this machine's current folder, which names nothing on "
+            f"{match.group(1)} — give the sandbox's name")
+    return match.group(1), match.group(2)
+
+
+def remote_names(args):
+    """The names in `args` that are host:name, if any; [] if all are local."""
+    names = [args.name] if getattr(args, "name", None) else list(getattr(args, "names", None) or [])
+    return [n for n in names if REMOTE_NAME.fullmatch(n or "")]
+
+
+def _remote_command(raw_argv, token, bare):
+    """The original command line, `token` (host:name) replaced by `bare`. It
+    occurs once, as the name; anything after it (an exec's command) is left as
+    typed, including a later string that happens to look the same."""
+    out = list(raw_argv)
+    out[out.index(token)] = bare
+    return out
+
+
+def exec_remote(args, config, raw_argv):
+    """Replace this process with ssh running the command on the remote; its exit
+    status is the remote's (ssh's own failures are 255)."""
+    token = args.name
+    remote, bare = split_remote(token)
+    dest = remote_dest(remote, config)
+    argv = ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *_remote_command(raw_argv, token, bare)])]
+    sys.stdout.flush()
+    os.execvp("ssh", argv)
+
+
+def run_remote_verb(args, config, raw_argv, token):
+    """One host:name of a multi-name verb (start a:x b c:y): the verb, this name
+    right after it, and the flags as typed; the other names left out."""
+    remote, bare = split_remote(token)
+    dest = remote_dest(remote, config)
+    names = set(args.raw_names)
+    verb_at = next(i for i, a in enumerate(raw_argv) if not a.startswith("-"))
+    rest = [a for a in raw_argv[verb_at + 1:] if a not in names]
+    command = ["msbctl", raw_argv[verb_at], bare, *rest]
+    proc = subprocess.run(ssh_argv(dest, wants_tty()) + [shlex.join(command)])
+    if proc.returncode:
+        die(f"{token}: exit {proc.returncode} on {remote}")
+
+
+def add_remote_forward(args, config, raw_argv):
+    """add --remote HOST …: the rest of the arguments, run there."""
+    dest = remote_dest(args.remote, config)
+    rest, skip = [], False
+    for a in raw_argv:
+        if skip:
+            skip = False
+            continue
+        if a == "--remote":
+            skip = True
+            continue
+        if a.startswith("--remote="):
+            continue
+        rest.append(a)
+    sys.stdout.flush()
+    os.execvp("ssh", ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *rest])])
+
+
+def _remote_cache_path(name):
+    return os.path.join(REMOTES_DIR, f"{name}.json")
+
+
+def _short_reason(proc):
+    text = (proc.stderr or "").strip().splitlines()
+    return (text[-1] if text else f"ssh exit {proc.returncode}")[:80]
+
+
+def query_remote_ls(name, dest, refresh):
+    """(rows, problem, stale_age) for one remote: its `ls --json` sandboxes, why
+    it could not answer (or None), and how old the rows are if they came from
+    the cache. A host that failed less than REMOTE_RETRY_AFTER ago is not tried
+    again, unless `refresh`."""
+    cache = read_json(_remote_cache_path(name))
+    now = time.time()
+    if not refresh and cache.get("failed_at", 0) > now - REMOTE_RETRY_AFTER:
+        problem = cache.get("reason", "unreachable")
+    else:
+        command = ["msbctl", "ls", "--json"] + (["--refresh"] if refresh else [])
+        try:
+            proc = subprocess.run(ssh_argv(dest, tty=False, batch=True) + [shlex.join(command)],
+                                  capture_output=True, text=True, timeout=REMOTE_LS_TIMEOUT,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            proc = None
+        problem = None
+        if proc is None:
+            problem = f"no answer in {REMOTE_LS_TIMEOUT}s"
+        elif proc.returncode == 255:            # ssh's own failure
+            problem = f"unreachable: {_short_reason(proc)}"
+        else:
+            try:
+                data = json.loads(proc.stdout)
+                rows = data["sandboxes"]
+            except (ValueError, KeyError, TypeError):
+                # An older msbctl answers --json with its usage text, which is
+                # not a parse error worth reporting as one.
+                old = "usage:" in (proc.stderr or "") + (proc.stdout or "")
+                problem = ("host msbctl too old (needs `ls --json`)" if old
+                           else f"error: {_short_reason(proc)}")
+            else:
+                write_json(_remote_cache_path(name), {"at": now, "sandboxes": rows,
+                                                      "msbctl": data.get("msbctl", "")})
+                return rows, None, None
+        cache["failed_at"], cache["reason"] = now, problem
+        write_json(_remote_cache_path(name), cache)
+    if cache.get("sandboxes") is not None:
+        return cache["sandboxes"], problem, now - cache.get("at", now)
+    return [], problem, None
+
+
+def _age(seconds):
+    for unit, step in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= step:
+            return f"{int(seconds // step)}{unit}"
+    return f"{int(seconds)}s"
+
+
+def remote_ls_rows(args, config):
+    """[(host, row dict or None, note)] for every configured remote, queried in
+    parallel. A row None is the one line an unreachable remote gets."""
+    import concurrent.futures
+    remotes = configured_remotes(config)
+    out = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(remotes)))) as pool:
+        futures = {name: pool.submit(query_remote_ls, name, remote_dest(name, config), args.refresh)
+                   for name in sorted(remotes)}
+        for name, fut in futures.items():
+            rows, problem, stale = fut.result()
+            if problem:
+                out.append((name, None, problem + (f" (rows below are {_age(stale)} old)"
+                                                   if stale is not None and rows else "")))
+            for row in rows:
+                out.append((name, row, f"stale {_age(stale)}" if stale is not None else ""))
+    return out
+
+
+def remote_key_candidates():
+    """Public keys the laptop could authorize on a host: the agent's, then ~/.ssh/*.pub."""
+    out = []
+    proc = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
+    for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+        if _parse_pub_line(line):
+            out.append(("agent", line.strip()))
+    try:
+        for f in sorted(os.listdir(SSH_DIR)):
+            if f.endswith(".pub"):
+                with open(os.path.join(SSH_DIR, f), encoding="utf-8") as fh:
+                    line = fh.read().strip()
+                if _parse_pub_line(line) and all(line.split()[1] != l.split()[1] for _, l in out):
+                    out.append((f"~/.ssh/{f}", line))
+    except OSError:
+        pass  # no ~/.ssh: nothing to list
+    return out
+
+
+def remote_test(name, config, batch=True):
+    """Run the host's `host check --json` and say what matters from here."""
+    dest = remote_dest(name, config)
+    # Not batch: ssh may need to ask about the host key, on the terminal.
+    proc = subprocess.run(ssh_argv(dest, tty=False, batch=batch)
+                          + [shlex.join(["msbctl", "host", "check", "--json"])],
+                          capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL if batch else None)
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        reason = _short_reason(proc) if proc.returncode else "not JSON (host msbctl too old?)"
+        write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
+                   {"at": time.time(), "ok": False, "summary": reason})
+        die(f"{name} ({dest}): {reason}")
+    say(f"{name}  {dest}")
+    for c in data.get("checks", []):
+        mark = {True: "ok  ", False: "WARN", None: "info"}[c.get("ok")]
+        note(f"{mark}  {c.get('check', '?'):<16} {c.get('detail', '')}")
+    problems = []
+    if not data.get("restricted"):
+        problems.append("this key is not restricted")
+        warn("this key can get a shell on the host: run `msbctl host authorize \"<this key>\"` "
+             "there and remove its unrestricted line")
+    theirs = str(data.get("msbctl", "")).split()[0]
+    mine = version_string().split()[0]
+    if theirs.split("+")[0] != mine.split("+")[0]:
+        problems.append(f"msbctl {theirs} there, {mine} here")
+        warn(f"the host runs msbctl {theirs}, this machine {mine}")
+    write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
+               {"at": time.time(), "ok": not problems, "summary": "; ".join(problems) or "ok"})
+
+
+def cmd_remote(args, config):
+    """remote add|ls|test|rm — the ssh destinations this machine drives."""
+    if args.action == "ls":
+        remotes = configured_remotes(config)
+        if not remotes:
+            note("no remotes — `msbctl remote add NAME user@host`")
+            return
+        for name in sorted(remotes):
+            test = read_json(os.path.join(REMOTES_DIR, f"{name}.test.json"))
+            last = (f"{'ok' if test.get('ok') else test.get('summary', '?')}, "
+                    f"{_age(time.time() - test['at'])} ago") if test.get("at") else "not tested"
+            note(f"{name:<16} {remotes[name].get('ssh', '?'):<32} {last}")
+        return
+    name = args.name or die(f"remote {args.action} needs a NAME")
+    if not SANDBOX_NAME.fullmatch(name):
+        die(f"{name!r}: a remote's name is lowercase letters, digits and dashes")
+    if args.action == "add":
+        dest = args.dest or die("remote add NAME DEST: DEST is user@host")
+        if not REMOTE_DEST.fullmatch(dest):
+            die(f"{dest!r} is not user@host or host")
+        if name in configured_remotes(config):
+            die(f"{name} is already a remote (`msbctl remote rm {name}` first)")
+        ensure_local_config()
+        set_toml_key(CONFIG_FILE, "ssh", dest, table=f"remotes.{name}")
+        note(f"remotes.{name} = {dest}  ({tilde(CONFIG_FILE)})")
+        say("On the host, authorize this machine's everyday key")
+        note("It gets a forced command there: msbctl verbs from host serve's allowlist,")
+        note("no shell, and nothing that can read a stored secret or approve a policy.")
+        cands = remote_key_candidates()
+        for where, line in cands:
+            parts = line.split()
+            note(f"  {where:<22} {parts[0]} …{parts[1][-12:]} {' '.join(parts[2:])}")
+        line = cands[0][1] if cands else "ssh-ed25519 AAAA... you@this-machine"
+        note("")
+        note(f"  msbctl host authorize \"{line}\"")
+        note("")
+        note("For policy changes from here, use a SEPARATE key the agent does not hold —")
+        note("a FIDO2 one: `ssh-keygen -t ed25519-sk`, then on the host `msbctl host authorize --admin`.")
+        say(f"Testing {name}")
+        # Not batch mode, this once: an unknown host key has to be accepted at
+        # a prompt, and BatchMode fails on it with a message that does not say so.
+        try:
+            remote_test(name, load_config(), batch=False)
+        except SystemExit as exc:
+            warn(str(exc.code).replace("msbctl: ", "", 1))
+            note(f"once the key is authorized there: `msbctl remote test {name}`")
+    elif args.action == "test":
+        remote_test(name, config)
+    elif args.action == "rm":
+        if not remove_toml_table(CONFIG_FILE, f"remotes.{name}"):
+            die(f"no remote {name!r}")
+        for f in (f"{name}.json", f"{name}.test.json"):
+            try:
+                os.unlink(os.path.join(REMOTES_DIR, f))
+            except FileNotFoundError:
+                pass  # never queried
+        note(f"{name} removed from {tilde(CONFIG_FILE)}; the host itself is untouched")
+
+
 # ----------------------------------------------------------------------- main
 
 # --------------------------------------------------------------------- status
@@ -7851,7 +8213,16 @@ def preflight(args):
         return
     # `host check` reports a missing msb or /dev/kvm itself; the other host
     # verbs need neither (serve re-runs msbctl, which checks then).
-    if args.func is cmd_host:
+    if args.func in (cmd_host, cmd_remote):
+        return
+    # A sandbox on a remote needs ssh here, not msb; nor does `ls` once there
+    # are remotes (this machine's rows simply are not shown without msb).
+    if remote_names(args) and len(remote_names(args)) == len(
+            [args.name] if getattr(args, "name", None) else list(getattr(args, "names", None) or [])):
+        return
+    if args.func is cmd_add and getattr(args, "remote", None):
+        return
+    if args.func is cmd_ls and configured_remotes():
         return
     if not shutil.which("msb"):
         die("msb is not on PATH")
@@ -7884,6 +8255,8 @@ def build_parser():
     p.add_argument("--claude-token", metavar="NAME", help="with --repo: a stored Claude token's name")
     p.add_argument("--autostart", action="store_true", help="with --repo: start it with the others")
     p.add_argument("-y", "--yes", action="store_true", help="with --repo: no confirmation")
+    p.add_argument("--remote", metavar="HOST",
+                   help="register it on a remote instead (`msbctl remote ls`); the rest is sent there")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("ls", help="one line per sandbox")
@@ -8053,6 +8426,12 @@ def build_parser():
     p.add_argument("--json", action="store_true", help="check: one JSON document")
     p.set_defaults(func=cmd_host)
 
+    p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, ls, test, rm")
+    p.add_argument("action", choices=["add", "ls", "test", "rm"])
+    p.add_argument("name", nargs="?", help="the remote's name, as in NAME:sandbox")
+    p.add_argument("dest", nargs="?", help="for add: user@host, as ssh takes it")
+    p.set_defaults(func=cmd_remote)
+
     p = sub.add_parser("_agent-filter", help=argparse.SUPPRESS)
     p.add_argument("name")
     p.set_defaults(func=cmd_agent_filter)
@@ -8104,6 +8483,16 @@ def main():
             if args.func not in (cmd_setup, cmd_self_update):   # these can still work with a broken config.toml
                 raise
             config = None
+        raw_argv = sys.argv[1:]
+        # host:name — after parsing, from the name's own slot only: argv is
+        # never scanned for the shape, since a port spec (3000:5173) and an
+        # allow target (mirror:443) have it too.
+        if args.func not in (cmd_agent_filter, cmd_remote):
+            if args.func is cmd_add and getattr(args, "remote", None):
+                add_remote_forward(args, config, raw_argv)
+            if getattr(args, "name", None) and split_remote(args.name):
+                exec_remote(args, config, raw_argv)
+            args.raw_names = list(getattr(args, "names", None) or [])
         if getattr(args, "autostart", False):
             if args.names:
                 die("start --autostart takes no names")
@@ -8116,11 +8505,11 @@ def main():
             if not args.names:
                 note("nothing in the autostart set needs starting")
                 return
-        elif args.func is not cmd_agent_filter:
+        elif args.func not in (cmd_agent_filter, cmd_remote):
             if hasattr(args, "name"):
                 args.name = resolve_here(args.name)
             if hasattr(args, "names"):
-                args.names = [resolve_here(n) for n in args.names or [None]]
+                args.names = [n if split_remote(n) else resolve_here(n) for n in args.names or [None]]
         if not hasattr(args, "names"):
             args.func(args, config)
             if BOOTSTRAP_FAILURES:
@@ -8133,7 +8522,10 @@ def main():
             for name in args.names:
                 args.name = name
                 try:
-                    args.func(args, config)
+                    if split_remote(name):
+                        run_remote_verb(args, config, raw_argv, name)
+                    else:
+                        args.func(args, config)
                 except SystemExit as exc:
                     if exc.code:
                         failed.append(str(exc.code).replace("msbctl: ", "", 1))
