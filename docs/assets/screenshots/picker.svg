@@ -25,7 +25,7 @@
 <text x="34.8" y="133.0" fill="#6cc3f5" textLength="520.8" lengthAdjust="spacingAndGlyphs">start/stop/rebuild/update/purge/reclaim act on every selecte··</text>
 <text x="606.0" y="133.0" fill="#cfd8cf" textLength="193.2" lengthAdjust="spacingAndGlyphs">repo       acme/webshop</text>
 <text x="34.8" y="151.0" fill="#cfd8cf" textLength="453.6" lengthAdjust="spacingAndGlyphs">infra         stopped  claude,gh    ~/workspaces/infra</text>
-<text x="606.0" y="151.0" fill="#cfd8cf" textLength="201.6" lengthAdjust="spacingAndGlyphs">conf       .msb/dev.yaml</text>
+<text x="606.0" y="151.0" fill="#cfd8cf" textLength="428.4" lengthAdjust="spacingAndGlyphs">conf       .msb/dev.yaml  (read for the image only)</text>
 <text x="34.8" y="169.0" fill="#cfd8cf" textLength="512.4" lengthAdjust="spacingAndGlyphs">ml-notebooks  running  -            ~/workspaces/ml-notebooks</text>
 <text x="606.0" y="169.0" fill="#cfd8cf" textLength="453.6" lengthAdjust="spacingAndGlyphs">image      mcr.microsoft.com/devcontainers/base:ubuntu</text>
 <text x="34.8" y="187.0" fill="#eef5ee" font-weight="bold" textLength="470.4" lengthAdjust="spacingAndGlyphs">webshop       running  claude,node  ~/workspaces/webshop</text>

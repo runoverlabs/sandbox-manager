@@ -326,8 +326,10 @@ def msb_table():
     place so that a format change is one fix rather than a hunt: column 1 is
     the name, column 3 the state.
     """
-    proc = subprocess.run(["msb", "ls"], capture_output=True, text=True)
     table = {}
+    if not shutil.which("msb"):
+        return table                # a laptop that only drives remotes
+    proc = subprocess.run(["msb", "ls"], capture_output=True, text=True)
     if proc.returncode != 0:
         return table
     for line in proc.stdout.splitlines()[1:]:
@@ -6923,7 +6925,59 @@ REPO_ONLY_FLAGS = ("ref", "new_name", "guest_path", "workspace_disk", "identity"
                    "autostart", "yes")
 
 
+def add_where(args, config):
+    """Which machine a new sandbox goes on: None for this one, else a remote's
+    name. Asked only at a terminal, with remotes configured and no folder
+    given (a folder is on this machine by definition)."""
+    remotes = configured_remotes(config)
+    if not remotes or args.dir or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    here = "this machine" + ("" if not local_problem() else f"   ({local_problem()})")
+    rows = {f"{n:<14} {remotes[n].get('ssh', '?')}": n for n in sorted(remotes)}
+    choice = choose_one("where should it run", [here] + list(rows), 0 if not local_problem() else 1)
+    return rows.get(choice)
+
+
+def add_on_remote(remote, args, config):
+    """A new sandbox on a remote: the repo and the name asked here, the rest by
+    the host's own `add --repo` over ssh, which fetches the repo's policy,
+    shows it, asks for its GitHub token and registers it there."""
+    dest = remote_dest(remote, config)
+    say(f"A sandbox on {remote}")
+    note("There is no folder of yours on that machine, so the code is cloned inside")
+    note("the sandbox, from GitHub, and work leaves it by `git push`.")
+    here = parse_github_url(git(os.getcwd(), "remote", "get-url", "origin")) or ""
+    raw = args.repo or ask("GitHub repo (owner/name or URL)", here)
+    repo = (parse_github_url(raw) or raw).strip().removesuffix(".git")
+    if not REPO_NAME.fullmatch(repo) or ".." in repo:
+        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    default_name = re.sub(r"[^a-z0-9-]+", "-", repo.split("/")[1].lower()).strip("-")
+    name = args.new_name or ask("sandbox name", default_name)
+    if not SANDBOX_NAME.fullmatch(name):
+        die(f"{name!r}: a sandbox name is lowercase letters, digits and dashes")
+    command = ["msbctl", "add", "--repo", repo, "--name", name]
+    for flag in REPO_ONLY_FLAGS:
+        value = getattr(args, flag, None)
+        if flag != "new_name" and value:
+            option = f"--{flag.replace('_', '-')}"
+            command += [option] if value is True else [option, str(value)]
+    note(f"the rest is asked by {remote} itself")
+    sys.stdout.flush()
+    proc = subprocess.run(ssh_argv(dest, wants_tty()) + [shlex.join(command)])
+    if proc.returncode:
+        die(f"{remote}: add failed (exit {proc.returncode})")
+    note(f"from this machine it is {remote}:{name}, for every msbctl verb")
+    if wants_tty() and confirm(f"start {remote}:{name} now? (the first start clones and bootstraps)"):
+        subprocess.run(ssh_argv(dest, True) + [shlex.join(["msbctl", "start", name])])
+
+
 def cmd_add(args, config):
+    remote = add_where(args, config)
+    if remote:
+        add_on_remote(remote, args, config)
+        return
+    if local_problem():
+        die(local_problem())
     if args.repo:
         cmd_add_repo(args, config)
         return
@@ -7290,7 +7344,9 @@ def github_token_help(repo):
     note("")
     note("Expiry is yours to choose; anything up to 366 days.")
     url = "https://github.com/settings/personal-access-tokens/new"
-    if shutil.which("xdg-open") and confirm("open that page now?"):
+    # Over ssh (a laptop adding a sandbox here), a browser would open on this
+    # machine's screen rather than the caller's.
+    if shutil.which("xdg-open") and not os.environ.get("SSH_CONNECTION") and confirm("open that page now?"):
         subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL,
                          stderr=subprocess.DEVNULL, start_new_session=True)
     else:
@@ -7484,9 +7540,10 @@ def host_authorize(args):
     except FileNotFoundError:
         text = ""
     existing = text.splitlines()
-    for line in existing:
-        if blob in line.split():
-            die(f"that key is already in {tilde(path)}:\n  {line}\nedit the file by hand to change it")
+    present = [line for line in existing if blob in line.split()]
+    if present and not args.replace:
+        die(f"that key is already in {tilde(path)}:\n  {present[0]}\n"
+            "--replace rewrites that line; or edit the file by hand")
     if args.admin:
         if not ktype.startswith("sk-"):
             warn("a plain key as the admin key: if the laptop's ssh-agent holds it, the")
@@ -7503,11 +7560,22 @@ def host_authorize(args):
             me = os.path.realpath(__file__)
             warn(f"msbctl is not on PATH; the line names {me}, which an upgrade may move")
         line = f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}'.rstrip()
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-    with os.fdopen(fd, "a", encoding="utf-8") as fh:
-        fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+    if present:
+        # Every line naming the key goes, so none of them still grants what the
+        # new one does not; written whole and renamed, so a failure halfway
+        # cannot leave sshd reading half a file.
+        kept = [old for old in existing if old not in present] + [line]
+        tmp = path + ".msbctl-new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(kept) + "\n")
+        os.replace(tmp, path)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as fh:
+            fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
     os.chmod(path, 0o600)
-    note(f"added to {tilde(path)}:")
+    note(f"{'replaced in' if present else 'added to'} {tilde(path)}:")
     note(f"  {line}")
     if not args.admin:
         note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
@@ -7943,18 +8011,194 @@ def remote_test(name, config, batch=True):
                {"at": time.time(), "ok": not problems, "summary": "; ".join(problems) or "ok"})
 
 
+RELEASES = "https://github.com/runoverlabs/sandbox-manager/releases"
+MSB_INSTALLER = "https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh"
+
+# What `remote setup` needs to know about a host, as key=value lines, run by
+# remote_sh().
+REMOTE_PROBE = r"""u="$(id -un)"
+printf 'user=%s\n' "$u"
+printf 'msb=%s\n' "$(msb --version 2>/dev/null | head -n1)"
+printf 'msbctl=%s\n' "$(msbctl --version 2>/dev/null | head -n1)"
+printf 'kvm=%s\n' "$(if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then echo rw; elif [ -e /dev/kvm ]; then echo denied; else echo missing; fi)"
+printf 'curl=%s\n' "$(command -v curl)"
+printf 'linger=%s\n' "$(if [ -e "/var/lib/systemd/linger/$u" ]; then echo yes; else echo no; fi)"
+printf 'unit=%s\n' "$(if [ -e "$HOME/.config/systemd/user/msb-autostart.service" ]; then echo yes; else echo no; fi)"
+printf 'sudo=%s\n' "$(if sudo -n true 2>/dev/null; then echo yes; else echo no; fi)"
+"""
+
+
+def remote_sh(dest, script, *args, tty=False, batch=False, capture=False, stdin=None):
+    """Run a sh script on `dest` with ~/.local/bin on PATH: for setting a host
+    up, through a key that still has a shell. `sh -c` whatever the login shell
+    is; ~/.local/bin because both installers put their commands there and a
+    non-login ssh session often does not look. Under `host serve` this is
+    refused (exit 126), which is how a key already restricted shows."""
+    command = shlex.join(["sh", "-c", 'PATH="$HOME/.local/bin:$PATH"; ' + script, "sh", *args])
+    return subprocess.run(ssh_argv(dest, tty=tty, batch=batch) + [command],
+                          capture_output=capture, text=True,
+                          stdin=subprocess.DEVNULL if batch and stdin is None else None,
+                          input=stdin)
+
+
+def ssh_close(dest):
+    """End the shared connection to `dest`. One opened through a key that had
+    a shell would otherwise keep that shell for ten minutes after the key has
+    been restricted."""
+    subprocess.run(ssh_argv(dest, tty=False)[:-2] + ["-O", "exit", dest],
+                   capture_output=True, text=True)
+
+
+def remote_probe(dest, batch=False):
+    """{key: value} from REMOTE_PROBE, or None if this key already runs
+    `host serve` there (it refuses a shell script, exit 126). Dies when ssh
+    itself fails."""
+    proc = remote_sh(dest, REMOTE_PROBE, batch=batch, capture=True)
+    if proc.returncode == 126 and "host serve" in (proc.stderr or ""):
+        return None
+    if proc.returncode:
+        die(f"{dest}: {_short_reason(proc)}")
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def own_release():
+    """The release a host should run to match this machine: this version, or
+    None from a checkout, whose version may not have been released."""
+    return None if IS_CHECKOUT else version_string().split()[0]
+
+
+def remote_setup(name, config):
+    """Bring a remote to a working host, asking before each change: msb,
+    msbctl at this machine's version, /dev/kvm, autostart, and last this
+    machine's key restricted to `host serve`. Then `remote test`."""
+    dest = remote_dest(name, config)
+    say(f"Setting up {name}  ({dest})")
+    # Not batch mode: an unknown host key has to be accepted at the prompt.
+    probe = remote_probe(dest)
+    if probe is None:
+        note("this machine's key already runs `msbctl host serve` there, so the host is")
+        note("set up; anything more is done on the host itself, or with an admin key")
+        remote_test(name, config)
+        return
+    note(f"{'user':<9} {probe.get('user', '?')}")
+    note(f"{'msb':<9} {probe.get('msb') or 'not installed'}")
+    note(f"{'msbctl':<9} {probe.get('msbctl') or 'not installed'}")
+    note(f"{'/dev/kvm':<9} {dict(rw='usable', denied='no access for this user', missing='missing').get(probe.get('kvm'), '?')}")
+    if probe.get("kvm") == "missing":
+        die(f"{name} has no /dev/kvm: msb cannot run sandboxes there (no KVM, or a VM "
+            "without nested virtualization)")
+
+    wanted = own_release()
+    if not probe.get("curl") and (not probe.get("msb") or not probe.get("msbctl")):
+        die(f"{name} has no curl, which both installers need — install it there first")
+    if not probe.get("msb"):
+        note("")
+        note(f"msb from microsandbox's installer ({MSB_INSTALLER})")
+        if confirm(f"install msb on {name}?"):
+            if remote_sh(dest, f"curl -fsSL {shlex.quote(MSB_INSTALLER)} | sh", tty=wants_tty()).returncode:
+                die(f"installing msb on {name} failed (above)")
+    theirs = (probe.get("msbctl") or "").split()[1:2]
+    theirs = theirs[0] if theirs else ""
+    mine = version_string().split()[0]
+    installed = bool(theirs)
+    if not theirs or theirs.split("+")[0] != mine.split("+")[0]:
+        note("")
+        if "git checkout" in probe.get("msbctl", ""):
+            warn(f"{name} runs msbctl from a git checkout ({theirs}): update it there with git pull")
+        else:
+            release = f"v{wanted}" if wanted else "the latest release"
+            question = (f"install msbctl ({release}) on {name}?" if not theirs
+                        else f"msbctl {theirs} there, {mine} here — install {release} on {name}?")
+            if confirm(question):
+                get = f"{RELEASES}/{f'download/v{wanted}' if wanted else 'latest/download'}/get.sh"
+                script = f"curl -fsSL {shlex.quote(get)} | sh" + (f" -s -- --version v{wanted}" if wanted else "")
+                if remote_sh(dest, script, tty=wants_tty()).returncode:
+                    die(f"installing msbctl on {name} failed (above)")
+                installed = True
+    if not installed:
+        # Autostart, the key's forced command and the test are all msbctl's.
+        note("")
+        note(f"without msbctl on {name} there is nothing more to set up; "
+             f"`msbctl remote setup {name}` asks again")
+        return
+    if probe.get("kvm") == "denied":
+        note("")
+        user = probe.get("user", "")
+        warn(f"{user} cannot open /dev/kvm on {name}: it is usually the kvm group")
+        if probe.get("sudo") == "yes" and confirm(f"add {user} to the kvm group there (sudo)?"):
+            remote_sh(dest, 'sudo -n usermod -aG kvm "$1"', user)
+            # A group applies from the next login, so drop the shared connection.
+            ssh_close(dest)
+        else:
+            note(f"on {name}, as root:  usermod -aG kvm {user}")
+
+    if probe.get("unit") != "yes" or probe.get("linger") != "yes":
+        note("")
+        note("autostart: the sandboxes marked autostart start when the host boots, with")
+        note("nobody logged in (a systemd user unit, and lingering for the user)")
+        if confirm(f"set up autostart on {name}?"):
+            remote_sh(dest, "msbctl host autostart install", tty=wants_tty())
+            if probe.get("linger") != "yes":
+                if probe.get("sudo") == "yes":
+                    remote_sh(dest, 'sudo -n loginctl enable-linger "$1"', probe.get("user", ""))
+                else:
+                    note(f"lingering needs root, once, on {name}:  loginctl enable-linger {probe.get('user', '')}")
+
+    remote_restrict_key(name, dest)
+    say(f"Testing {name}")
+    remote_test(name, load_config())
+
+
+def remote_restrict_key(name, dest):
+    """Offer to give this machine's key the forced command on the host. If the
+    key is the one this connection logs in with, that ends its shell there."""
+    say("This machine's key on the host")
+    note("Restricted, a key runs `msbctl host serve`: msbctl verbs from its allowlist,")
+    note("no shell, nothing that reads a stored secret or approves a changed policy.")
+    note("That is what keeps an agent running on this machine from doing more there.")
+    cands = remote_key_candidates()
+    if not cands:
+        note("no public key found in the ssh-agent or ~/.ssh — skipped")
+        return
+    skip = "not now (the key keeps its shell; `msbctl remote setup` asks again)"
+    labels = [f"{where:<22} {line.split()[0]} …{line.split()[1][-12:]} {' '.join(line.split()[2:])}"
+              for where, line in cands]
+    # The default is to skip: the agent's first key is as likely to be the
+    # one an operator keeps a shell with as the everyday one.
+    choice = choose_one("restrict which key", labels + [skip], len(labels))
+    if choice == skip:
+        return
+    line = cands[labels.index(choice)][1]
+    blob = line.split()[1]
+    proc = remote_sh(dest, 'grep -F -- "$1" "$HOME/.ssh/authorized_keys"', blob, capture=True)
+    current = (proc.stdout or "").strip()
+    if "host serve" in current and "\n" not in current:
+        note("already restricted there")
+        return
+    replace = bool(current)
+    if replace:
+        warn(f"this key logs in to {name} with a shell now; restricted, it no longer will.")
+        warn("Keep another way in first: a password, the console, or an admin key")
+        warn("(`ssh-keygen -t ed25519-sk`, then `msbctl host authorize --admin` on the host).")
+        if not confirm("restrict it anyway?"):
+            return
+    proc = remote_sh(dest, 'msbctl host authorize "$@"', *(["--replace"] if replace else []), line)
+    if proc.returncode:
+        die(f"authorizing the key on {name} failed (above)")
+    # The shared connection still has the old key's shell: close it, so the
+    # next command logs in again and gets the forced command.
+    ssh_close(dest)
+
+
 def cmd_remote(args, config):
-    """remote add|ls|test|rm — the ssh destinations this machine drives."""
+    """remote add|setup|ls|test|rm — the ssh destinations this machine drives."""
     if args.action == "ls":
         remotes = configured_remotes(config)
         if not remotes:
             note("no remotes — `msbctl remote add NAME user@host`")
             return
         for name in sorted(remotes):
-            test = read_json(os.path.join(REMOTES_DIR, f"{name}.test.json"))
-            last = (f"{'ok' if test.get('ok') else test.get('summary', '?')}, "
-                    f"{_age(time.time() - test['at'])} ago") if test.get("at") else "not tested"
-            note(f"{name:<16} {remotes[name].get('ssh', '?'):<32} {last}")
+            note(f"{name:<16} {remotes[name].get('ssh', '?'):<32} {remote_last_test(name)}")
         return
     name = args.name or die(f"remote {args.action} needs a NAME")
     if not SANDBOX_NAME.fullmatch(name):
@@ -7968,6 +8212,14 @@ def cmd_remote(args, config):
         ensure_local_config()
         set_toml_key(CONFIG_FILE, "ssh", dest, table=f"remotes.{name}")
         note(f"remotes.{name} = {dest}  ({tilde(CONFIG_FILE)})")
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            # At a terminal, do the host's half from here too, asking first.
+            try:
+                remote_setup(name, load_config())
+            except SystemExit as exc:
+                warn(str(exc.code).replace("msbctl: ", "", 1))
+                note(f"registered anyway; `msbctl remote setup {name}` tries again")
+            return
         say("On the host, authorize this machine's everyday key")
         note("It gets a forced command there: msbctl verbs from host serve's allowlist,")
         note("no shell, and nothing that can read a stored secret or approve a policy.")
@@ -7989,6 +8241,8 @@ def cmd_remote(args, config):
         except SystemExit as exc:
             warn(str(exc.code).replace("msbctl: ", "", 1))
             note(f"once the key is authorized there: `msbctl remote test {name}`")
+    elif args.action == "setup":
+        remote_setup(name, config)
     elif args.action == "test":
         remote_test(name, config)
     elif args.action == "rm":
@@ -8000,6 +8254,51 @@ def cmd_remote(args, config):
             except FileNotFoundError:
                 pass  # never queried
         note(f"{name} removed from {tilde(CONFIG_FILE)}; the host itself is untouched")
+
+
+def remote_last_test(name):
+    test = read_json(os.path.join(REMOTES_DIR, f"{name}.test.json"))
+    if not test.get("at"):
+        return "not tested"
+    return f"{'ok' if test.get('ok') else test.get('summary', '?')}, {_age(time.time() - test['at'])} ago"
+
+
+def remotes_menu(config):
+    """The main menu's "remote hosts": add one, set one up or test it, remove
+    it. Each action is the `msbctl remote` verb of the same name."""
+    while True:
+        remotes = configured_remotes(config)
+        say("Remote hosts")
+        note("Machines that run sandboxes for this one, over ssh. A sandbox there is")
+        note("HOST:name for every msbctl verb, and `msbctl ls` lists them all.")
+        add, back = "add a remote host", "back"
+        rows = {f"{n:<14} {remotes[n].get('ssh', '?'):<28} {remote_last_test(n)}": n
+                for n in sorted(remotes)}
+        choice = choose_one("remote hosts", list(rows) + [add, back], 0 if rows else len(rows))
+        if choice == back:
+            return
+        try:
+            if choice == add:
+                dest = ask("ssh destination (user@host, or a Host from ~/.ssh/config)")
+                if not dest:
+                    continue
+                host = dest.split("@")[-1].split(".")[0].lower()
+                name = ask("call it", re.sub(r"[^a-z0-9-]+", "-", host).strip("-") or "remote")
+                cmd_remote(verb_args("remote", action="add", name=name, dest=dest), config)
+            else:
+                name = rows[choice]
+                setup, test, rm = "set up / check", "test the connection", "remove"
+                action = choose_one(name, [setup, test, rm, back], 0)
+                if action == setup:
+                    remote_setup(name, config)
+                elif action == test:
+                    remote_test(name, config)
+                elif action == rm and confirm(f"forget {name}? (the host itself is untouched)"):
+                    cmd_remote(verb_args("remote", action="rm", name=name), config)
+        except SystemExit as exc:
+            if exc.code:
+                warn(str(exc.code).replace("msbctl: ", "", 1))
+        config = load_config()
 
 
 # ----------------------------------------------------------------------- main
@@ -8054,8 +8353,45 @@ def guest_usage(name):
 
 
 def cmd_status(args, config):
-    """The sidebar. One block per sandbox; stdout so it can be piped or cached."""
+    """The sidebar. One block per sandbox, this machine's and then each
+    remote's; stdout so it can be piped or cached."""
     names = registered()
+    remotes = configured_remotes(config)
+    if names or not remotes:
+        local_status(args, config, names)
+    if remotes:
+        remote_status(args, config, remotes, gap=bool(names))
+
+
+def remote_status(args, config, remotes, gap):
+    """Each remote's sandboxes, one line each. --quick reads what `ls` last
+    cached and runs no ssh; otherwise the remotes are asked first, as `ls`
+    asks them (a host that just failed is left alone for a minute)."""
+    if not args.quick:
+        remote_ls_rows(verb_args("ls"), config)
+    for index, host in enumerate(sorted(remotes)):
+        if gap or index:
+            print()
+        cache = read_json(_remote_cache_path(host))
+        rows = cache.get("sandboxes")
+        age = f"  {DIM}{_age(time.time() - cache['at'])} ago{RESET}" if cache.get("at") else ""
+        print(f"{BOLD}{host}{RESET}  {DIM}{remotes[host].get('ssh', '')}{RESET}{age}")
+        if cache.get("failed_at", 0) > cache.get("at", 0):
+            print(f"   {RED}{cache.get('reason', 'unreachable')}{RESET}")
+        if rows is None:
+            print(f"   {DIM}not listed yet{RESET}")
+            continue
+        if not rows:
+            print("   nothing registered")
+        pad = max((len(r.get("name", "")) for r in rows), default=0)
+        for r in rows:
+            mark = "●" if r.get("state") == "running" else "○"
+            print(f"{mark} {host}:{r.get('name', '?')}{' ' * (pad - len(r.get('name', '')))}  "
+                  f"{DIM}{r.get('state', '?')}{RESET}")
+            print(f"   repo   {r.get('location', '')}")
+
+
+def local_status(args, config, names):
     if not names:
         print("   nothing registered")
         print("   `msbctl add` in a project directory")
@@ -8137,6 +8473,7 @@ MENU = [
     ("add",      "register a new project"),
     ("manage",   "manage sandboxes        (list, start, stop, rebuild, …)"),
     ("config",   "setup                   identities, Claude login, your network, defaults"),
+    ("remotes",  "remote hosts            other machines, over ssh"),
     ("claudemd", "edit your CLAUDE.md additions"),
     ("refresh",  "refresh version info"),
     ("quit",     "quit"),
@@ -8231,7 +8568,7 @@ def cmd_menu(args, config):
                 if exc.code:
                     warn(str(exc.code).replace("msbctl: ", "", 1))
         elif choice == "manage":
-            if not names:
+            if not names and not configured_remotes(config):
                 note("nothing to manage yet")
             elif not os.path.exists(picker):
                 note(f"msb-picker not found at {picker} — run install.sh")
@@ -8249,6 +8586,9 @@ def cmd_menu(args, config):
             config = load_config()
             note("egress rules, [env] and the image are fixed at create time —")
             note("`msbctl rebuild <name>` for those. Identity applies on restart.")
+        elif choice == "remotes":
+            remotes_menu(config)
+            config = load_config()
         elif choice == "claudemd":
             if not os.path.exists(PROFILE_LOCAL):
                 os.makedirs(CONFIG_DIR, mode=0o700, exist_ok=True)
@@ -8287,12 +8627,21 @@ def preflight(args):
         return
     if args.func is cmd_add and getattr(args, "remote", None):
         return
-    if args.func is cmd_ls and configured_remotes():
+    # With remotes, `add` asks where first and checks this machine only if it
+    # is the answer, and the menu works from a laptop with no msb at all.
+    if args.func in (cmd_ls, cmd_status, cmd_add, cmd_menu) and configured_remotes():
         return
+    if local_problem():
+        die(local_problem())
+
+
+def local_problem():
+    """Why this machine cannot run sandboxes, or None."""
     if not shutil.which("msb"):
-        die("msb is not on PATH")
+        return "msb is not on PATH"
     if not os.path.exists("/dev/kvm"):
-        die("no /dev/kvm — msbctl runs on the host, not inside a container")
+        return "no /dev/kvm — msbctl runs on the host, not inside a container"
+    return None
 
 
 def verb_args(verb, **values):
@@ -8510,11 +8859,13 @@ def build_parser():
                    help="authorize: one public key line, quoted; autostart: install")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
+    p.add_argument("--replace", action="store_true",
+                   help="authorize: rewrite the key's existing line instead of refusing")
     p.add_argument("--json", action="store_true", help="check: one JSON document")
     p.set_defaults(func=cmd_host)
 
-    p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, ls, test, rm")
-    p.add_argument("action", choices=["add", "ls", "test", "rm"])
+    p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, setup, ls, test, rm")
+    p.add_argument("action", choices=["add", "setup", "ls", "test", "rm"])
     p.add_argument("name", nargs="?", help="the remote's name, as in NAME:sandbox")
     p.add_argument("dest", nargs="?", help="for add: user@host, as ssh takes it")
     p.set_defaults(func=cmd_remote)

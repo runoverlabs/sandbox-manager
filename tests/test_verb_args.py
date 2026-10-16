@@ -40,7 +40,8 @@ class VerbArgsTest(MsbctlTest):
     def test_the_menus_refresh_lists(self):
         self.make_folder_sandbox("web")
         with mock.patch.object(self.m.shutil, "which", lambda cmd: None):
-            code, out, err = self.run_main(stdin="5\nq\n")
+            refresh = [key for key, _ in self.m.MENU].index("refresh") + 1
+            code, out, err = self.run_main(stdin=f"{refresh}\nq\n")
         self.assertEqual(code, 0, err)
         self.assertIn("web", out)
 
