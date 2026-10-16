@@ -25,3 +25,8 @@ ignore = [
     # Every /tmp path in msbctl is a path inside the guest VM, not on the host.
     "S108",
 ]
+
+[lint.per-file-ignores]
+# The tests plant made-up secret values on purpose, to prove they never reach
+# argv or output.
+"tests/*" = ["S105", "S106"]

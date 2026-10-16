@@ -21,11 +21,13 @@ writes are the long-form documentation of every key; this page is the map.
 | `~/.config/msb/secrets/global.env` | the Claude token, and an optional `GH_TOKEN` for version checks (0600) |
 | `~/.config/msb/secrets/<name>.env` | that sandbox's tokens (0600) |
 | `<project>/.msb/sandbox.toml` | the project's portable policy |
-| `<project>/.msb/dev.yaml` | the file passed to `msb --conf`: image, cpus, memory |
+| `~/.local/state/msb/policy/<name>/` | a repo sandbox's `.msb/`, as fetched from GitHub, and `meta.json` |
+| `<project>/.msb/dev.yaml` | the image, and nothing else; read by msbctl, never passed to msb |
 | `~/.local/state/msb/claude/<name>/` | that sandbox's `~/.claude` |
 | `~/.local/state/msb/profile/` | the assembled `CLAUDE.md`, mounted read-only |
 | `~/.local/state/msb/agent/` | the SSH-agent filters' sockets and logs |
 | `~/.local/state/msb/versions.json` | the cached version checks |
+| `~/.local/state/msb/policy-approved/<name>.json` | the project policy last approved for that sandbox |
 
 `MSB_CONFIG_DIR` and `MSB_STATE_DIR` move the two roots.
 
@@ -51,6 +53,7 @@ including a whole egress group, replaces the shipped value.
 | `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
 | `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
 | `identity` | `""` | the `[identities]` entry new sandboxes use |
+| `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
 
 ### `[identities.<name>]`
 
@@ -139,6 +142,44 @@ name, so it's safe to commit.
 | `containers_storage` | `"fuse-overlayfs"` for podman without a container disk |
 | `script` | a project script run last, inside the guest, from the project folder |
 
+## .msb/dev.yaml
+
+One line msbctl reads: `image:`, which must be an image reference
+(`registry/name:tag@sha256:…`); a path is refused. The file is **never passed
+to msb**. msb's own config file can mount host paths, copy host files into the
+guest and fill in `${VAR}` from msb's environment, which holds the bound
+secrets, and the project folder is writable from inside the sandbox. So a
+create or rebuild refuses a `dev.yaml` that sets anything else. The `cpus`,
+`memory` and `workdir` keys older versions wrote are accepted and ignored.
+`msbctl show` warns about a file a rebuild would refuse; a sandbox that already
+exists keeps starting.
+
+| A `dev.yaml` with | moves to |
+| --- | --- |
+| `env:` | `[env]` in `.msb/sandbox.toml` |
+| `cpus:`, `memory:` | `.msb/sandbox.toml` |
+| `mounts:`, `ports:` | `msbctl mount`, `msbctl port` (the registry entry) |
+| anything else | a file of your own, named by `msb_conf` in the registry entry |
+
+`msb_conf` is the operator's escape hatch for msb features msbctl doesn't model
+(`user`, `rlimits`, `security`, …). It lives in the registry entry only, must
+be an absolute path, and may not contain `${`. The flags msbctl emits win over
+it.
+
+### The policy pin
+
+These keys in `.msb/sandbox.toml` are applied only once approved on the host
+(see [the policy pin](egress.md#the-policy-pin)): `rule_groups`,
+`extra_rules`, `allow_private_dns`, `secret_binds`, `[secrets]`, `cpus`,
+`memory`, `root_disk`, `containers_disk` and `[caches]`. They decide what may
+leave the sandbox, which host a stored value is sent to, and what the sandbox
+takes from the host: a committed `memory = "256G"` is as much a change as a
+new rule. `image`, `[bootstrap]` and `[env]` aren't pinned; they act only
+inside the guest. The approved values are kept in
+`~/.local/state/msb/policy-approved/<name>.json`, and their digest as
+`policy_pin` in the registry entry. Keys in the registry entry itself are
+yours and are never re-approved.
+
 ## The registry entry
 
 `~/.config/msb/sandboxes/<name>.toml` is machine-local and never committed.
@@ -147,14 +188,18 @@ Any key it sets overrides the project's file.
 | Key | Meaning |
 | --- | --- |
 | `name`, `project` | the sandbox's name and the absolute path of its project folder |
+| `source`, `repo`, `ref` | `source = "repo"` for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder), which has `repo` and an optional `ref` instead of `project` |
 | `guest_path` | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
 | `repo` | `owner/name` on GitHub, for the token binding and the picker |
 | `identity` | an `[identities]` name; applied at every start |
 | `autostart` | started when the picker opens |
 | `ssh_keys` | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
+| `extra_rule_groups` | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
 | `ports` | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
 | `egress_mode` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
-| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides |
+| `policy_pin` | written by msbctl: the digest of the project policy last approved |
+| `msb_conf` | your own msb config file, passed as `--conf`: an absolute path, never in a project, no `${` in it. See [dev.yaml](#msbdevyaml) |
+| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides. `conf` must name a file inside the project |
 | `[versions]` | what `msbctl update` installed, so a rebuild reproduces it |

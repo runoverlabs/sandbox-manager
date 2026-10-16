@@ -19,7 +19,8 @@ explains them.
   shorthand for the current folder's sandbox.
 
 See [Everyday use](everyday.md#the-current-folder-names-the-sandbox) for the
-rules behind this.
+rules behind this. A name like `sbx-01:webshop`, in any of those places, is a
+sandbox on the [remote](remote-hosts.md) called `sbx-01`.
 
 ## Registering and inspecting
 
@@ -27,9 +28,13 @@ rules behind this.
 
 ```text
 msbctl add [dir]
+msbctl add --repo owner/name [--ref REF] [--name NAME] [--guest-path PATH]
+           [--workspace-disk SIZE] [--identity NAME] [--claude-token NAME] [--autostart] [-y]
 ```
 
-Register a project with the setup wizard. Nothing is started. A bare name
+Register a project with the setup wizard. Nothing is started. `--remote HOST`
+registers it on [a remote](remote-hosts.md#on-the-laptop) instead: the rest of
+the arguments are run there. A bare name
 resolves under your workspaces folder and is created if missing; a path
 starting with `/`, `~`, `./` or `../` is taken as written. Without an argument
 it asks, defaulting to the current directory. It also asks where the project
@@ -37,15 +42,28 @@ appears inside the sandbox: [`/work`, the host's own path, or a custom
 one](advanced.md#where-the-project-appears-in-the-sandbox). See
 [Get started](quickstart.md#2-register-a-project).
 
+With `--repo`, there's no folder: the sandbox clones the GitHub repo into a
+disk volume inside itself, and its policy is the repo's own `.msb/`, fetched at
+the commit it resolves to now. The flags answer what it would otherwise ask;
+without a terminal, anything not given takes its default (`/work`, the default
+branch, the repo's name). It shows what the repo asks for (commit, rule groups,
+rules, secret bindings, image) and asks before registering, unless `-y`. At a
+terminal it also asks for the sandbox's GitHub token, which a private repo
+needs. See [Sandboxes without a folder](advanced.md#sandboxes-without-a-folder).
+
 ### `msbctl ls`
 
 ```text
-msbctl ls [--refresh] [--porcelain] [--picker]
+msbctl ls [--refresh] [--porcelain] [--picker] [--json]
 ```
 
 One line per sandbox: name, state, project, pending updates, autostart.
 `--refresh` checks upstream versions first. `--porcelain` prints tab-separated
-fields for scripts; `--picker` is the format `msb-picker` reads.
+fields for scripts; `--picker` is the format `msb-picker` reads. `--json` prints
+one JSON document, `{"msbctl": version, "sandboxes": [...]}`, each with
+`name`, `state`, `source`, `location`, `repo`, `ref`, `autostart` and
+`updates`: this machine's sandboxes only, which is what a laptop asks a
+remote for.
 
 ### `msbctl status`
 
@@ -59,12 +77,14 @@ image, folder. `--quick` skips reading figures from inside each guest.
 ### `msbctl show`
 
 ```text
-msbctl show [name]
+msbctl show [name] [--json]
 ```
 
 Everything about one sandbox: resources, disks, extra folders, installed
 versions, environment, every egress rule in the order it's emitted, and the
-identity, keys and secrets bound to it.
+identity, keys and secrets bound to it. `--json` prints the essentials as one
+JSON document; for each secret it says whether a value is **stored**, never
+what it is.
 
 ### `msbctl config`
 
@@ -90,10 +110,13 @@ terminal editor.
 
 ```text
 msbctl start [name…]
+msbctl start --autostart
 ```
 
 Start a stopped sandbox, or create it if it doesn't exist yet. Creating runs
-the bootstrap, once.
+the bootstrap, once. `--autostart` starts every sandbox whose registry entry
+says `autostart = true` and isn't running; the picker runs it when it opens,
+and so does the unit [`msbctl host autostart install`](#msbctl-host) writes.
 
 ### `msbctl stop`
 
@@ -243,6 +266,20 @@ Add egress rules. Each target is `host` (HTTPS, :443), `host:port` (TCP),
 address goes in brackets, `[fd00::5]:22`. Written to the project's
 `extra_rules`. See [Adding a host](egress.md#adding-a-host).
 
+### `msbctl policy`
+
+```text
+msbctl policy name|. [show|approve|update [REF]]
+```
+
+`show` (the default) prints the project-layer values the [policy
+pin](egress.md#the-policy-pin) covers, whether they're the approved ones, and
+what changed since. `approve` shows the change and asks; it needs a terminal.
+`update`, for a sandbox cloned from a repo, fetches the repo's `.msb/` at the
+tip of its ref (or of `REF`, which becomes its ref), shows what that commit
+changes, and swaps it in once approved; a `rebuild` then applies it. The clone
+inside the sandbox isn't touched.
+
 ### `msbctl observe`
 
 ```text
@@ -280,10 +317,16 @@ ports given it lists them, and `--rm` stops publishing one. Needs a rebuild. See
 msbctl secret add name|.
 msbctl secret ls  name|.
 msbctl secret rm  name|. VAR
+msbctl secret set name|. VAR [--stdin] [--restart]
 ```
 
 Tokens the sandbox can use but never see. `add` offers the presets or takes
-your own binding. See [Credentials & SSH](credentials.md#more-secrets).
+your own binding. `set` stores a new value for a variable the sandbox already
+binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt or, with
+`--stdin`, from standard input; binding a new variable is `add`. A running
+sandbox uses the new value from its next start, or now with `--restart`. See
+[Credentials & SSH](credentials.md#more-secrets) and
+[Scripting](credentials.md#scripting-storing-a-token-from-a-password-manager).
 
 ### `msbctl keys`
 
@@ -320,11 +363,14 @@ recorded so a rebuild reproduces them. Run `msbctl ls --refresh` first for
 
 ```text
 msbctl setup [--welcome]
+msbctl setup --claude-token NAME [--stdin]
 ```
 
 Your machine-level settings as a menu: git identities, Claude login, your
 network, new-sandbox defaults, or the config file itself. `--welcome` runs the
-first-time walk-through.
+first-time walk-through. `--claude-token NAME` skips the menu and stores one
+Claude token under that name (`main` is the default one), from a hidden prompt
+or `--stdin`.
 
 ### `msbctl self-update`
 
@@ -334,6 +380,43 @@ msbctl self-update [--version vX.Y.Z]
 
 Upgrade a packaged install to the latest release, or a given one, verifying it
 the same way the installer does. In a git checkout it tells you to `git pull`.
+
+## Remote hosts
+
+### `msbctl host`
+
+```text
+msbctl host serve
+msbctl host authorize "PUBLIC KEY LINE" [--admin]
+msbctl host check [--json]
+msbctl host autostart install
+```
+
+For running this machine as a [remote host](remote-hosts.md). `serve` is the
+forced command a laptop's key runs: it reads `SSH_ORIGINAL_COMMAND`, refuses
+anything outside [its allowlist](remote-hosts.md#what-the-restricted-key-may-run)
+with exit status 126, and runs the rest with `MSB_RESTRICTED=1`. `authorize`
+adds a key to `~/.ssh/authorized_keys` with that forced command, or with
+`--admin` without one. `check` reports the host's hygiene, as heuristics.
+`autostart install` writes and enables a systemd user unit that runs `msbctl
+start --autostart` at boot. Under `host serve`, only `check` is allowed.
+
+### `msbctl remote`
+
+```text
+msbctl remote add NAME user@host
+msbctl remote ls
+msbctl remote test NAME
+msbctl remote rm NAME
+```
+
+The other machines this one drives. `add` records `[remotes.NAME]` in
+`config.toml`, prints the `msbctl host authorize` line to run there, and tests
+the connection interactively (so a new host key can be accepted). `test` runs
+the host's `host check` and warns about an unrestricted key or a version
+mismatch. `rm` forgets it; the host isn't touched. Then `NAME:sandbox`
+addresses a sandbox there for every verb, and `ls` shows every host. See
+[Remote hosts](remote-hosts.md#on-the-laptop).
 
 ## Environment variables
 

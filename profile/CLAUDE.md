@@ -19,8 +19,11 @@ property of the VM and not a privilege over the host.
 
 Installed packages persist across stop/start but **not across a rebuild**. If
 something is worth having every time, say so — it belongs in the manager's
-`bootstrap.sh` or the project's `.msb/sandbox.toml`, both of which are on the
-host and outside your reach by design.
+`bootstrap.sh` (on the host, outside your reach) or the project's
+`.msb/sandbox.toml`. That file is read by msbctl on the host, and it is
+read-only in here: its egress rules, secret bindings and resources are only
+applied once the operator approves them on the host, so editing it from inside
+the sandbox achieves nothing. Say what should change instead.
 
 ## The network will refuse things, and that is the design
 
@@ -30,8 +33,9 @@ allowlist of hosts is reachable, on explicit ports.
 **So treat a connection failure as policy before you treat it as an outage.**
 Do not retry it, do not look for a proxy, and do not reach for an alternative
 mirror — report the exact host and port that was refused. Adding it is one line
-in the project's `.msb/sandbox.toml` on the host, and the whole allowlist is
-deliberately built from denials that actually happened rather than from guesses.
+in the project's `.msb/sandbox.toml`, made and approved by the operator on the
+host, and the whole allowlist is deliberately built from denials that actually
+happened rather than from guesses.
 
 If a fetch over `http://` fails, the fix is its `https://` URL. A hostname rule
 on a plaintext port is enforced as a set of IP addresses and breaks against

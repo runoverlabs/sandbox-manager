@@ -7,6 +7,7 @@
     msbctl ls [--refresh]         one line per sandbox
     msbctl show <name>            everything about one, including versions
     msbctl start|stop <name>…         repeatable: acts on each in turn
+    msbctl start --autostart      every sandbox marked autostart that is not running
     msbctl rebuild <name>         destroy and recreate; keeps ~/.claude state
     msbctl purge <name>           destroy, delete state, secret and registration
     msbctl rename <name> <new>    new name; recreates it, everything else moves along
@@ -21,13 +22,16 @@
     msbctl resize <name>          change cpus / memory / root disk, keeping its state
     msbctl cache <name> [ls|clear [key]]   the package-cache disks
     msbctl allow <name> host…     add egress rules (then rebuild to apply)
+    msbctl policy <name> [approve]   the project policy it is pinned to; approve a change
     msbctl observe <name> [on|off|report]   stop blocking and record what is reached
-    msbctl secret add|rm|ls <name>   extra tokens the sandbox can use but not see
+    msbctl secret add|rm|ls|set <name>   extra tokens the sandbox can use but not see
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
     msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (then rebuild)
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
     msbctl code <name>            open the editor on the project, on the host
     msbctl reclaim <name>         give the guest's page cache back to the host
+    msbctl host serve|authorize|check|autostart   run this machine as a remote host
+    msbctl remote add|ls|test|rm  the machines this one drives; then HOST:name anywhere
 
 Inside a registered project folder the name can be left out where it is the
 only argument (`msbctl shell`, `msbctl stop`), and `.` stands for it where more
@@ -55,14 +59,17 @@ tomllib, so there is no TOML serializer here to rot. The one exception is the
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
 import hashlib
+import io
 import ipaddress
 import json
 import os
 import pydoc
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -75,6 +82,7 @@ import termios
 import time
 import tty
 import urllib.error
+import urllib.parse
 import urllib.request
 
 if sys.version_info < (3, 11):
@@ -354,6 +362,81 @@ def read_env_file(path):
     return values
 
 
+# ------------------------------------------------------- the project's dev.yaml
+#
+# A project's .msb/dev.yaml is READ BY MSBCTL, for its `image:` line, and never
+# handed to msb. msb's config file can mount host paths, copy host files into
+# the guest and interpolate `${VAR}` from msb's own environment — the one that
+# holds the bound secrets — and the project folder is writable from inside the
+# sandbox. So the file is checked line by line, without a YAML parser, and a
+# create refuses one that says anything msbctl does not read: a key that looks
+# harmless today is one msb may act on tomorrow, and a silently ignored setting
+# reads as applied.
+
+# Top-level keys a dev.yaml may carry. Only `image` is read; the others are
+# what older `msbctl add` runs wrote, and are accepted and ignored (cpus and
+# memory come from sandbox.toml, the workdir from `guest_path`).
+CONF_KEYS_READ = ("image", "cpus", "memory", "workdir")
+_CONF_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:")
+
+
+def conf_problems(path):
+    """Human-readable problems with a project dev.yaml; [] if there are none,
+    and for a missing file (the image lookup reports that)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+    problems = []
+    for n, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or line == "---":
+            continue
+        if line[0] in " \t":
+            problems.append(f"line {n}: nested values are not read ({stripped[:40]!r})")
+            continue
+        match = _CONF_KEY.match(line)
+        if not match:
+            problems.append(f"line {n}: not a `key: value` line ({stripped[:40]!r})")
+        elif match.group(1) not in CONF_KEYS_READ:
+            problems.append(f"line {n}: `{match.group(1)}` is not read by msbctl")
+    return problems
+
+
+# An OCI image reference: [registry[:port]/]path[:tag][@sha256:digest], the
+# path lowercase. Validated because the positional image is the one value from
+# a project that still reaches msb's argv, and a path-shaped one (`/home/you`,
+# `./rootfs`, `~/x`, `file:///x`) is not an image a repo gets to name.
+IMAGE_REF = re.compile(
+    r"(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?/)?"
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[0-9a-f]{64})?")
+
+
+def conf_image(path):
+    """The `image:` of a dev.yaml, or None (no such line, or no file)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                match = re.match(r"^image:\s*(\S+)\s*$", line)
+                if match:
+                    return match.group(1)
+    except FileNotFoundError:
+        pass  # no file: no image line
+    return None
+
+
+def image_problem(ref):
+    """Why `ref` is not an OCI image reference, or None."""
+    if not isinstance(ref, str) or not IMAGE_REF.fullmatch(ref):
+        return ("not an image reference like registry/name:tag@sha256:… "
+                "(a path is never accepted)")
+    return None
+
+
 # ---------------------------------------------------------------------- config
 
 class Sandbox:
@@ -370,24 +453,54 @@ class Sandbox:
         self.entry = read_toml(os.path.join(REGISTRY_DIR, f"{name}.toml"))
         if not self.entry:
             die(f"no sandbox named {name!r} — `msbctl ls` to see what exists")
-        if "project" not in self.entry:
-            die(f"{name}.toml has no `project` key — it was hand-edited into an "
-                "unusable state, or written by an older msbctl")
-
-        self.project = os.path.realpath(os.path.expanduser(self.entry["project"]))
+        # "folder": the project is a host folder, mounted. "repo": there is no
+        # host folder at all — the code is cloned from GitHub into a disk volume
+        # inside the sandbox, and the project layer is the repo's own .msb/ as
+        # fetched at a recorded commit (policy_dir(), never mounted).
+        self.source = self.entry.get("source", "folder")
+        if self.source not in ("folder", "repo"):
+            die(f"{name}.toml: source is {self.source!r}, expected \"folder\" or \"repo\"")
+        self.is_repo = self.source == "repo"
         self.repo = self.entry.get("repo", "")
+        if self.is_repo:
+            if not self.repo:
+                die(f"{name}.toml has `source = \"repo\"` but no `repo`")
+            self.project = policy_dir(name)
+        else:
+            if "project" not in self.entry:
+                die(f"{name}.toml has no `project` key — it was hand-edited into an "
+                    "unusable state, or written by an older msbctl")
+            self.project = os.path.realpath(os.path.expanduser(self.entry["project"]))
         self.autostart = bool(self.entry.get("autostart", False))
         self.project_cfg = read_toml(os.path.join(self.project, ".msb", "sandbox.toml"))
 
         defaults = config.get("defaults", {})
+        if self.is_repo and ("conf" in self.project_cfg or "conf" in self.entry):
+            # Only .msb/dev.yaml is fetched, so another path would be a missing
+            # file and a silent fall to the default image.
+            die(f"{name}: `conf` cannot be set for a sandbox cloned from {self.repo} — "
+                "only .msb/dev.yaml is read from the repo")
         self.conf = self._pick("conf", ".msb/dev.yaml")
         self.cpus = self._pick("cpus", defaults.get("cpus", 4))
         self.memory = self._pick("memory", defaults.get("memory", "8G"))
         self.root_disk = self._pick("root_disk", defaults.get("root_disk", "16G"))
-        # Size of a dedicated disk for /var/lib/containers, or empty for none.
-        self.secret_binds = self._pick("secret_binds", [])
+        # Which layer a binding came from decides where its VALUE may come
+        # from: see secret_env(). The registry entry is the operator's; the
+        # project's sandbox.toml is a file the sandbox itself can write.
+        # A folder sandbox's registry list REPLACES the project's, like every
+        # other key. A repo sandbox's ADDS to it: `secret add` and `allow` write
+        # to the registry there, since there is no checkout to edit, and
+        # replacing would silently drop what the repo asks for.
+        if self.is_repo:
+            self.registry_binds = list(self.entry.get("secret_binds", []))
+            self.secret_binds = list(dict.fromkeys(
+                self.project_cfg.get("secret_binds", []) + self.registry_binds))
+        else:
+            self.secret_binds = self._pick("secret_binds", [])
+            self.registry_binds = list(self.secret_binds) if "secret_binds" in self.entry else []
         # {feature: size} for per-package-manager cache disks. See CACHES.
         self.caches = self._pick("caches", {})
+        # Size of a dedicated disk for /var/lib/containers, or empty for none.
         self.containers_disk = self._pick("containers_disk",
                                           defaults.get("containers_disk", ""))
         self.claude_auth = defaults.get("claude_auth", "secret")
@@ -397,12 +510,47 @@ class Sandbox:
         self.identity_name = self._pick("identity", defaults.get("identity"))
 
         self.conf_path = os.path.join(self.project, self.conf)
+        # Inside the project, always. An absolute `conf` (or one climbing out
+        # with ../, or a symlink) would make os.path.join ignore the project,
+        # and the file it names is read for the image and checked by
+        # conf_problems() as if the project had written it.
+        real_project = os.path.realpath(self.project)
+        real_conf = os.path.realpath(self.conf_path)
+        if not real_conf.startswith(real_project.rstrip(os.sep) + os.sep):
+            die(f"{name}: conf {self.conf!r} is outside the project folder — it must name a "
+                f"file under {tilde(self.project)} (set in {tilde(self._origin('conf'))})")
         # Disk volumes are named after the sandbox, but msb cannot rename a
         # volume, so a renamed sandbox keeps its old prefix here (`volumes` in
         # the registry entry) rather than losing its caches and images.
         self.volume_prefix = self.entry.get("volumes") or name
         self.state = os.path.join(STATE_DIR, "claude", name)
         self.agent_sock = os.path.join(AGENT_DIR, f"{name}.sock")
+
+    def reload(self):
+        """Read every layer again, after one was rewritten (a fetched policy)."""
+        self.__init__(self.name, self.config)
+
+    @property
+    def repo_meta(self):
+        """What fetch_repo_policy() recorded about the fetch: repo, ref, branch,
+        sha, private, fetched_at. {} for a folder sandbox or before a fetch."""
+        if not self.is_repo:
+            return {}
+        return read_json(os.path.join(self.project, "meta.json"))
+
+    @property
+    def workspace_volume(self):
+        """The disk volume a repo sandbox's clone lives on. Kept across rebuilds,
+        deleted by purge."""
+        return f"{self.volume_prefix}-workspace"
+
+    @property
+    def location(self):
+        """Where the code is, for display: a host folder, or the repo."""
+        if not self.is_repo:
+            return tilde(self.project)
+        ref = self.entry.get("ref") or self.repo_meta.get("branch") or "(default branch)"
+        return f"github:{self.repo}@{ref}"
 
     def wants_component(self, comp):
         """Whether this sandbox is set up to have `comp`. Used to keep bun, gitleaks and a
@@ -426,7 +574,8 @@ class Sandbox:
     def owned_volumes(self, vols=None):
         """Names of the existing disk volumes that belong to this sandbox."""
         return [n for n in (msb_volumes() if vols is None else vols)
-                if n.startswith(f"{self.volume_prefix}-cache-") or n == self.containers_volume]
+                if n.startswith(f"{self.volume_prefix}-cache-")
+                or n in (self.containers_volume, self.workspace_volume)]
 
     def named_disk_flags(self, volume, dest, size):
         """`--mount-named` for a disk volume that OUTLIVES the sandbox, so a rebuild
@@ -479,6 +628,15 @@ class Sandbox:
         memory by this path, so they do not follow a change.
         """
         raw = self.guest_path_setting
+        if self.is_repo and raw == "host":
+            die(f"{self.name}: guest_path \"host\" means the host folder's own path, and a "
+                f"sandbox cloned from {self.repo} has no host folder — fix it in "
+                f"{tilde(registry_path(self))}")
+        if self.is_repo and "." in str(raw):
+            # The clone is a named disk volume, and msb refuses one at a path
+            # with a dot in it ("invalid or reserved device id").
+            die(f"{self.name}: guest_path {raw!r} has a dot in it, which a disk volume "
+                f"cannot be mounted at — fix it in {tilde(registry_path(self))}")
         path = self.project if raw == "host" else raw
         problem = guest_path_problem(path)
         if problem:
@@ -509,33 +667,75 @@ class Sandbox:
 
     @property
     def image(self):
-        """Resolved from the registry entry, else from the --conf file.
+        """Resolved from the registry entry, else from the project's dev.yaml.
 
         Extracted from the YAML with an anchored regex rather than parsed. The
-        alternative is a PyYAML dependency for one scalar, and the alternative
-        to THAT is duplicating the digest into sandbox.toml, where it would
-        drift from the file msb actually reads. `image:` is one line in
-        a file this tool generates, and a non-match is an error rather than a
-        guess.
+        alternative is a PyYAML dependency for one scalar. `image:` is one line
+        in a file this tool generates, and a non-match is an error rather than
+        a guess. Whatever the source, it must be an OCI reference: the
+        positional image is the one thing a project still hands to msb, and a
+        path-shaped value (`/home/you`, `./rootfs`) is not something msbctl
+        lets a repo choose. See image_problem().
         """
         if "image" in self.entry:
-            return self.entry["image"]
-        if not os.path.isfile(self.conf_path):
-            die(f"{tilde(self.conf_path)} does not exist — `msbctl add` writes it")
-        with open(self.conf_path, encoding="utf-8") as fh:
-            for line in fh:
-                match = re.match(r"^image:\s*(\S+)\s*$", line)
-                if match:
-                    return match.group(1)
-        die(f"no `image:` line in {tilde(self.conf_path)}")
+            ref, where = self.entry["image"], registry_path(self)
+        elif self.is_repo and not os.path.isfile(self.conf_path):
+            # A repo without .msb/dev.yaml gets the machine's default image.
+            ref, where = self.config.get("defaults", {}).get("image", ""), CONFIG_FILE
+        else:
+            if not os.path.isfile(self.conf_path):
+                die(f"{tilde(self.conf_path)} does not exist — `msbctl add` writes it")
+            ref, where = conf_image(self.conf_path), self.conf_path
+            if ref is None:
+                die(f"no `image:` line in {tilde(self.conf_path)}")
+        problem = image_problem(ref)
+        if problem:
+            die(f"{self.name}: image {ref!r} in {tilde(where)}: {problem}")
+        return ref
+
+    @property
+    def msb_conf(self):
+        """The operator's own msb config file (`msb_conf` in the registry
+        entry), or None. REGISTRY ONLY, never `_pick`: it is the escape hatch
+        for msb config-file features msbctl does not model (`user`, `rlimits`,
+        `security`, ...), and those are exactly the features — host mounts,
+        host file copies, `${VAR}` from msb's environment — that a project must
+        not be able to reach. It must not contain `${` at all: msb interpolates
+        that from its own environment, which holds every bound secret."""
+        raw = self.entry.get("msb_conf")
+        if not raw:
+            return None
+        path = os.path.expanduser(str(raw))
+        where = tilde(registry_path(self))
+        if not os.path.isabs(path):
+            die(f"{self.name}: msb_conf {raw!r} must be an absolute path (in {where})")
+        if not os.path.isfile(path):
+            die(f"{self.name}: msb_conf {tilde(path)} is not a file (in {where})")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            if "${" in fh.read():
+                die(f"{self.name}: msb_conf {tilde(path)} contains `${{`, which msb would "
+                    "fill in from its own environment — the one holding the bound secrets. "
+                    "Write the value out instead.")
+        return path
 
     # -------------------------------------------------------------- the rules
 
     @property
     def rule_groups(self):
+        """The project's groups (or the registry's, which replace them), then
+        this machine's own: `extra_rule_groups` in the registry entry. Those
+        ADD, and are not part of the project's pinned policy — a group defined
+        only in this machine's config.toml means nothing to anyone else who
+        clones the project, and in their sandbox.toml it would make every other
+        machine's create fail with "unknown rule group"."""
         groups = self._pick("rule_groups",
                             self.config.get("defaults", {}).get("rule_groups", []))
+        groups = list(dict.fromkeys(list(groups) + self.machine_rule_groups))
         return [g for g in groups if g != "base"]
+
+    @property
+    def machine_rule_groups(self):
+        return [g for g in self.entry.get("extra_rule_groups", []) if g != "base"]
 
     @property
     def egress_mode(self):
@@ -558,8 +758,15 @@ class Sandbox:
         Create-time, like every other network setting: changing it needs a
         rebuild, not a restart.
         """
-        mode = self._pick("egress_mode",
-                          self.config.get("defaults", {}).get("egress_mode", "enforce"))
+        # REGISTRY ONLY, never `_pick`: the project's sandbox.toml is committed
+        # and writable from inside the sandbox, so a project that could set
+        # this could switch its own deny-by-default off.
+        if "egress_mode" in self.project_cfg and not getattr(self, "_warned_egress_mode", False):
+            self._warned_egress_mode = True
+            warn(f"{self.name}: egress_mode in {tilde(project_path(self))} is ignored — it is "
+                 f"machine-local only (`msbctl observe {self.name} on` sets it in the registry entry)")
+        mode = self.entry.get("egress_mode",
+                              self.config.get("defaults", {}).get("egress_mode", "enforce"))
         if mode not in EGRESS_MODES:
             die(f"{self.name}: egress_mode is {mode!r}, expected one of "
                 f"{', '.join(EGRESS_MODES)}")
@@ -571,6 +778,10 @@ class Sandbox:
 
     @property
     def extra_rules(self):
+        if self.is_repo:
+            # The repo's rules, then the operator's: see registry_binds.
+            return list(dict.fromkeys(self.project_cfg.get("extra_rules", [])
+                                      + self.entry.get("extra_rules", [])))
         return self._pick("extra_rules", [])
 
     @property
@@ -592,7 +803,12 @@ class Sandbox:
         still holds either way — it only widens what a *name* can resolve to,
         never what is reachable without a rule.
         """
-        return bool(self._pick("allow_private_dns", False))
+        # A machine-local group that resolves to LAN addresses brings it along,
+        # from the same machine-local place: such a group does not work without
+        # it, and the failure reads as a missing rule.
+        private = self.config.get("defaults", {}).get("private_dns_groups", [])
+        return bool(self._pick("allow_private_dns", False)
+                    or any(g in private for g in self.machine_rule_groups))
 
     def image_or_none(self):
         """image, but None instead of dying when the conf file is missing.
@@ -653,7 +869,11 @@ class Sandbox:
         at launch.
         """
         flags, env = [], {}
-        wants_github = self.project_cfg.get("secrets", {}).get("github", bool(self.repo))
+        # A repo sandbox always binds its token when one is stored: it is how
+        # the clone authenticates and how its work gets pushed (there is no
+        # agent to forward), and the binding is the fixed one, to GitHub only.
+        wants_github = self.is_repo or self.project_cfg.get("secrets", {}).get(
+            "github", bool(self.repo))
 
         if self.claude_auth == "secret":
             token = claude_tokens().get(self.claude_token)
@@ -688,21 +908,40 @@ class Sandbox:
                 flags += ["--secret", with_transcript_passthrough(
                     "GH_TOKEN@github.com,api.github.com")]
             else:
-                note(f"no GH_TOKEN for {self.name} — the GitHub API is unavailable "
-                     "in this sandbox (git push over SSH still works)")
+                note(f"no GH_TOKEN for {self.name} — " + (
+                    "the clone of a private repo, git push and the GitHub API need one: "
+                    f"`msbctl secret set {self.name} GH_TOKEN`" if self.is_repo else
+                    "the GitHub API is unavailable in this sandbox (git push over SSH still works)"))
 
         # Extra bindings, in msb's own `ENV[:OPTIONS]@HOST[,HOST]` syntax so a
-        # hand-written one works too. The value comes from this sandbox's env
-        # file, else the shared one, and — like the others — only ever travels
-        # in the environment of the msb process.
+        # hand-written one works too. Like the others, the value only ever
+        # travels in the environment of the msb process.
+        #
+        # Where the value may come from depends on who wrote the binding. A
+        # binding in the project's sandbox.toml decides which HOST a stored
+        # value is sent to, and that file is committed and writable from inside
+        # the sandbox: if it could reach global.env, `MY_TOKEN@attacker.example`
+        # plus one egress rule would send the operator's shared token there. So
+        # a project binding resolves from this sandbox's own env file only; the
+        # fallback to the shared file is for bindings in the registry entry.
+        # The reserved variables are never bound this way, from any layer.
         own = read_env_file(os.path.join(SECRETS_DIR, f"{self.name}.env"))
         shared = read_env_file(os.path.join(SECRETS_DIR, "global.env"))
         for spec in self.secret_binds:
             var = secret_var(spec)
-            value = own.get(var) or shared.get(var)
+            if is_reserved_var(var):
+                warn(f"{self.name}: secret binding {spec!r} is ignored — {var} has a fixed binding "
+                     "and cannot be bound again (a rebuild refuses this)")
+                continue
+            from_registry = spec in self.registry_binds
+            value = own.get(var) or (shared.get(var) if from_registry else None)
             if value:
                 env[var] = value
                 flags += ["--secret", with_transcript_passthrough(spec)]
+            elif not from_registry:
+                note(f"no {var} for {self.name} — a binding from the project's sandbox.toml "
+                     f"takes its value from {tilde(os.path.join(SECRETS_DIR, self.name + '.env'))} "
+                     f"only: `msbctl secret add {self.name}` (skipped for now)")
             else:
                 note(f"no {var} for {self.name} — `msbctl secret add {self.name}` "
                      "(skipped for now)")
@@ -723,12 +962,33 @@ class Sandbox:
 
     def mount_flags(self):
         uid, gid = os.getuid(), os.getgid()
+        if self.is_repo:
+            # No host folder: the clone lives on a disk volume that outlives the
+            # sandbox, so a rebuild finds `.git` there and leaves it alone. The
+            # fetched policy is NOT mounted — it is what the host reads, and the
+            # guest's own checkout of .msb/ changes nothing until it is pushed
+            # and `msbctl policy <name> update` is run.
+            return self._mounts_after_project(uid, gid, self.named_disk_flags(
+                self.workspace_volume, self.guest_project,
+                self._pick("workspace_disk", self.config.get("defaults", {})
+                           .get("workspace_disk", "20G"))))
         flags = [
             # uid/gid presentation is what makes guest writes land as you on
             # the host. Without it you get files you cannot rm without help.
             "--mount-dir", f"{self.project}:{self.guest_project}:uid={uid},gid={gid}",
         ]
+        # The project's .msb/ again, read-only, over the read-write mount (in
+        # this order: spike 15). It is the policy the host reads at the next
+        # rebuild. A tripwire, not the control: root in the guest can umount
+        # it (spike 15 again), and the policy pin is what actually stops an edit
+        # from inside the sandbox from being applied. This only makes the edit
+        # fail at once, with EROFS, instead of waiting for the operator.
+        if os.path.isdir(os.path.join(self.project, ".msb")):
+            flags += ["--mount-dir", f"{self.project}/.msb:{self.guest_project}/.msb:ro"]
+        return self._mounts_after_project(uid, gid, flags)
 
+    def _mounts_after_project(self, uid, gid, flags):
+        """Every mount but the project's own, appended to `flags`."""
         for src, dest, mode in self.extra_mounts:
             if not os.path.isdir(src):
                 die(f"{self.name}: extra folder {tilde(src)} does not exist — "
@@ -780,9 +1040,18 @@ class Sandbox:
     # ----------------------------------------------------------- all together
 
     def create_flags(self):
-        flags = ["--conf", self.conf_path]
-        # After --conf, which it overrides: a project's committed dev.yaml says
-        # `workdir: /work`, and a sandbox mounted elsewhere must not start there.
+        # The project's dev.yaml is NEVER passed to msb. msb's --conf file is
+        # code, not data: it can mount host paths (relative to the file),
+        # copy host files into the guest, and fill `${VAR}` from msb's own
+        # environment, which is where the bound secrets are. The project folder
+        # is writable from inside the sandbox, so passing it would let the guest
+        # rewrite what the next rebuild executes. msbctl reads its `image:` and
+        # nothing else (see conf_problems()); everything else is a flag below.
+        # `msb_conf` is the operator's own file, from the registry only.
+        conf = self.msb_conf
+        flags = ["--conf", conf] if conf else []
+        # Where the project is mounted, which a `workdir:` in an msb_conf must
+        # not override: flags win over --conf.
         flags += ["--workdir", self.guest_project]
         flags += self.mount_flags()
         for key, value in self.env_vars().items():
@@ -822,7 +1091,7 @@ class Sandbox:
         # them, in either mode. msb binds the host side on 127.0.0.1 unless the
         # spec names an address, and dials the guest's own address rather than
         # its loopback — so the server inside must listen on 0.0.0.0. Whether
-        # these merge with a `ports:` list in the project's dev.yaml or replace
+        # these merge with a `ports:` list in an operator's msb_conf or replace
         # it is unverified; set them in one place.
         for spec, *_ in self.published_ports:
             flags += ["--port", spec]
@@ -834,10 +1103,9 @@ class Sandbox:
         # too, even though nothing is being enforced.
         flags += ["--tls-intercept"]
         flags += ["--root-disk", str(self.root_disk)]
-        # Explicit flags, not just dev.yaml: that file is written once by the
-        # wizard, so a cpus/memory override in the registry entry or sandbox.toml
-        # would otherwise be resolved and shown but never reach msb. Flags win
-        # over --conf (verified on 0.7.6).
+        # From sandbox.toml / the registry / [defaults], never from dev.yaml,
+        # which is not passed to msb. Flags also win over an msb_conf
+        # (verified on 0.7.6).
         flags += ["--cpus", str(self.cpus), "--memory", str(self.memory)]
         return flags
 
@@ -907,10 +1175,11 @@ class Sandbox:
         it — these are defaults to extend. Egress rules are the opposite case:
         a project may legitimately need a narrower set, so it overrides there.
 
-        Do NOT also set a key here that the project's --conf dev.yaml sets in
-        its own `env:` block. Which of the two wins is unverified, and a
-        telemetry switch whose value depends on an unverified precedence is
-        worse than one in a single place.
+        A project's dev.yaml cannot set any: it is not passed to msb, and
+        create refuses one with an `env:` block (conf_problems()). Do not set
+        a key both here and in an operator's msb_conf either: which of the two
+        wins is unverified, and a telemetry switch whose value depends on an
+        unverified precedence is worse than one in a single place.
         """
         merged = {}
         # Under every [env], so a project can still override an agent's default.
@@ -1128,6 +1397,12 @@ class _AgentFilter(socketserver.BaseRequestHandler):
                 if not permitted:
                     _write_msg(self.request, bytes([AGENT_FAILURE]))
                     continue
+                if not self.server.upstream():
+                    # No host agent (see ensure_agent_filter): an empty list, so
+                    # ssh in the guest says "no identities" rather than hanging.
+                    _write_msg(self.request, bytes([AGENT_IDENTITIES_ANSWER]) + struct.pack(">I", 0)
+                               if kind == AGENTC_REQUEST_IDENTITIES else bytes([AGENT_FAILURE]))
+                    continue
                 if upstream is None:
                     upstream = socket.socket(socket.AF_UNIX)
                     upstream.connect(self.server.upstream())
@@ -1209,7 +1484,12 @@ def ensure_agent_filter(box):
     every start."""
     upstream = os.environ.get("SSH_AUTH_SOCK", "")
     if not upstream or not os.path.exists(upstream):
-        die("no usable SSH_AUTH_SOCK — start an agent and ssh-add a key")
+        if box.ssh_keys != []:
+            die("no usable SSH_AUTH_SOCK — start an agent and ssh-add a key")
+        # A sandbox allowed no keys needs no agent: the filter still answers
+        # (with nothing), so the --vsock baked in at create has a listener. This
+        # is the usual case on a remote host, where nobody's agent is forwarded.
+        upstream = ""
     # Every start path comes through here, so this is where a selected key that
     # is not loaded yet gets added, before the sandbox can ask for it.
     ensure_keys_loaded(box)
@@ -1795,6 +2075,8 @@ def ensure_git_checkstat(box):
     harmless. Only a top-level `.git` is touched: a linked worktree's `.git`
     file names a host path that may not exist in the guest.
     """
+    if box.is_repo:
+        return      # the clone is on a disk volume; no host editor watches it
     script = ('[ -e .git ] || exit 0; '
               'git config --local --get core.checkStat >/dev/null '
               '|| git config --local core.checkStat minimal')
@@ -1886,6 +2168,14 @@ def warn_missing_prereqs(box):
                                               "platform.claude.com"]))
     needs.append(("gh" + (" + gitleaks" if boot.get("gitleaks") else "") + " downloads",
                   ["github.com", "release-assets.githubusercontent.com"]))
+    if box.is_repo:
+        needs.append((f"the clone of {box.repo}", ["github.com"]))
+        # The clone fails inside the bootstrap, one step removed from the cause,
+        # so say it here, before anything is created.
+        if box.repo_meta.get("private") and not read_env_file(
+                os.path.join(SECRETS_DIR, f"{box.name}.env")).get("GH_TOKEN"):
+            warn(f"{box.repo} is private and {box.name} has no GitHub token, so the clone "
+                 f"will fail — `msbctl secret set {box.name} GH_TOKEN` first")
 
     rules = box.net_rules()
     missing = []
@@ -1902,14 +2192,464 @@ def warn_missing_prereqs(box):
         note(f"     {label:<24} {', '.join(absent)}")
     note("")
     note("   Add the rule group that covers them to `rule_groups` in")
-    note(f"   {tilde(os.path.join(box.project, '.msb', 'sandbox.toml'))} — "
+    note(f"   {box.repo + ':.msb/sandbox.toml' if box.is_repo else tilde(project_path(box))} — "
          "`npm` and `claude` are")
     note("   the usual two — or set the feature false under [bootstrap].")
     note("   Continuing; the bootstrap reports what actually failed.")
 
 
+# ---------------------------------------------------------- the policy pin
+#
+# The project's .msb/sandbox.toml decides what may leave the sandbox, which host
+# a stored value is substituted toward, and what the sandbox takes from the
+# host. It is also committed, and writable from inside the sandbox through the
+# project mount. So what it says is not applied just because it says it: the
+# values in PINNED_KEYS are recorded (a digest in the registry entry, the values
+# themselves under STATE_DIR) when the operator approves them, and a create or
+# rebuild that finds them changed shows the difference and asks. Without a
+# terminal, or under `msbctl host serve`, it refuses: a prompt is something code
+# on the other end of a pty can answer as easily as a person.
+#
+# Only the PROJECT layer is pinned. The registry entry and config.toml are the
+# operator's own files, outside every sandbox, and are not re-approved.
+
+PINNED_KEYS = (
+    "rule_groups",          # which egress groups apply
+    "extra_rules",          # and the project's own rules
+    "allow_private_dns",    # whether names may resolve to LAN addresses
+    "secret_binds",         # which host a stored value is substituted toward
+    "secrets",              # whether GH_TOKEN is bound at all
+    # Resources resolve through _pick too, so a commit saying memory = "256G"
+    # or a 4T root disk lands on the next rebuild — on a host that stands alone,
+    # with nobody watching it.
+    "cpus", "memory", "root_disk", "containers_disk", "caches", "workspace_disk",
+)
+# NOT pinned, on purpose: `image`, [bootstrap] and [env] act only inside the
+# guest, which is what the sandbox is for, and `conf` only names the file the
+# image is read from (and must stay in the project).
+
+POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
+
+
+def restricted():
+    """True under `msbctl host serve`: nothing that approves a policy may ask."""
+    return os.environ.get("MSB_RESTRICTED") == "1"
+
+
+def project_policy(box):
+    """The project-layer values the pin covers. For a repo sandbox, also the
+    commit they were read at, so a diff always names the commit being approved."""
+    policy = {k: box.project_cfg[k] for k in PINNED_KEYS if k in box.project_cfg}
+    if box.is_repo:
+        policy["_commit"] = box.repo_meta.get("sha", "")
+    return policy
+
+
+def policy_digest(policy):
+    blob = json.dumps(policy, sort_keys=True, separators=(",", ":")).encode()
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+def approved_path(name):
+    return os.path.join(POLICY_APPROVED_DIR, f"{name}.json")
+
+
+def policy_pinned(box):
+    """Whether the project's current values are the approved ones."""
+    return box.entry.get("policy_pin") == policy_digest(project_policy(box))
+
+
+def _policy_value(value):
+    return json.dumps(value) if not isinstance(value, str) else f'"{value}"'
+
+
+def policy_diff(old, new):
+    """Lines describing what changed from `old` to `new` (None: never recorded)."""
+    if old is None:
+        lines = ["first time this sandbox's policy is recorded:"]
+        lines += [f"  {k} = {_policy_value(v)}" for k, v in sorted(new.items())] or ["  (nothing)"]
+        return lines
+    lines = []
+    for key in sorted(set(old) | set(new)):
+        before, after = old.get(key), new.get(key)
+        if before == after:
+            continue
+        if key not in old:
+            lines.append(f"+ {key} = {_policy_value(after)}")
+        elif key not in new:
+            lines.append(f"- {key} = {_policy_value(before)}")
+        elif isinstance(before, list) and isinstance(after, list):
+            lines.append(f"  {key}:")
+            lines += [f"+   {item}" for item in after if item not in before]
+            lines += [f"-   {item}" for item in before if item not in after]
+        elif isinstance(before, dict) and isinstance(after, dict):
+            lines.append(f"  [{key}]")
+            for sub in sorted(set(before) | set(after)):
+                if before.get(sub) != after.get(sub):
+                    if sub in before:
+                        lines.append(f"-   {sub} = {_policy_value(before[sub])}")
+                    if sub in after:
+                        lines.append(f"+   {sub} = {_policy_value(after[sub])}")
+        else:
+            lines.append(f"  {key}: {_policy_value(before)} -> {_policy_value(after)}")
+    return lines
+
+
+def approved_policy(name):
+    """The approved values, or None if none were ever recorded for `name`."""
+    path = approved_path(name)
+    if not os.path.isfile(path):
+        return None
+    return read_json(path)
+
+
+def approve_policy(box, policy=None):
+    """Record `policy` (default: the project's current values) as approved."""
+    policy = project_policy(box) if policy is None else policy
+    os.makedirs(POLICY_APPROVED_DIR, mode=0o700, exist_ok=True)
+    path = approved_path(box.name)
+    fd, tmp = tempfile.mkstemp(dir=POLICY_APPROVED_DIR)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(policy, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    digest = policy_digest(policy)
+    set_toml_key(registry_path(box), "policy_pin", digest)
+    box.entry["policy_pin"] = digest
+
+
+def ask_approval(box, policy, why, where):
+    """Show how `policy` differs from the approved one and ask. Dies where
+    nobody may be asked (no terminal, or `host serve`), and when declined."""
+    say(f"{box.name}: the project's policy changed since it was approved")
+    note(f"from {where}, before {why}:")
+    for line in policy_diff(approved_policy(box.name), policy):
+        note(f"  {line}")
+    if restricted() or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        die(f"{box.name}: policy not approved — run `msbctl policy {box.name} approve` on the "
+            "host, or with your admin key")
+    if not confirm(f"approve this policy for {box.name}?"):
+        die("not approved, nothing changed")
+
+
+def check_policy(box, why):
+    """Return if the project's pinned values are the approved ones; otherwise show
+    what changed and ask, or die where nobody may be asked. `why` names what
+    wants to apply them ("create", "allow")."""
+    if policy_pinned(box):
+        return
+    current = project_policy(box)
+    if approved_policy(box.name) is None and not current and not box.entry.get("policy_pin"):
+        approve_policy(box)        # nothing to approve: the project sets none of it
+        return
+    ask_approval(box, current, why, tilde(project_path(box)))
+    approve_policy(box, current)
+    note("approved")
+
+
+def cmd_policy(args, config):
+    """policy <name> [show|approve|update [REF]] — the project-layer values the pin covers."""
+    box = Sandbox(args.name, config)
+    if args.action in ("approve", "update") and restricted():
+        die(f"`policy {args.action}` is refused here — run it on the host, or with your admin key")
+    if args.ref and args.action != "update":
+        die("a ref is only for `policy <name> update [REF]`")
+    if args.action == "update":
+        policy_update(box, args.ref)
+        return
+    if args.action == "approve":
+        if policy_pinned(box):
+            note(f"{box.name}: the project's policy is the approved one")
+            return
+        check_policy(box, "approving")
+        return
+    say(f"{box.name}  policy  [{'approved' if policy_pinned(box) else 'NOT APPROVED'}]")
+    if box.is_repo:
+        meta = box.repo_meta
+        note(f"from {box.repo} at {meta.get('sha', '?')[:12]} "
+             f"({meta.get('branch') or meta.get('ref') or '?'}), fetched {meta.get('fetched_at', '?')}")
+    else:
+        note(f"from {tilde(project_path(box))}")
+    current = project_policy(box)
+    for key in PINNED_KEYS:
+        if key in current:
+            note(f"  {key} = {_policy_value(current[key])}")
+    if not any(k in current for k in PINNED_KEYS):
+        note("  (the project sets none of the pinned keys)")
+    if not policy_pinned(box):
+        say("Changes since the last approval")
+        for line in policy_diff(approved_policy(box.name), current):
+            note(f"  {line}")
+        note(f"`msbctl policy {box.name} approve` to accept them")
+
+
+# ------------------------------------------------- sandboxes cloned from a repo
+#
+# A repo sandbox has no host folder. Its code is a clone, made by the bootstrap
+# inside the sandbox, on a disk volume that outlives it. Its project layer is
+# the repo's own .msb/sandbox.toml and .msb/dev.yaml, fetched from the GitHub
+# contents API AT A RECORDED COMMIT into policy_dir(name), which plays the part
+# a project folder plays for a folder sandbox and is never mounted. `rebuild`
+# recreates at that commit and fetches nothing, so an unattended rebuild is
+# possible and the pin means something; `msbctl policy <name> update` moves it,
+# showing what the newer commit changes first.
+
+POLICY_MAX_BYTES = 256 * 1024
+REPO_NAME = re.compile(r"[A-Za-z0-9-]+/[A-Za-z0-9._-]+")
+
+
+def policy_dir(name):
+    return os.path.join(STATE_DIR, "policy", name)
+
+
+def github_api(path, token=None):
+    """(status, data) for a GitHub REST call. (404, None) for a 404, and
+    (None, None) for any network or decode failure. Neither the token nor the
+    response body ever goes into an error: http_json's single None for every
+    failure cannot tell "no such file" from "GitHub is down", and a policy fetch
+    must."""
+    req = urllib.request.Request("https://api.github.com" + path, headers={
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "msbctl"})
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310  an https:// constant
+            return resp.status, json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except (urllib.error.URLError, json.JSONDecodeError, TimeoutError, OSError):
+        return None, None
+
+
+def repo_token(name):
+    """The GitHub token a policy fetch for `name` uses, or None (a public repo
+    needs none). The sandbox's own first, else the machine's global one —
+    except under `host serve`, where `add --repo` is allowed: a 200 against a
+    404 for a repo named by the caller would tell it which private repos the
+    operator's token can read."""
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env")).get("GH_TOKEN")
+    if own or restricted():
+        return own or None
+    return read_env_file(GLOBAL_ENV).get("GH_TOKEN") or None
+
+
+def _api_die(repo, ref, status):
+    hint = (" — a private repo needs a GitHub token with Contents: read on it "
+            "(`msbctl secret set <name> GH_TOKEN`)" if status == 404 else "")
+    die(f"cannot read {repo}@{ref or '(default branch)'}: "
+        f"{status if status is not None else 'GitHub unreachable'}{hint}")
+
+
+def resolve_repo_ref(repo, ref, token):
+    """(sha, branch, private) for `ref` (empty: the default branch)."""
+    status, info = github_api(f"/repos/{repo}", token)
+    if status != 200 or not isinstance(info, dict):
+        _api_die(repo, ref, status)
+    branch = ""
+    target = ref or info.get("default_branch", "")
+    if not ref:
+        branch = target
+    elif not re.fullmatch(r"[0-9a-f]{40}", ref):
+        bstatus, _ = github_api(f"/repos/{repo}/branches/{urllib.parse.quote(ref, safe='')}", token)
+        branch = ref if bstatus == 200 else ""
+    status, commit = github_api(f"/repos/{repo}/commits/{urllib.parse.quote(target, safe='')}", token)
+    if status != 200 or not isinstance(commit, dict) or not commit.get("sha"):
+        _api_die(repo, ref, status)
+    return commit["sha"], branch, bool(info.get("private"))
+
+
+def _fetch_file(repo, path, sha, token):
+    """A file's bytes at `sha`, or None if it does not exist there. Any other
+    failure dies: only a 404 means "no file", never an error, or a repo whose
+    policy could not be read would silently get the defaults."""
+    status, data = github_api(f"/repos/{repo}/contents/{path}?ref={sha}", token)
+    if status == 404:
+        return None
+    if status != 200 or not isinstance(data, dict):
+        _api_die(repo, sha[:12], status)
+    if data.get("type") != "file" or data.get("size", 0) > POLICY_MAX_BYTES:
+        die(f"{repo}: {path} at {sha[:12]} is not a file under {POLICY_MAX_BYTES // 1024} KiB")
+    try:
+        raw = base64.b64decode(data.get("content", ""))
+    except ValueError:
+        die(f"{repo}: {path} at {sha[:12]} did not decode")
+    if len(raw) > POLICY_MAX_BYTES:
+        die(f"{repo}: {path} at {sha[:12]} is over {POLICY_MAX_BYTES // 1024} KiB")
+    return raw
+
+
+def fetch_repo_policy(name, repo, ref, sha=None, token=None):
+    """Fetch .msb/sandbox.toml and .msb/dev.yaml of `repo` at `ref` (or exactly
+    at `sha`) into a new private directory beside policy_dir(name), and return
+    (that directory, meta). install_policy() swaps it in; nothing is replaced
+    here, so a refused or failed fetch changes nothing."""
+    token = token or repo_token(name)
+    if sha:
+        status, info = github_api(f"/repos/{repo}", token)
+        if status != 200 or not isinstance(info, dict):
+            _api_die(repo, sha[:12], status)
+        branch = ref if ref and not re.fullmatch(r"[0-9a-f]{40}", ref) else ""
+        private = bool(info.get("private"))
+        if not ref:
+            branch = info.get("default_branch", "")
+    else:
+        sha, branch, private = resolve_repo_ref(repo, ref, token)
+    files = {}
+    for path in (".msb/sandbox.toml", ".msb/dev.yaml"):
+        files[path] = _fetch_file(repo, path, sha, token)
+    if files[".msb/sandbox.toml"] is not None:
+        try:
+            tomllib.loads(files[".msb/sandbox.toml"].decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+            die(f"{repo}: .msb/sandbox.toml at {sha[:12]} does not parse: {exc}")
+    parent = os.path.dirname(policy_dir(name))
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f".{name}-", dir=parent)
+    os.makedirs(os.path.join(tmp, ".msb"), exist_ok=True)
+    for path, raw in files.items():
+        if raw is not None:
+            with open(os.path.join(tmp, path), "wb") as fh:
+                fh.write(raw)
+    problems = conf_problems(os.path.join(tmp, ".msb", "dev.yaml"))
+    if problems:
+        shutil.rmtree(tmp, ignore_errors=True)
+        die(f"{repo}: .msb/dev.yaml at {sha[:12]} sets what msbctl does not read: "
+            + "; ".join(problems))
+    meta = {"repo": repo, "ref": ref, "branch": branch, "sha": sha, "private": private,
+            "fetched_at": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    write_json(os.path.join(tmp, "meta.json"), meta)
+    return tmp, meta
+
+
+def install_policy(name, tmp):
+    """Swap a directory fetch_repo_policy() wrote in as policy_dir(name)."""
+    dest = policy_dir(name)
+    old = None
+    if os.path.exists(dest):
+        old = dest + ".old"
+        shutil.rmtree(old, ignore_errors=True)
+        os.replace(dest, old)
+    os.replace(tmp, dest)
+    if old:
+        shutil.rmtree(old, ignore_errors=True)
+
+
+def policy_of_dir(path):
+    """project_policy() for a fetched directory that is not installed yet."""
+    cfg = read_toml(os.path.join(path, ".msb", "sandbox.toml"))
+    policy = {k: cfg[k] for k in PINNED_KEYS if k in cfg}
+    policy["_commit"] = read_json(os.path.join(path, "meta.json")).get("sha", "")
+    return policy
+
+
+def ensure_repo_policy(box):
+    """Before a create: a repo sandbox whose policy directory is missing (a new
+    machine, a wiped state directory) fetches it — at the approved commit if one
+    was ever approved, else the tip. Only then; a rebuild never refetches."""
+    if not box.is_repo or os.path.isfile(os.path.join(box.project, "meta.json")):
+        return
+    sha = (approved_policy(box.name) or {}).get("_commit") or None
+    note(f"fetching the policy of {box.repo}" + (f" at {sha[:12]}" if sha else ""))
+    tmp, _ = fetch_repo_policy(box.name, box.repo, box.entry.get("ref", ""), sha=sha)
+    install_policy(box.name, tmp)
+    box.reload()
+
+
+def policy_update(box, ref):
+    """Move a repo sandbox's policy to the tip of its ref (or of REF, which
+    also becomes its ref), showing what that changes and asking first."""
+    if not box.is_repo:
+        die(f"{box.name} is a folder sandbox; its policy is {tilde(project_path(box))} — "
+            f"`msbctl policy {box.name} approve` after changing it")
+    ref = box.entry.get("ref", "") if ref is None else ref
+    tmp, meta = fetch_repo_policy(box.name, box.repo, ref)
+    try:
+        new = policy_of_dir(tmp)
+        if policy_digest(new) == box.entry.get("policy_pin"):
+            note(f"{box.name}: {box.repo} at {meta['sha'][:12]} has the approved policy already")
+            install_policy(box.name, tmp)
+            tmp = None
+        else:
+            ask_approval(box, new, f"moving to {meta['sha'][:12]}", f"{box.repo}")
+            install_policy(box.name, tmp)
+            tmp = None
+            approve_policy(box, new)
+            note("approved")
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if ref != box.entry.get("ref", ""):
+        set_toml_key(registry_path(box), "ref", ref)
+    note(f"a `msbctl rebuild {box.name}` applies it. The clone inside is not touched: it is a")
+    note("git checkout, moved with git (`git fetch && git checkout ...` in the sandbox).")
+
+
+def warn_local_groups_in_project(box):
+    """A group only this machine defines, listed in the project's own file: it
+    works here and breaks every other clone. Said, not refused — it is not a
+    hole, just in the wrong file, and `msbctl edit` → Features moves it."""
+    if box.is_repo:
+        return
+    stray = [g for g in box.project_cfg.get("rule_groups", []) if g in machine_only_groups()]
+    if stray:
+        warn(f"{', '.join(stray)} in {tilde(project_path(box))}: defined only in this machine's "
+             f"config.toml, so every other clone fails with \"unknown rule group\" — move "
+             f"{'it' if len(stray) == 1 else 'them'} to extra_rule_groups in the registry entry "
+             f"(`msbctl edit {box.name}` → Features & agents does it)")
+
+
+def refuse_before_create(box):
+    """Everything that stops a create, checked BEFORE anything is removed: a
+    rebuild or rename that tore the VM down first and then refused would leave
+    nothing where a running sandbox was."""
+    ensure_repo_policy(box)
+    refuse_conf_problems(box)
+    refuse_reserved_bindings(box)
+    check_policy(box, "create")
+
+
+def is_reserved_var(var):
+    """Variables with a FIXED binding: GH_TOKEN (github.com, api.github.com) and
+    every Claude token (Anthropic's hosts). No `secret_binds` entry, in any
+    layer, may name one: a second binding `GH_TOKEN@attacker.example` would
+    send the sandbox's real token wherever the binding says."""
+    return (var == "GH_TOKEN" or var == CLAUDE_TOKEN_VAR
+            or var.startswith(CLAUDE_TOKEN_VAR + "_"))
+
+
+def reserved_binding_problems(box):
+    """The `secret_binds` entries that name a reserved variable."""
+    return [spec for spec in box.secret_binds if is_reserved_var(secret_var(spec))]
+
+
+def refuse_reserved_bindings(box):
+    bad = reserved_binding_problems(box)
+    if bad:
+        die(f"{box.name}: {', '.join(repr(b) for b in bad)} in "
+            f"{tilde(box._origin('secret_binds'))}: GH_TOKEN and the Claude tokens have fixed "
+            "bindings and cannot be bound again — remove the line")
+
+
+def refuse_conf_problems(box):
+    """Die if the project's dev.yaml says more than msbctl reads. Only create
+    and rebuild check: an existing sandbox keeps running and starting, since
+    nothing in the file reaches msb either way."""
+    problems = conf_problems(box.conf_path)
+    if not problems:
+        return
+    lines = [f"{tilde(box.conf_path)} sets what msbctl does not read, and is never passed to msb:"]
+    lines += [f"  {p}" for p in problems]
+    lines += ["Move `env:` to [env] in .msb/sandbox.toml, and cpus/memory there too.",
+              "Anything else msb's config file can do goes in a file of your own, named by",
+              f"`msb_conf` in {tilde(registry_path(box))} (registry only, never a repo)."]
+    die("\n".join(lines))
+
+
 def do_create(box):
     say(f"Creating {box.name}")
+    refuse_before_create(box)
+    warn_local_groups_in_project(box)
     warn_missing_prereqs(box)
     ensure_agent_filter(box)
     secret_flags, env = box.secret_env()
@@ -1986,6 +2726,11 @@ def bootstrap_payload(box):
         "MSB_PROJECT_SCRIPT": boot.get("script", ""),
         "MSB_CONTAINERS_STORAGE": boot.get("containers_storage", ""),
         "MSB_CACHE_LINKS": " ".join(f"{src}:{dest}" for src, dest in box.cache_links),
+        # A repo sandbox's code: cloned into the workspace volume on its first
+        # create, left alone after (a rebuild finds .git there).
+        "MSB_CLONE_URL": f"https://github.com/{box.repo}.git" if box.is_repo else "",
+        "MSB_CLONE_REF": (box.entry.get("ref") or box.repo_meta.get("branch", ""))
+                         if box.is_repo else "",
     }
     exports = "\n".join(f"export {k}={shq(v)}" for k, v in env.items())
     return (f"cat >/tmp/bootstrap.sh <<'MSB_BOOTSTRAP_EOF'\n{body}\n"
@@ -2023,6 +2768,7 @@ def cmd_rebuild(args, config):
     note("`msbctl resize`). Packages installed")
     note("by hand are lost; anything in bootstrap.sh comes back. Package caches,")
     note("container images and the Claude state are kept.")
+    refuse_before_create(box)
     run(["msb", "stop", box.name], check=False, quiet=True)
     run(["msb", "rm", box.name], check=False, quiet=True)
     do_create(box)
@@ -2040,12 +2786,20 @@ def cmd_purge(args, config):
     note(f"  its Claude state     {tilde(box.state)}")
     owned = box.owned_volumes()
     if owned:
-        note(f"  its disk volumes     {', '.join(owned)}  (package caches, container images)")
+        note(f"  its disk volumes     {', '.join(owned)}  (package caches, container images"
+             + (", the clone" if box.is_repo else "") + ")")
+    if box.is_repo and box.workspace_volume in owned:
+        warn(f"{box.workspace_volume} holds the clone: work in it that was not pushed is lost")
     if os.path.isfile(secret):
         note(f"  its token            {tilde(secret)}  (revoke it on GitHub too)")
+    if box.is_repo:
+        note(f"  its fetched policy   {tilde(box.project)}")
     note(f"  its registration     {tilde(entry)}")
     note("")
-    note(f"The project itself is NOT touched: {tilde(box.project)}")
+    if box.is_repo:
+        note(f"The repository on GitHub is not touched: {box.repo}")
+    else:
+        note(f"The project itself is NOT touched: {tilde(box.project)}")
     if not args.yes and not confirm(f"purge {box.name}?"):
         return
 
@@ -2053,8 +2807,10 @@ def cmd_purge(args, config):
     run(["msb", "rm", box.name], check=False, quiet=True)
     stop_agent_filter(box)
     shutil.rmtree(box.state, ignore_errors=True)
+    if box.is_repo:
+        shutil.rmtree(box.project, ignore_errors=True)
     remove_sandbox_volumes(box)
-    for path in (secret, entry):
+    for path in (secret, entry, approved_path(box.name)):
         try:
             os.unlink(path)
         except FileNotFoundError:
@@ -2116,7 +2872,9 @@ def rename_sandbox(box, new):
     old = box.name
     moves = [(os.path.join(SECRETS_DIR, f"{old}.env"), os.path.join(SECRETS_DIR, f"{new}.env")),
              (box.state, os.path.join(STATE_DIR, "claude", new)),
-             (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log"))]
+             (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log")),
+             (approved_path(old), approved_path(new)),
+             (policy_dir(old), policy_dir(new))]
     # Checked before anything is destroyed, so a refusal leaves it all as it was.
     clash = [dst for src, dst in moves if os.path.exists(src) and os.path.exists(dst)]
     if clash:
@@ -2164,6 +2922,7 @@ def cmd_rename(args, config):
         die(problem)
     say(f"Renaming {box.name} to {args.new}")
     if state_of(box.name) != "absent":
+        refuse_before_create(box)
         explain_rename()
         if not args.yes and not confirm(f"rename {box.name} to {args.new}?"):
             return
@@ -2217,8 +2976,15 @@ def move_project(box, raw, config):
     return True
 
 
+def refuse_repo_sandbox(box, what):
+    if box.is_repo:
+        die(f"{box.name} has no folder on this machine — it is a clone of {box.repo} inside "
+            f"the sandbox, so there is nothing to {what}")
+
+
 def cmd_move(args, config):
     box = Sandbox(args.name, config)
+    refuse_repo_sandbox(box, "move")
     if not move_project(box, args.dir, config):
         return
     if state_of(box.name) == "absent":
@@ -2312,6 +3078,7 @@ def cmd_reclaim(args, config):
 
 def cmd_code(args, config):
     box = Sandbox(args.name, config)
+    refuse_repo_sandbox(box, "open (`msbctl shell` gets you into the clone)")
     editor = os.environ.get("MSB_EDITOR", "codium")
     if not shutil.which(editor):
         die(f"{editor} is not on PATH — set MSB_EDITOR to the one you use")
@@ -2351,7 +3118,7 @@ def write_json(path, data):
 
 
 def print_one(box, table):
-    note(f"{box.name}  {state_of(box.name, table)}  {tilde(box.project)}")
+    note(f"{box.name}  {state_of(box.name, table)}  {box.location}")
 
 
 def _flatten(table, prefix=""):
@@ -2628,12 +3395,18 @@ def cmd_allow(args, config):
 
     # The registry entry REPLACES the project's list when it sets extra_rules
     # (see Sandbox._pick), so write wherever the list effectively lives.
+    # A repo sandbox has no checkout to edit, so its own list is the
+    # registry's, which ADDS to the repo's rather than replacing them.
     sandbox_toml = os.path.join(box.project, ".msb", "sandbox.toml")
-    if "extra_rules" in box.entry or not os.path.isfile(sandbox_toml):
+    if box.is_repo or "extra_rules" in box.entry or not os.path.isfile(sandbox_toml):
         target = os.path.join(REGISTRY_DIR, f"{box.name}.toml")
     else:
         target = sandbox_toml
+    # Before writing: a change someone else made to the project's policy is
+    # shown and asked about on its own, not approved along with this one.
+    check_policy(box, "adding rules")
     added = append_toml_list(target, "extra_rules", fresh, after_key="rule_groups")
+    approve_policy(Sandbox(box.name, config))
     for rule in added:
         note(f"allowed: {rule}")
     note(f"written to {tilde(target)}")
@@ -3241,6 +4014,10 @@ def choose_secret(config, taken=()):
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var):
         warn("not a valid variable name")
         return None
+    if is_reserved_var(var):
+        warn(f"{var} has a fixed binding and cannot be bound again "
+             "(the GitHub and Claude tokens have their own settings)")
+        return None
     hosts = ask("hosts it may be sent to (comma-separated, e.g. api.example.com)").replace(" ", "")
     if not hosts:
         warn("a secret needs at least one host")
@@ -3287,13 +4064,125 @@ def pick_secrets(config, taken=()):
     return out
 
 
+SECRET_MAX_BYTES = 8 * 1024
+
+
+def read_secret_input(prompt, from_stdin):
+    """A secret value from stdin (one trailing newline dropped) or a hidden
+    prompt. Dies on an empty value, whitespace inside one, or one over 8 KiB,
+    and never says what it read."""
+    if from_stdin:
+        value = sys.stdin.read()
+        value = value[:-1] if value.endswith("\n") else value
+        value = value[:-1] if value.endswith("\r") else value
+    else:
+        value = read_secret_hidden(prompt)
+    if not value:
+        die("no value given — nothing was stored")
+    if any(c.isspace() for c in value):
+        die("the value has whitespace in it — nothing was stored")
+    if len(value.encode()) > SECRET_MAX_BYTES:
+        die(f"the value is over {SECRET_MAX_BYTES // 1024} KiB — nothing was stored")
+    return value
+
+
+def msb_bound_secrets(name):
+    """The variables msb has a binding for in this sandbox, or None if it
+    cannot say. A binding is made at create time, and only for a variable that
+    had a value then (secret_env() skips the rest), so a value stored later
+    may have nothing in msb to substitute it."""
+    proc = subprocess.run(["msb", "inspect", name, "--format", "json"],
+                          capture_output=True, text=True)
+    try:
+        network = json.loads(proc.stdout)["config"]["network"]
+        return {item["env_var"] for item in (network.get("secrets") or {}).get("secrets", [])}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def bind_secret_live(box, config, spec, restart):
+    """After a value for `spec` was stored: make the existing sandbox use it.
+    Already bound, a restart is all it takes (msb reads the value at start);
+    not bound yet, `msb modify --secret` adds the binding, applied at the next
+    start or, with `restart`, now."""
+    state = state_of(box.name)
+    if state == "absent":
+        note("not created yet, so it is bound at first start")
+        return
+    box = Sandbox(box.name, config)
+    _, env = box.secret_env()
+    bound = msb_bound_secrets(box.name)
+    if bound is not None and secret_var(spec) in bound:
+        if restart and state == "running":
+            run(["msb", "stop", box.name], check=False, quiet=True)
+            ensure_running(box)
+            note(f"{box.name} restarted with the new value")
+        else:
+            note(f"used from the next start of {box.name}"
+                 + ("" if state != "running" else f" (`--restart`, or `msbctl stop {box.name}` and start)"))
+        return
+    if ":" in spec.split("@", 1)[0]:
+        note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
+        return
+    argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec)]
+    if state == "running":
+        argv.append("--restart" if restart else "--next-start")
+    run(argv, env=env)
+    note(f"bound; {'applied now' if restart and state == 'running' else 'used from the next start'}")
+
+
+def secret_set(box, config, args):
+    """secret set <name> VAR [--stdin] [--restart]: store a value for a variable
+    this sandbox ALREADY binds (GH_TOKEN, or one of its secret_binds). Storing
+    a value is not a policy change; binding a new variable, or the same one to
+    another host, is `secret add`, which is."""
+    var = args.var or die("secret set needs the variable: `msbctl secret set <name> VAR`")
+    specs = [x for x in box.secret_binds if secret_var(x) == var and not is_reserved_var(var)]
+    if var != "GH_TOKEN" and not specs:
+        if is_reserved_var(var):
+            die(f"{var} is not stored per sandbox — a Claude token is `msbctl setup --claude-token NAME`")
+        die(f"{box.name} does not bind {var} (`msbctl secret ls {box.name}`); binding a new "
+            "variable is `msbctl secret add`")
+    if var != "GH_TOKEN":
+        # The binding says which host the value goes to, and it comes from the
+        # project: an edit nobody approved must not be bound live by this.
+        check_policy(box, f"binding {var}")
+    # A folder sandbox that does not bind GitHub yet: turning that on is
+    # `[secrets] github = true` in the project, a pinned key. Checked before
+    # anything is read or stored.
+    github_off = var == "GH_TOKEN" and not (
+        box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo)))
+    if github_off and restricted():
+        die(f"{box.name} does not bind GH_TOKEN, and turning that on changes the project's "
+            f"policy — on the host: `msbctl edit {box.name}` → GitHub token")
+    value = read_secret_input(f"the {var} value", args.stdin)
+    path = os.path.join(SECRETS_DIR, f"{box.name}.env")
+    set_env_file_value(path, var, value)
+    note(f"{var} stored in {tilde(path)} (0600)")
+    if var != "GH_TOKEN":
+        bind_secret_live(box, config, specs[0], args.restart)
+        return
+    if github_off:
+        project = require_project_file(box)
+        check_policy(box, "binding GitHub")
+        set_toml_key(project, "github", True, table="secrets")
+        approve_policy(Sandbox(box.name, config))
+    bind_secret_live(box, config, GH_SPEC, args.restart)
+
+
 def cmd_secret(args, config):
-    """secret add|rm|ls <name> — extra credentials for an existing sandbox. New
+    """secret add|rm|ls|set <name> — extra credentials for an existing sandbox. New
     ones are registered with `msb modify`, so no rebuild is needed (a restart is)."""
     box = Sandbox(args.name, config)
+    if (getattr(args, "stdin", False) or getattr(args, "restart", False)) and args.action != "set":
+        die("--stdin and --restart are for `msbctl secret set`")
+    if args.action == "set":
+        secret_set(box, config, args)
+        return
     sandbox_toml = os.path.join(box.project, ".msb", "sandbox.toml")
     target = (os.path.join(REGISTRY_DIR, f"{box.name}.toml")
-              if "secret_binds" in box.entry or not os.path.isfile(sandbox_toml) else sandbox_toml)
+              if box.is_repo or "secret_binds" in box.entry or not os.path.isfile(sandbox_toml)
+              else sandbox_toml)
     if args.action == "ls":
         own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
         for spec in box.secret_binds or ["(none)"]:
@@ -3304,7 +4193,11 @@ def cmd_secret(args, config):
         spec = next((x for x in box.secret_binds if secret_var(x) == args.var), None)
         if not spec:
             die(f"{box.name} has no secret {args.var!r} (`msbctl secret ls {box.name}`)")
+        if box.is_repo and spec not in box.registry_binds:
+            require_project_file(box)       # the repo's own binding: it says where to change it
+        check_policy(box, "removing a secret")
         remove_from_toml_list(target, "secret_binds", spec)
+        approve_policy(Sandbox(box.name, config))
         state = state_of(box.name)
         if state != "absent":
             _, secret_vars = box.secret_env()
@@ -3322,6 +4215,9 @@ def cmd_secret(args, config):
     if not picked:
         return
     spec, preset = picked
+    if is_reserved_var(secret_var(spec)):
+        die(f"{secret_var(spec)} has a fixed binding and cannot be bound again")
+    check_policy(box, "adding a secret")
     if preset:
         note(f"create it at {preset.get('help', '(see the provider)')}")
         if preset.get("usage"):
@@ -3332,6 +4228,7 @@ def cmd_secret(args, config):
         return
     store_secret_value(box.name, secret_var(spec), value)
     append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
+    approve_policy(Sandbox(box.name, config))
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
         return
@@ -3696,6 +4593,21 @@ def _local_groups(config=None):
     return sorted(read_toml(CONFIG_FILE).get("rules", {}))
 
 
+def machine_only_groups():
+    """Groups this machine defines that msb-manager does not ship: a name in
+    your config.toml's [rules] and not in defaults.toml's. Those belong in the
+    registry entry's `extra_rule_groups`, never a project's sandbox.toml. A
+    shipped group you redefined keeps its name everywhere, so it stays portable."""
+    shipped = read_toml(DEFAULTS_FILE).get("rules", {})
+    return {g for g in _local_groups() if g not in shipped}
+
+
+def split_groups(groups):
+    """(portable, machine-only) — the project's list and the registry's."""
+    local = machine_only_groups()
+    return [g for g in groups if g not in local], [g for g in groups if g in local]
+
+
 def _summary_network(config):
     groups = _local_groups()
     return ", ".join(groups) if groups else "none of your own"
@@ -3721,6 +4633,12 @@ def section_network(config, ctx):
             g = choose_one("remove which", groups + ["cancel"], 0)
             if g != "cancel":
                 set_toml_key(CONFIG_FILE, g, None, table="rules")
+                for other in registered():
+                    path = registry_path_for(other)
+                    have = read_toml(path).get("extra_rule_groups", [])
+                    if g in have:
+                        set_toml_key(path, "extra_rule_groups", [x for x in have if x != g] or None)
+                        note(f"  and from {other}'s extra_rule_groups (rebuild it to apply)")
                 for key in ("private_dns_groups", "rule_groups"):
                     cur = list(config.get("defaults", {}).get(key, []))
                     if g in cur:
@@ -3881,7 +4799,24 @@ def cmd_self_update(args, config):
     os.execvp("sh", argv)
 
 
+def store_claude_token(args):
+    """setup --claude-token NAME [--stdin]: no menu, for a host with no one at
+    it — the value arrives over stdin (from a password manager, through ssh)."""
+    name = args.claude_token
+    if not CLAUDE_TOKEN_NAME.fullmatch(name):
+        die(f"{name!r}: a Claude token's name is lowercase letters, digits and _ "
+            f"(`{CLAUDE_TOKEN_MAIN}` is the default one)")
+    value = read_secret_input(f"the Claude token {name!r}", args.stdin)
+    set_env_file_value(GLOBAL_ENV, claude_token_var(name), value)
+    note(f"Claude token {name!r} stored in {tilde(GLOBAL_ENV)} (0600); read at each sandbox's next start")
+
+
 def cmd_setup(args, config):
+    if getattr(args, "claude_token", None):
+        store_claude_token(args)
+        return
+    if getattr(args, "stdin", False):
+        die("--stdin is for `msbctl setup --claude-token NAME --stdin`")
     ensure_local_config()
     welcome = getattr(args, "welcome", False)
     if welcome:
@@ -3951,12 +4886,15 @@ def project_path(box):
 def edit_target(box, name):
     """Where to write setting `name`: the registry entry if it already overrides it
     there (it would win otherwise), else the project's sandbox.toml."""
-    if name in box.entry or not os.path.isfile(project_path(box)):
+    if box.is_repo or name in box.entry or not os.path.isfile(project_path(box)):
         return registry_path(box)
     return project_path(box)
 
 
 def require_project_file(box):
+    if box.is_repo:
+        die(f"this comes from {box.repo}'s .msb/sandbox.toml — change it there, push, then "
+            f"`msbctl policy {box.name} update` and `msbctl rebuild {box.name}`")
     if not os.path.isfile(project_path(box)):
         die(f"{tilde(project_path(box))} does not exist, and these settings live there")
     return project_path(box)
@@ -3993,15 +4931,20 @@ def section_features(box, config, ctx):
     managed = {p for _, _, spec in FEATURES for p in spec.get("packages", [])}
     extras = [p for p in boot_cfg(box).get("packages", []) if p not in managed]
     packages = list(dict.fromkeys(plan["packages"] + extras))
+    # Groups only this machine defines go to its registry entry, and every
+    # other group to wherever the list lives (normally the project). This also
+    # moves one an older msbctl had written into the project's list.
+    portable, local = split_groups(plan["groups"])
     changed = [
-        set_toml_key(edit_target(box, "rule_groups"), "rule_groups", plan["groups"]),
+        set_toml_key(edit_target(box, "rule_groups"), "rule_groups", portable),
+        set_toml_key(registry_path(box), "extra_rule_groups", local or None),
         set_toml_key(project, "packages", packages, table="bootstrap"),
         set_toml_key(project, "bun", plan["bun"], table="bootstrap"),
         set_toml_key(project, "gitleaks", plan["gitleaks"], table="bootstrap"),
         set_toml_key(project, "claude", "claude" in plan["agents"], table="bootstrap"),
     ]
     private = config.get("defaults", {}).get("private_dns_groups", [])
-    if any(g in private for g in plan["groups"]) and not box.allow_private_dns:
+    if any(g in private for g in portable) and not box.allow_private_dns:
         # Such a group does not work without it, and the failure reads as a
         # missing egress rule, so it is set together with the group.
         if set_toml_key(edit_target(box, "allow_private_dns"), "allow_private_dns", True):
@@ -4212,7 +5155,7 @@ GH_SPEC = "GH_TOKEN@github.com,api.github.com"
 
 def _github_state(box):
     own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
-    bound = box.project_cfg.get("secrets", {}).get("github", bool(box.repo))
+    bound = box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo))
     return bool(own.get("GH_TOKEN")), bool(bound)
 
 
@@ -4231,7 +5174,9 @@ def section_github(box, config, ctx):
     """This sandbox's fine-grained PAT, for the GitHub API (PRs, CI reads) — git push
     over SSH does not use it. Set, replace or remove; applied to a running sandbox
     with `msb modify`, no rebuild."""
-    project = require_project_file(box)
+    # A repo sandbox always binds a stored token (see secret_env), so there is
+    # no project switch to flip.
+    project = None if box.is_repo else require_project_file(box)
     say("GitHub token")
     if not box.repo:
         raw = ask("GitHub repo this sandbox works on (owner/name or URL, blank to cancel)")
@@ -4250,23 +5195,15 @@ def section_github(box, config, ctx):
         github_token_help(box.repo)
         if not capture_token(box.name):
             return
-        set_toml_key(project, "github", True, table="secrets")
-        if state == "absent":
-            note("not created yet, so it is bound at first start")
-            return
-        _, env = Sandbox(box.name, config).secret_env()
-        argv = ["msb", "modify", box.name, "--secret", GH_SPEC]
-        if state == "running":
-            # A running guest keeps its current placeholder bindings until restarted.
-            if confirm(f"apply now — this restarts {box.name}?"):
-                argv.append("--restart")
-            else:
-                note("saved; it is bound on the next restart")
-                return
-        run(argv, env=env, check=False)
+        if project:
+            set_toml_key(project, "github", True, table="secrets")
+        # A running guest keeps its current placeholder bindings until restarted.
+        restart = state == "running" and confirm(f"apply now — this restarts {box.name}?")
+        bind_secret_live(box, config, GH_SPEC, restart)
     elif action.startswith("remove"):
         set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), "GH_TOKEN", None)
-        set_toml_key(project, "github", False, table="secrets")
+        if project:
+            set_toml_key(project, "github", False, table="secrets")
         note("removed; git over SSH is unaffected")
         if state != "absent":
             _, env = Sandbox(box.name, config).secret_env()
@@ -4345,18 +5282,22 @@ def section_identity(box, config, ctx):
 
 
 def _summary_place(box):
-    return f"{box.name}, {tilde(box.project)} at {box.guest_project}"
+    return f"{box.name}, {box.location} at {box.guest_project}"
 
 
 def section_place(box, config, ctx):
     say("Name & project folder")
-    note("a bare name resolves as for `msbctl add`; / ~ ./ ../ are taken as written")
-    raw = ask("project folder", tilde(box.project))
-    if resolve_project(raw, config) != box.project and move_project(box, raw, config):
-        ctx["rebuild"].add("project folder")
-        box = Sandbox(box.name, config)
+    if box.is_repo:
+        note(f"a clone of {box.repo}: there is no host folder to move")
+    else:
+        note("a bare name resolves as for `msbctl add`; / ~ ./ ../ are taken as written")
+        raw = ask("project folder", tilde(box.project))
+        if resolve_project(raw, config) != box.project and move_project(box, raw, config):
+            ctx["rebuild"].add("project folder")
+            box = Sandbox(box.name, config)
     current = box.guest_path_setting
-    chosen = pick_guest_path(box.project, current)
+    chosen = (ask("where the clone is in the sandbox (no dots)", current) if box.is_repo
+              else pick_guest_path(box.project, current))
     if chosen != current and set_toml_key(registry_path(box), "guest_path", chosen):
         ctx["rebuild"].add("project path in the sandbox")
         box = Sandbox(box.name, config)
@@ -4367,6 +5308,7 @@ def section_place(box, config, ctx):
     if problem:
         die(problem)
     if state_of(box.name) != "absent":
+        refuse_before_create(box)
         explain_rename()
         if not confirm(f"rename {box.name} to {new} now?"):
             return
@@ -4415,7 +5357,7 @@ def section_files(box, config, ctx):
         if os.path.isfile(project_path(box)):
             files.append(("sandbox.toml     this project, portable", project_path(box)))
         if os.path.isfile(box.conf_path):
-            files.append(("dev.yaml         msb config", box.conf_path))
+            files.append(("dev.yaml         the image", box.conf_path))
         label = choose_one("edit which file", [l for l, _ in files] + ["back"], 0)
         if label == "back":
             return
@@ -4445,6 +5387,33 @@ EDIT_SECTIONS = [
     ("Secrets", section_secrets, _summary_secrets),
     ("Identity & autostart", section_identity, _summary_identity),
 ]
+
+
+# The sections that write a pinned key (PINNED_KEYS). "Secrets" is not here:
+# it goes through cmd_secret, which does the same itself. "Name & folder" is
+# not either: a different folder brings a policy nobody here has looked at,
+# which the next create shows and asks about.
+POLICY_SECTIONS = (section_features, section_resources, section_caches,
+                   section_containers, section_egress, section_github)
+
+
+class approving_edits:
+    """Around an edit section that writes the project's policy: a pending
+    change made by someone else is asked about first, on its own, and what the
+    operator then chooses in the menu is approved as they leave it."""
+
+    def __init__(self, box, config):
+        self.box, self.config = box, config
+
+    def __enter__(self):
+        check_policy(self.box, "editing")
+
+    def __exit__(self, kind, exc, tb):
+        try:
+            approve_policy(Sandbox(self.box.name, self.config))
+        except SystemExit:
+            pass        # the file no longer parses; _recover_broken handles that
+        return False
 
 
 def _recover_broken(name, message):
@@ -4497,9 +5466,13 @@ def cmd_edit(args, config):
             break
         try:
             if choice.startswith("Edit the files"):
-                section_files(box, config, ctx)
+                with approving_edits(box, config):
+                    section_files(box, config, ctx)
             elif choice.startswith("View the CLAUDE.md"):
                 section_claude_md(box, config, ctx)
+            elif EDIT_SECTIONS[default][1] in POLICY_SECTIONS:
+                with approving_edits(box, config):
+                    EDIT_SECTIONS[default][1](box, config, ctx)
             else:
                 EDIT_SECTIONS[default][1](box, config, ctx)
         except SystemExit as exc:               # a section's escape/die must not end the menu
@@ -4596,26 +5569,29 @@ def cmd_config(args, config):
         note(f"  {path:<34} {value}   {DIM}{origin}{RESET}")
 
 
+def print_json(data):
+    """Machine-readable output: one JSON document on stdout, and nothing else."""
+    json.dump(data, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+
+
 def cmd_ls(args, config):
+    if args.json:
+        # Everything a human would read goes to stderr meanwhile, so stdout is
+        # exactly one JSON document whatever a probe or a warning says.
+        with contextlib.redirect_stdout(sys.stderr):
+            data = ls_data(args, config)
+        print_json(data)
+        return
     names = registered()
+    remotes = configured_remotes(config)
+    if remotes:
+        return ls_with_remotes(args, config, names)
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
         return
-    table = msb_table()
-    cache = read_json(VERSIONS_CACHE)
-    if args.refresh:
-        cache = refresh_versions(names, config, cache)
-
-    rows = []
-    for name in names:
-        box = Sandbox(name, config)
-        info = cache.get(name, {})
-        pending = sorted(c for c, v in info.items()
-                         if isinstance(v, dict) and v.get("available")
-                         and v.get("installed")
-                         and v["available"] != v["installed"])
-        rows.append((name, state_of(name, table), tilde(box.project),
-                     ",".join(pending) or "-", "yes" if box.autostart else "no"))
+    rows = [(r["name"], r["state"], r["location"], ",".join(r["updates"]) or "-",
+             "yes" if r["autostart"] else "no") for r in ls_rows(args, config, names)]
 
     if args.porcelain:
         for row in rows:
@@ -4645,6 +5621,73 @@ def cmd_ls(args, config):
     print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)) + RESET)
     for row in rows:
         print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)))
+
+
+def ls_with_remotes(args, config, names):
+    """`ls` across this machine and every remote. A HOST column comes first
+    (`local` for this one); --porcelain and --picker keep their columns and
+    write a remote sandbox as host:name, which every verb understands. This
+    machine's rows are there only if it can run sandboxes itself: a laptop
+    that only drives remotes (any Mac) has no msb at all."""
+    local = ls_rows(args, config, names) if shutil.which("msb") else []
+    rows = [("local", r["name"], r["state"], r["location"],
+             ",".join(r["updates"]) or "-", "yes" if r["autostart"] else "no") for r in local]
+    for host, r, mark in remote_ls_rows(args, config):
+        if r is None:
+            if args.porcelain:
+                print(f"msbctl: {host}: {mark}", file=sys.stderr)
+            else:
+                rows.append((host, "-", mark, "", "", ""))
+            continue
+        state = r.get("state", "?") + (f" ({mark})" if mark else "")
+        rows.append((host, f"{host}:{r.get('name', '?')}" if args.porcelain or args.picker
+                     else r.get("name", "?"), state, r.get("location", ""),
+                     ",".join(r.get("updates", [])) or "-", "yes" if r.get("autostart") else "no"))
+    if args.porcelain:
+        for row in rows:
+            print("\t".join(row[1:]))
+        return
+    if args.picker:
+        # As in cmd_ls: padded here, one tab between the name and the text.
+        # The first field is what every action is given, so a remote row's is
+        # host:name; an unreachable host's line gets one no verb accepts.
+        shown = [(r[0], r[1].split(":")[-1], r[2], r[4], r[3]) for r in rows]
+        widths = [max(len(str(d[i])) for d in shown) for i in range(5)]
+        for row, d in zip(rows, shown, strict=True):
+            key = row[1] if row[1] != "-" else f"{row[0]}:-"
+            print(f"{key}\t" + "  ".join(str(d[i]).ljust(widths[i]) for i in range(5)).rstrip())
+        return
+    header = ("HOST", "NAME", "STATE", "PROJECT", "UPDATES", "AUTOSTART")
+    widths = [max(len(str(r[i])) for r in [header] + rows) for i in range(6)]
+    print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)).rstrip() + RESET)
+    for row in rows:
+        print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)).rstrip())
+
+
+def ls_rows(args, config, names):
+    """One dict per sandbox: what `ls` shows, in every format."""
+    table = msb_table()
+    cache = read_json(VERSIONS_CACHE)
+    if args.refresh:
+        cache = refresh_versions(names, config, cache)
+    rows = []
+    for name in names:
+        box = Sandbox(name, config)
+        info = cache.get(name, {})
+        pending = sorted(c for c, v in info.items()
+                         if isinstance(v, dict) and v.get("available")
+                         and v.get("installed")
+                         and v["available"] != v["installed"])
+        rows.append({"name": name, "state": state_of(name, table), "source": box.source,
+                     "location": box.location, "repo": box.repo,
+                     "ref": box.entry.get("ref", "") if box.is_repo else "",
+                     "autostart": box.autostart, "updates": pending})
+    return rows
+
+
+def ls_data(args, config):
+    """`ls --json`: {"msbctl": version, "sandboxes": [...]}. Never a secret."""
+    return {"msbctl": version_string(), "sandboxes": ls_rows(args, config, registered())}
 
 
 def cmd_entry(args, config):
@@ -4686,16 +5729,65 @@ def version_lines(box, info):
     return lines
 
 
+def show_data(box, table=None):
+    """`show --json`: what one sandbox resolves to. Says whether each secret is
+    STORED, never what it is: no value is ever put in here."""
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
+    shared = read_env_file(GLOBAL_ENV)
+    secrets = []
+    for spec in box.secret_binds:
+        var = secret_var(spec)
+        from_registry = spec in box.registry_binds
+        secrets.append({"var": var, "hosts": spec.rpartition("@")[2].split(","),
+                        "origin": "registry" if from_registry else "project",
+                        "reserved": is_reserved_var(var),
+                        "stored": bool(own.get(var) or (from_registry and shared.get(var)))})
+    data = {
+        "name": box.name, "state": state_of(box.name, table), "source": box.source,
+        "location": box.location, "repo": box.repo,
+        "ref": box.entry.get("ref", "") if box.is_repo else "",
+        "image": box.image_or_none(), "cpus": box.cpus, "memory": str(box.memory),
+        "root_disk": str(box.root_disk), "guest_path": box.guest_project,
+        "egress_mode": box.egress_mode, "rule_groups": box.rule_groups,
+        "extra_rules": box.extra_rules,
+        "ports": [spec for spec, *_ in box.published_ports],
+        "policy_approved": policy_pinned(box),
+        "claude_token": {"name": box.claude_token,
+                         "stored": box.claude_token in claude_tokens(shared)},
+        "github_token_stored": bool(own.get("GH_TOKEN")),
+        "secrets": secrets,
+    }
+    if box.is_repo:
+        data["commit"] = box.repo_meta.get("sha", "")
+    return data
+
+
 def cmd_show(args, config):
+    if args.json:
+        with contextlib.redirect_stdout(sys.stderr):
+            data = show_data(Sandbox(args.name, config))
+        print_json(data)
+        return
     box = Sandbox(args.name, config)
     table = msb_table()
     info = read_json(VERSIONS_CACHE).get(box.name, {})
 
     say(f"{box.name}  [{state_of(box.name, table)}]")
-    note(f"project    {tilde(box.project)}")
+    if box.is_repo:
+        meta = box.repo_meta
+        note(f"source     {box.location}, cloned inside the sandbox ({box.workspace_volume})")
+        note(f"policy     .msb/ at {meta.get('sha', '(not fetched yet)')[:12]}"
+             f"{'' if policy_pinned(box) else '  NOT APPROVED — `msbctl policy ' + box.name + '`'}")
+    else:
+        note(f"project    {tilde(box.project)}")
     note(f"in guest   {box.guest_project}")
-    note(f"repo       {box.repo or '(no GitHub remote)'}")
-    note(f"conf       {box.conf}")
+    if not box.is_repo:
+        note(f"repo       {box.repo or '(no GitHub remote)'}")
+    note(f"conf       {box.conf}  (read for the image only)")
+    for problem in conf_problems(box.conf_path):
+        warn(f"{box.conf} {problem} — ignored by msbctl, and a rebuild will refuse")
+    if box.msb_conf:
+        note(f"msb_conf   {tilde(box.msb_conf)}")
     note(f"image      {box.image}")
     note(f"resources  {box.cpus} cpu, {box.memory} ceiling, {box.root_disk} disk")
     note(f"autostart  {'yes' if box.autostart else 'no'}")
@@ -4736,7 +5828,10 @@ def cmd_show(args, config):
         note(f"{RED}every host is reachable and is being recorded; "
              f"`msbctl observe {box.name}` to read it{RESET}")
         note(f"{DIM}the rules below are kept but NOT enforced{RESET}")
-    note(f"groups     base + {', '.join(box.rule_groups) or '(none)'}")
+    note(f"groups     base + {', '.join(box.rule_groups) or '(none)'}"
+         + (f"  ({', '.join(box.machine_rule_groups)} from this machine only)"
+            if box.machine_rule_groups else ""))
+    warn_local_groups_in_project(box)
     note(f"private DNS answers {'allowed' if box.allow_private_dns or box.observing else 'DROPPED (rebind protection on)'}")
     for rule in box.net_rules():
         note(f"  {rule}")
@@ -5823,7 +6918,17 @@ def resolve_project(raw, config):
     return os.path.realpath(os.path.join(root, raw) if root else raw)
 
 
+REPO_ONLY_FLAGS = ("ref", "new_name", "guest_path", "workspace_disk", "identity", "claude_token",
+                   "autostart", "yes")
+
+
 def cmd_add(args, config):
+    if args.repo:
+        return cmd_add_repo(args, config)
+    given = [f"--{f.replace('new_', '').replace('_', '-')}" for f in REPO_ONLY_FLAGS
+             if getattr(args, f, None)]
+    if given:
+        die(f"{', '.join(given)}: only with --repo (the folder wizard asks for these)")
     config = maybe_welcome(config)
     say("Register a sandbox")
     # Prompted rather than taken from the cwd when not given, because the
@@ -5927,7 +7032,8 @@ def cmd_add(args, config):
     pick_caches(plan)
     mounts = pick_mounts(project if guest_path == "host" else guest_path)
     secrets = pick_secrets(config)
-    chosen = plan["groups"]
+    # This machine's own groups go in the registry entry, not the project.
+    chosen, local_groups = split_groups(plan["groups"])
     packages = plan["packages"]
     containers_disk = plan["containers_disk"]
     root_default = config.get("defaults", {}).get("root_disk", "16G")
@@ -5971,9 +7077,11 @@ def cmd_add(args, config):
                         CLAUDE_TOKEN=claude_token,
                         SSH_KEYS=format_ssh_keys(ssh_keys),
                         MOUNTS=format_list("mounts", mounts, '# mounts = ["~/reference:/mnt/reference:ro"]'),
+                        EXTRA_RULE_GROUPS=format_list("extra_rule_groups", local_groups,
+                                                      '# extra_rule_groups = ["homelab"]'),
                         AUTOSTART="true" if autostart else "false"))
     note(f"wrote {tilde(entry_path)}")
-    for var, host in unreachable_secret_hosts(config, chosen, [sp for sp, _ in secrets]):
+    for var, host in unreachable_secret_hosts(config, chosen + local_groups, [sp for sp, _ in secrets]):
         warn(f"{var} is bound to {host}, but no egress rule allows it — "
              f"`msbctl allow {name} {host}` (then rebuild), or it can never be used")
     for spec, value in secrets:
@@ -5986,7 +7094,15 @@ def cmd_add(args, config):
     os.makedirs(msb_dir, exist_ok=True)
     defaults = config.get("defaults", {})
 
+    # Whether a written file is committable depends on the layout, and saying
+    # "commit this" for a file that is not in any repo is worse than saying
+    # nothing.
+    inside_repo = os.path.isdir(os.path.join(project, ".git"))
     sandbox_toml = os.path.join(msb_dir, "sandbox.toml")
+    # The policy is approved below only if the wizard wrote it from what was
+    # just chosen. One kept from a clone is somebody else's, and the first
+    # create shows it and asks.
+    wrote_policy = not os.path.exists(sandbox_toml)
     if os.path.exists(sandbox_toml):
         note(f"kept existing {tilde(sandbox_toml)}")
     else:
@@ -6023,10 +7139,6 @@ def cmd_add(args, config):
                                                 '# containers_storage = "fuse-overlayfs"'),
                             ALLOW_PRIVATE_DNS="true" if needs_private_dns else "false",
                             SECRET_GITHUB="true" if want_github else "false"))
-        # Whether this is committable depends on the layout, and saying
-        # "commit this" for a file that is not in any repo is worse than
-        # saying nothing.
-        inside_repo = os.path.isdir(os.path.join(project, ".git"))
         note(f"wrote {tilde(sandbox_toml)}" +
              ("  — commit this" if inside_repo else "  (outside the checkout)"))
 
@@ -6035,14 +7147,132 @@ def cmd_add(args, config):
         note(f"kept existing {tilde(dev_yaml)}")
     else:
         with open(dev_yaml, "w", encoding="utf-8") as fh:
-            fh.write(render("dev.yaml.in", NAME=name, IMAGE=image,
-                            CPUS=plan["cpus"], MEMORY=plan["memory"]))
+            fh.write(render("dev.yaml.in", IMAGE=image))
         note(f"wrote {tilde(dev_yaml)}" +
              ("  — commit this" if inside_repo else "  (outside the checkout)"))
 
+    if wrote_policy:
+        approve_policy(Sandbox(name, config))
     say("Registered")
     note(f"Nothing has been started. When you want it:  msbctl start {name}")
     note("The first start runs the bootstrap and takes a few minutes.")
+
+
+def cmd_add_repo(args, config):
+    """add --repo OWNER/NAME: a sandbox with no host folder. Its code is cloned
+    inside the sandbox at the first create; its policy is the repo's .msb/,
+    fetched here and approved at the commit it was read at. Flags answer the
+    questions; without a terminal, whatever no flag says takes its default.
+    Nothing is written into any folder."""
+    if args.dir:
+        die("give a folder or --repo, not both")
+    raw = args.repo.strip()
+    repo = (parse_github_url(raw) or raw).removesuffix(".git")
+    if not REPO_NAME.fullmatch(repo) or ".." in repo:
+        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    interactive = sys.stdin.isatty() and sys.stdout.isatty()
+    defaults = config.get("defaults", {})
+    say(f"Register a sandbox cloned from {repo}")
+
+    default_name = re.sub(r"[^a-z0-9-]+", "-", repo.split("/")[1].lower()).strip("-")
+    name = args.new_name or (ask("sandbox name", default_name) if interactive else default_name)
+    problem = name_problem(name)
+    if problem:
+        die(problem)
+    ref = args.ref if args.ref is not None else (
+        ask("branch, tag or commit (blank: the default branch)") if interactive else "")
+    # /work even when [defaults] guest_path is "host": there is no host path.
+    guest_path = args.guest_path or GUEST_PROJECT
+    problem = ("there is no host folder to mirror" if guest_path == "host"
+               else "a disk volume cannot be mounted at a path with a dot" if "." in guest_path
+               else guest_path_problem(guest_path))
+    if problem:
+        die(f"--guest-path {guest_path}: {problem}")
+    workspace_disk = args.workspace_disk
+    if workspace_disk:
+        size_bytes(workspace_disk)              # dies on a malformed size
+    idents = config.get("identities", {})
+    identity = args.identity
+    if identity is None:
+        identity = (ask("git identity (blank for none)", defaults.get("identity", ""))
+                    if interactive and idents else defaults.get("identity", "") or "")
+    if identity and identity not in idents:
+        die(f"unknown identity {identity!r} — config.toml defines: {', '.join(sorted(idents)) or '(none)'}")
+    tokens = claude_tokens()
+    claude_token = args.claude_token or ""
+    if claude_token and claude_token not in tokens:
+        die(f"no Claude token named {claude_token!r} is stored (`msbctl setup` → Claude login)")
+    if not args.claude_token and interactive and len(tokens) > 1:
+        follow = f"the default  (now {default_claude_token(config)})"
+        choice = choose_one("which Claude account this sandbox uses", [follow] + list(tokens), 0)
+        claude_token = "" if choice == follow else choice
+    autostart = args.autostart or (interactive and not args.yes
+                                   and confirm("start this one with the others by default?"))
+
+    # Kept in memory until the sandbox is registered, so declining leaves
+    # nothing behind; used for the fetch, in a header, and nowhere else.
+    token = None
+    if interactive:
+        say("GitHub token")
+        github_token_help(repo)
+        token = read_secret_hidden("paste the token") or None
+        if token and any(c.isspace() for c in token):
+            die("that token has whitespace in it — nothing was stored")
+    tmp, meta = fetch_repo_policy(name, repo, ref, token=token)
+    try:
+        cfg = read_toml(os.path.join(tmp, ".msb", "sandbox.toml"))
+        say("What the repo asks for")
+        note(f"commit       {meta['sha'][:12]}  ({meta['branch'] or ref or 'detached'})"
+             f"{'  private' if meta['private'] else ''}")
+        note(f"rule groups  base + {', '.join(cfg.get('rule_groups', defaults.get('rule_groups', []))) or '(none)'}")
+        for rule in cfg.get("extra_rules", []):
+            note(f"extra rule   {rule}")
+        for spec in cfg.get("secret_binds", []):
+            note(f"secret       {spec}")
+        for key in ("cpus", "memory", "root_disk", "containers_disk", "workspace_disk"):
+            if key in cfg:
+                note(f"{key:<12} {cfg[key]}")
+        image = conf_image(os.path.join(tmp, ".msb", "dev.yaml"))
+        note(f"image        {image or defaults.get('image', '?') + '  (the default)'}")
+        if not os.path.isfile(os.path.join(tmp, ".msb", "sandbox.toml")):
+            note("(no .msb/sandbox.toml in the repo: the machine's defaults apply)")
+        if restricted():
+            # Under host serve the caller is the laptop, which may name any repo:
+            # its policy must not bind a variable that already has a value here
+            # (a fresh name has none, so ordinary use never meets this).
+            own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env"))
+            stored = [secret_var(sp) for sp in cfg.get("secret_binds", []) if secret_var(sp) in own]
+            if stored:
+                die(f"{repo}'s policy binds {', '.join(stored)}, which already has a value stored "
+                    f"for {name} — refused here; add it on the host")
+        if meta["private"] and not token:
+            warn(f"{repo} is private and there is no token for {name}: the clone will fail "
+                 f"until `msbctl secret set {name} GH_TOKEN`")
+        if interactive and not args.yes and not confirm(f"register {name} with this policy?"):
+            die("cancelled — nothing was written")
+
+        os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
+        with open(registry_path_for(name), "w", encoding="utf-8") as fh:
+            fh.write(render("registry-repo.toml.in", NAME=name, REPO=repo, REF=ref,
+                            DATE=dt.date.today().isoformat(), GUEST_PATH=guest_path,
+                            IDENTITY=identity, CLAUDE_TOKEN=claude_token,
+                            AUTOSTART="true" if autostart else "false",
+                            WORKSPACE_DISK=(f'workspace_disk = "{workspace_disk}"' if workspace_disk
+                                            else f'# workspace_disk = "{defaults.get("workspace_disk", "20G")}"')))
+        install_policy(name, tmp)
+        tmp = None
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if token:
+        set_env_file_value(os.path.join(SECRETS_DIR, f"{name}.env"), "GH_TOKEN", token)
+    # The operator ran add with these arguments and, at a terminal, said yes to
+    # what was shown: that is the approval.
+    approve_policy(Sandbox(name, config))
+    note(f"wrote {tilde(registry_path_for(name))}")
+    say("Registered")
+    note(f"Nothing has been started. When you want it:  msbctl start {name}")
+    note("The first start clones the repo and runs the bootstrap; it takes a few minutes.")
 
 
 def github_token_help(repo):
@@ -6078,6 +7308,696 @@ def capture_token(name):
     set_env_file_value(path, "GH_TOKEN", token)
     note(f"stored in {tilde(path)} (0600)")
     return True
+
+
+# ------------------------------------------------------------- a remote host
+#
+# A remote host is an ordinary install, driven over ssh: `ssh host msbctl ...`.
+# The laptop is the adversary in this design (code run as the operator there:
+# an agent outside any sandbox, a compromised dependency), so the key it uses
+# every day must not be able to READ a stored secret or RE-AIM one at a host of
+# its choosing — and a plain shell does both (`cat secrets/global.env`). So
+# that key gets a forced command, `msbctl host serve`, which runs msbctl verbs
+# only, from an allowlist that looks at the arguments too, and with
+# MSB_RESTRICTED=1 so nothing it runs approves a policy change by prompting:
+# behind a pty, code on the laptop can answer a prompt as easily as you can.
+# Policy changes are made on the host itself, or with a second key the laptop's
+# agent does not hold (a FIDO2 `sk-` key). `msbctl host authorize` writes both
+# kinds of authorized_keys line. Hardening, not a permission system: the table
+# below is the whole of it, and is meant to be read in one sitting.
+
+HOST_EXIT_REFUSED = 126
+
+# What `msb exec` accepts (msb 0.7.7, crates/cli/lib/commands/exec.rs). Every
+# one acts inside the guest. Anything else is refused until it has been read:
+# a future msb flag must not pass unreviewed.
+MSB_EXEC_VALUE_FLAGS = ("-e", "--env", "-w", "--workdir", "-u", "--user", "--timeout", "--rlimit")
+MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream")
+
+
+def _msb_flags_problem(flags):
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        name = flag.split("=", 1)[0] if flag.startswith("--") else flag
+        if name in MSB_EXEC_BARE_FLAGS and "=" not in flag:
+            i += 1
+        elif name in MSB_EXEC_VALUE_FLAGS:
+            if "=" not in flag:
+                if i + 1 >= len(flags):
+                    return f"{flag} needs a value"
+                i += 1
+            i += 1
+        else:
+            return f"msb exec flag {flag!r} is not one host serve passes on"
+    return None
+
+
+def restricted_problem(argv):
+    """None if `msbctl <argv>` may run under `host serve`, else the reason.
+    Each refusal says what it would let a compromised laptop do."""
+    if argv in (["--version"], ["-V"]):
+        return None
+    try:
+        split, flags = split_cli(argv)
+    except (ValueError, IndexError):
+        return "the command line does not parse"
+    problem = _msb_flags_problem(flags)
+    if problem:
+        return problem
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            args = build_parser().parse_args(split)
+    except SystemExit as exc:
+        # -h prints help and exits 0: harmless, and the child prints it again.
+        return None if exc.code == 0 and ("-h" in split or "--help" in split) else \
+            "the command line does not parse"
+    func = args.func
+    names = list(getattr(args, "names", None) or [])
+    if hasattr(args, "name"):
+        names.append(args.name)
+    elif hasattr(args, "names") and not names and not getattr(args, "autostart", False):
+        names = [None]                  # omitted: the folder's sandbox
+    for name in names:
+        # `.` and an omitted name mean "the folder I am in", which on the host
+        # is nothing the caller chose; a path-like name is never a sandbox.
+        if name is None:
+            return "name the sandbox: the host's current folder means nothing to the caller"
+        if not SANDBOX_NAME.fullmatch(name):
+            return f"{name!r} is not a sandbox name"
+    if func is cmd_rename and not SANDBOX_NAME.fullmatch(args.new):
+        return f"{args.new!r} is not a sandbox name"
+
+    # Allowed as they are: they read, start, stop, or act inside a sandbox, and
+    # anything among them that would apply a changed policy (create, rebuild,
+    # rename) refuses under MSB_RESTRICTED. `purge` destroys unpushed work and
+    # leaks nothing, so it is outside the threat as stated.
+    plain = (cmd_ls, cmd_status, cmd_show, cmd_config, cmd_start, cmd_stop, cmd_reclaim,
+             cmd_shell, cmd_exec, cmd_update, cmd_resize, cmd_rebuild, cmd_purge, cmd_rename)
+    if func in plain:
+        return None
+    if func is cmd_self_update:
+        # Only forward: the latest release is how a remote gets upgraded without
+        # the admin key; --version is the way DOWN, to a weaker host serve.
+        return "self-update --version can downgrade host serve itself" if args.version else None
+    if func is cmd_cache:
+        return None if args.action in ("ls", "clear") else "cache: only ls and clear"
+    if func is cmd_observe:
+        # `on` lifts deny-by-default: everything the guest reads it could send.
+        return None if args.action in ("report", "off") else \
+            "observe on turns off egress filtering"
+    if func is cmd_secret:
+        # `add` binds a variable to a host, which decides where a stored value
+        # is sent. Storing a value (`set`) is not reading one.
+        return None if args.action in ("ls", "set", "rm") else \
+            "secret add binds a stored value to a host"
+    if func is cmd_setup:
+        # The menu edits identities, egress groups and defaults. Storing a
+        # Claude token is how one reaches the host at all.
+        return None if args.claude_token and args.stdin and not args.welcome else \
+            "setup: only --claude-token NAME --stdin"
+    if func is cmd_add:
+        # A folder `add` mounts a host path of the caller's choosing.
+        return None if args.repo else "add: only --repo (a folder add mounts a host path)"
+    if func is cmd_policy:
+        return None if args.action == "show" else f"policy {args.action} changes what is approved"
+    if func is cmd_host:
+        return None if args.action == "check" else f"host {args.action} is for the host itself"
+    # allow: a new egress rule. mount: a host path. port: a host port. keys:
+    # which of the host's ssh keys a sandbox may sign with. code: runs an
+    # editor on the host. move/entry/edit: rewrite the registry and the policy.
+    # _agent-filter: the host's ssh-agent. The menu: all of the above.
+    return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
+
+
+def host_serve():
+    """The forced command: validate SSH_ORIGINAL_COMMAND and run it, restricted."""
+    def refuse(reason):
+        print(f"msbctl host serve: refused: {reason}", file=sys.stderr)
+        sys.exit(HOST_EXIT_REFUSED)
+
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if raw is None:
+        # Also what an interactive login with this key gets: there is no shell.
+        refuse("this key runs msbctl commands only and gets no shell "
+               "(`ssh host msbctl ls`); see `msbctl host authorize`")
+
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        refuse("the command does not parse as shell words")
+    if not argv or argv[0] != "msbctl":
+        refuse("only msbctl commands")
+    argv = argv[1:]
+    problem = restricted_problem(argv)
+    if problem:
+        refuse(problem)
+    os.environ["MSB_RESTRICTED"] = "1"
+    # sshd runs a forced command with its own minimal PATH, so an msb in
+    # ~/.local/bin (where get.sh puts it) would not be found by any verb.
+    here = os.path.dirname(os.path.realpath(__file__))
+    os.environ["PATH"] = os.pathsep.join(
+        [os.path.join(HOME, ".local", "bin"), here, os.environ.get("PATH", "")])
+    me = os.path.realpath(__file__)
+    os.execv(sys.executable, [sys.executable, me, *argv])
+
+
+def authorized_keys_path():
+    return os.path.join(SSH_DIR, "authorized_keys")
+
+
+def host_authorize(args):
+    parsed = _parse_pub_line(args.arg or "")
+    if not parsed or "\n" in args.arg:
+        die("give one public key line, in quotes: \"ssh-ed25519 AAAA... comment\"")
+    _, ktype, comment = parsed
+    blob = args.arg.split()[1]
+    comment = re.sub(r"[^\w@.: ()+-]", "", comment)    # it lands on an options-bearing line
+    path = authorized_keys_path()
+    os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+    os.chmod(SSH_DIR, 0o700)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        text = ""
+    existing = text.splitlines()
+    for line in existing:
+        if blob in line.split():
+            die(f"that key is already in {tilde(path)}:\n  {line}\nedit the file by hand to change it")
+    if args.admin:
+        if not ktype.startswith("sk-"):
+            warn("a plain key as the admin key: if the laptop's ssh-agent holds it, the")
+            warn("code this host is guarded against can use it without asking. A FIDO2")
+            warn("`sk-` key (or one loaded with `ssh-add -c`) needs a touch or a yes.")
+            if not confirm("authorize it unrestricted anyway?"):
+                die("cancelled — nothing written")
+        line = f"{ktype} {blob} {comment}".rstrip()
+    else:
+        # As found on PATH, not resolved: a packaged install's `current` link
+        # moves on self-update, and the line must follow it.
+        me = shutil.which("msbctl")
+        if not me:
+            me = os.path.realpath(__file__)
+            warn(f"msbctl is not on PATH; the line names {me}, which an upgrade may move")
+        line = f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}'.rstrip()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+    os.chmod(path, 0o600)
+    note(f"added to {tilde(path)}:")
+    note(f"  {line}")
+    if not args.admin:
+        note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
+
+
+def _check(name, ok, detail):
+    return {"check": name, "ok": ok, "detail": detail}
+
+
+def host_checks():
+    """The hygiene report. Heuristics, each labelled as such: none of these can
+    prove the host is safe, only point at what plainly is not."""
+    out = []
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+    try:
+        import grp
+        groups = {grp.getgrgid(g).gr_name for g in os.getgroups()}
+    except (ImportError, KeyError):
+        groups = set()
+    admin = sorted(groups & {"sudo", "wheel", "admin"})
+    out.append(_check("user", os.getuid() != 0 and not admin,
+                      f"{user}, uid {os.getuid()}" + (f", in {', '.join(admin)} (can become root)"
+                                                     if admin else "") +
+                      (" — root" if os.getuid() == 0 else "")))
+    home_mode = os.stat(HOME).st_mode & 0o777
+    out.append(_check("home", home_mode & 0o077 == 0, f"{tilde(HOME)} is {home_mode:04o}"))
+    if os.path.isdir(SECRETS_DIR):
+        loose = [f for f in sorted(os.listdir(SECRETS_DIR))
+                 if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077]
+        dmode = os.stat(SECRETS_DIR).st_mode & 0o777
+        out.append(_check("secrets", dmode == 0o700 and not loose,
+                          f"{tilde(SECRETS_DIR)} {dmode:04o}" +
+                          (f"; not 0600: {', '.join(loose)}" if loose else ", every file 0600")))
+    else:
+        out.append(_check("secrets", True, "no secrets stored yet"))
+
+    def read(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+    dumpable = read("/proc/sys/fs/suid_dumpable")
+    out.append(_check("core dumps", dumpable == "0", f"fs.suid_dumpable = {dumpable}"))
+    pattern = read("/proc/sys/kernel/core_pattern") or ""
+    out.append(_check("core pattern", None if pattern.startswith("|") else True,
+                      pattern + (" (a pipe: dumps may land on disk unless its Storage=none)"
+                                 if pattern.startswith("|") else "")))
+    swaps = [line.split()[0] for line in (read("/proc/swaps") or "").splitlines()[1:] if line.split()]
+    # zram is compressed memory, not a disk; anything else must sit on dm-crypt.
+    plain = [sw for sw in swaps if not sw.startswith("/dev/zram") and not _on_dm_crypt(sw)]
+    out.append(_check("swap", not plain, "none" if not swaps else
+                      f"{', '.join(swaps)}" + (f" — not encrypted: {', '.join(plain)}" if plain
+                                              else " (in memory, or on dm-crypt)")))
+    mounts = [line.split()[:2] for line in (read("/proc/mounts") or "").splitlines() if line.split()]
+    best = max((m for m in mounts if HOME == m[1] or HOME.startswith(m[1].rstrip("/") + "/")),
+               key=lambda m: len(m[1]), default=None)
+    crypt = best is not None and _on_dm_crypt(best[0])
+    out.append(_check("disk", crypt, f"{tilde(HOME)} is on {best[0] if best else '?'}"
+                      f" ({best[1] if best else '?'}): "
+                      + ("dm-crypt found below it" if crypt else
+                         "no dm-crypt found below it — is the disk encrypted some other way?")))
+    keys = []
+    for line in (read(authorized_keys_path()) or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            keys.append(line)
+    open_keys = [line for line in keys if "host serve" not in line
+                 and not any(part.startswith("sk-") for part in line.split()[:3])]
+    out.append(_check("authorized_keys", not open_keys,
+                      f"{len(keys)} key(s); " + (f"{len(open_keys)} can get a shell and are not sk- keys"
+                                                 if open_keys else "each is host serve or an sk- key")))
+    out.append(_check("restricted", None, "yes: this key runs under host serve"
+                      if restricted() else "no: this session is unrestricted"))
+    linger = os.path.exists(f"/var/lib/systemd/linger/{user}")
+    unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
+    out.append(_check("autostart", linger and unit,
+                      f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
+                      f"{'enabled' if unit else 'not enabled'} (`msbctl host autostart install`)"))
+    msb = shutil.which("msb")
+    version = run(["msb", "--version"], capture=True, check=False).stdout.strip() if msb else ""
+    out.append(_check("msb", bool(msb) and os.path.exists("/dev/kvm"),
+                      f"{version or 'not found'}{' at ' + msb if msb else ''}, "
+                      f"/dev/kvm {'present' if os.path.exists('/dev/kvm') else 'MISSING'}"))
+    out.append(_check("msbctl", True, version_string()))
+    return out
+
+
+def _on_dm_crypt(device):
+    """Whether a block device is, or sits on, a dm-crypt (LUKS) mapping: its
+    device-mapper chain, walked through /sys, has a CRYPT- uuid. LVM alone is
+    device-mapper too and encrypts nothing, so the name is not enough."""
+    try:
+        start = os.path.basename(os.path.realpath(device))
+    except OSError:
+        return False
+    seen, todo = set(), [start]
+    while todo:
+        dev = todo.pop()
+        if dev in seen:
+            continue
+        seen.add(dev)
+        try:
+            with open(f"/sys/class/block/{dev}/dm/uuid", encoding="utf-8") as fh:
+                if fh.read().startswith("CRYPT-"):
+                    return True
+        except OSError:
+            pass  # not a device-mapper device
+        try:
+            todo += os.listdir(f"/sys/class/block/{dev}/slaves")
+        except OSError:
+            pass  # a leaf: nothing below it
+    return False
+
+
+def host_check(args):
+    checks = host_checks()
+    if args.json:
+        print_json({"msbctl": version_string(), "restricted": restricted(), "checks": checks})
+        return
+    say("Host check (heuristics: they point at what is plainly wrong, and prove nothing)")
+    for c in checks:
+        mark = {True: "ok  ", False: "WARN", None: "info"}[c["ok"]]
+        note(f"{mark}  {c['check']:<16} {c['detail']}")
+
+
+SYSTEMD_USER_DIR = os.path.join(HOME, ".config", "systemd", "user")
+AUTOSTART_UNIT = "msb-autostart.service"
+
+
+def host_autostart(args):
+    if args.arg != "install":
+        die("host autostart: the only action is `install`")
+    me = shutil.which("msbctl") or os.path.realpath(__file__)
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    path = os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"""# Written by `msbctl host autostart install`. Starts every sandbox whose
+# registry entry says autostart = true, after a reboot, with nobody logged in
+# (that part needs `loginctl enable-linger`, once, as root).
+[Unit]
+Description=Start the msb-manager autostart sandboxes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH={os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin
+ExecStart={me} start --autostart
+
+[Install]
+WantedBy=default.target
+""")
+    note(f"wrote {tilde(path)}")
+    if shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        run(["systemctl", "--user", "enable", AUTOSTART_UNIT], check=False)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
+    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
+        note("a user unit runs with nobody logged in only with lingering on; once, as root:")
+        note(f"  loginctl enable-linger {user}")
+
+
+def cmd_host(args, config):
+    """host serve|authorize|check|autostart — running this machine as a remote."""
+    if args.action == "serve":
+        host_serve()
+    elif restricted() and args.action != "check":
+        die(f"host {args.action} is for the host itself")
+    elif args.action == "authorize":
+        host_authorize(args)
+    elif args.action == "check":
+        host_check(args)
+    elif args.action == "autostart":
+        host_autostart(args)
+
+
+# ----------------------------------------------------------- remotes (laptop)
+#
+# A remote is an ssh destination running msb-manager (see `msbctl host`).
+# `host:name` addresses a sandbox there: the command line is sent as it was
+# typed, that one token made the bare name, over ssh to the host's msbctl,
+# with stdio passed straight through. Nothing else is involved: no daemon, no
+# protocol, no port. ssh authenticates and encrypts; the host's `host serve`
+# decides what the key may run. Local is not special: it is simply the host
+# this command runs on.
+
+REMOTE_NAME = re.compile(r"([a-z0-9][a-z0-9-]*):([a-z0-9][a-z0-9-]*|\.)")
+REMOTE_DEST = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._-]*@[A-Za-z0-9_][A-Za-z0-9.:_-]*|[A-Za-z0-9_][A-Za-z0-9._:-]*")
+REMOTES_DIR = os.path.join(STATE_DIR, "remotes")
+REMOTE_LS_TIMEOUT = 15
+# How long an unreachable host is left alone before `ls` tries it again. The
+# picker reloads the list after every action, and a host that is down would
+# otherwise cost the full connect timeout on each one; `ls --refresh` tries now.
+REMOTE_RETRY_AFTER = 60
+
+
+def configured_remotes(config=None):
+    """{name: {"ssh": dest}} from config.toml's [remotes.<name>] tables."""
+    if config is None:
+        try:
+            config = load_config()
+        except SystemExit:
+            return {}
+    return {k: v for k, v in (config.get("remotes") or {}).items() if isinstance(v, dict)}
+
+
+def remote_dest(name, config):
+    remote = configured_remotes(config).get(name)
+    if not remote or not remote.get("ssh"):
+        die(f"unknown remote {name!r} — `msbctl remote ls`")
+    dest = str(remote["ssh"])
+    if not REMOTE_DEST.fullmatch(dest):
+        die(f"remote {name}: ssh = {dest!r} is not user@host or host (fix config.toml)")
+    return dest
+
+
+def ssh_argv(dest, tty, batch=False):
+    """ssh to `dest`, sharing one connection per host for ten minutes, ending
+    in `--`: the remote command follows as ONE argument (shlex.join), since ssh
+    joins the rest with spaces for the far side's shell."""
+    os.makedirs(os.path.join(STATE_DIR, "ssh"), mode=0o700, exist_ok=True)
+    return ["ssh", "-o", "ControlMaster=auto",
+            "-o", f"ControlPath={os.path.join(STATE_DIR, 'ssh', '%C')}",
+            "-o", "ControlPersist=600", "-o", "ServerAliveInterval=30",
+            "-t" if tty else "-T",
+            *(["-o", "BatchMode=yes", "-o", "ConnectTimeout=5"] if batch else []),
+            dest, "--"]
+
+
+def wants_tty():
+    """A pty only when both ends are a terminal: `exec` from a pipe (an ACP
+    client) must be a clean byte stream, and -t would mangle it."""
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
+def split_remote(name):
+    """(remote, bare name) for `host:name`, or None for a local name."""
+    match = REMOTE_NAME.fullmatch(name or "")
+    if not match:
+        return None
+    if match.group(2) == ".":
+        die(f"{name}: `.` means this machine's current folder, which names nothing on "
+            f"{match.group(1)} — give the sandbox's name")
+    return match.group(1), match.group(2)
+
+
+def remote_names(args):
+    """The names in `args` that are host:name, if any; [] if all are local."""
+    names = [args.name] if getattr(args, "name", None) else list(getattr(args, "names", None) or [])
+    return [n for n in names if REMOTE_NAME.fullmatch(n or "")]
+
+
+def _remote_command(raw_argv, token, bare):
+    """The original command line, `token` (host:name) replaced by `bare`. It
+    occurs once, as the name; anything after it (an exec's command) is left as
+    typed, including a later string that happens to look the same."""
+    out = list(raw_argv)
+    out[out.index(token)] = bare
+    return out
+
+
+def exec_remote(args, config, raw_argv):
+    """Replace this process with ssh running the command on the remote; its exit
+    status is the remote's (ssh's own failures are 255)."""
+    token = args.name
+    remote, bare = split_remote(token)
+    dest = remote_dest(remote, config)
+    argv = ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *_remote_command(raw_argv, token, bare)])]
+    sys.stdout.flush()
+    os.execvp("ssh", argv)
+
+
+def run_remote_verb(args, config, raw_argv, token):
+    """One host:name of a multi-name verb (start a:x b c:y): the verb, this name
+    right after it, and the flags as typed; the other names left out."""
+    remote, bare = split_remote(token)
+    dest = remote_dest(remote, config)
+    names = set(args.raw_names)
+    verb_at = next(i for i, a in enumerate(raw_argv) if not a.startswith("-"))
+    rest = [a for a in raw_argv[verb_at + 1:] if a not in names]
+    command = ["msbctl", raw_argv[verb_at], bare, *rest]
+    proc = subprocess.run(ssh_argv(dest, wants_tty()) + [shlex.join(command)])
+    if proc.returncode:
+        die(f"{token}: exit {proc.returncode} on {remote}")
+
+
+def add_remote_forward(args, config, raw_argv):
+    """add --remote HOST …: the rest of the arguments, run there."""
+    dest = remote_dest(args.remote, config)
+    rest, skip = [], False
+    for a in raw_argv:
+        if skip:
+            skip = False
+            continue
+        if a == "--remote":
+            skip = True
+            continue
+        if a.startswith("--remote="):
+            continue
+        rest.append(a)
+    sys.stdout.flush()
+    os.execvp("ssh", ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *rest])])
+
+
+def _remote_cache_path(name):
+    return os.path.join(REMOTES_DIR, f"{name}.json")
+
+
+def _short_reason(proc):
+    text = (proc.stderr or "").strip().splitlines()
+    return (text[-1] if text else f"ssh exit {proc.returncode}")[:80]
+
+
+def query_remote_ls(name, dest, refresh):
+    """(rows, problem, stale_age) for one remote: its `ls --json` sandboxes, why
+    it could not answer (or None), and how old the rows are if they came from
+    the cache. A host that failed less than REMOTE_RETRY_AFTER ago is not tried
+    again, unless `refresh`."""
+    cache = read_json(_remote_cache_path(name))
+    now = time.time()
+    if not refresh and cache.get("failed_at", 0) > now - REMOTE_RETRY_AFTER:
+        problem = cache.get("reason", "unreachable")
+    else:
+        command = ["msbctl", "ls", "--json"] + (["--refresh"] if refresh else [])
+        try:
+            proc = subprocess.run(ssh_argv(dest, tty=False, batch=True) + [shlex.join(command)],
+                                  capture_output=True, text=True, timeout=REMOTE_LS_TIMEOUT,
+                                  stdin=subprocess.DEVNULL)
+        except subprocess.TimeoutExpired:
+            proc = None
+        problem = None
+        if proc is None:
+            problem = f"no answer in {REMOTE_LS_TIMEOUT}s"
+        elif proc.returncode == 255:            # ssh's own failure
+            problem = f"unreachable: {_short_reason(proc)}"
+        else:
+            try:
+                data = json.loads(proc.stdout)
+                rows = data["sandboxes"]
+            except (ValueError, KeyError, TypeError):
+                # An older msbctl answers --json with its usage text, which is
+                # not a parse error worth reporting as one.
+                old = "usage:" in (proc.stderr or "") + (proc.stdout or "")
+                problem = ("host msbctl too old (needs `ls --json`)" if old
+                           else f"error: {_short_reason(proc)}")
+            else:
+                write_json(_remote_cache_path(name), {"at": now, "sandboxes": rows,
+                                                      "msbctl": data.get("msbctl", "")})
+                return rows, None, None
+        cache["failed_at"], cache["reason"] = now, problem
+        write_json(_remote_cache_path(name), cache)
+    if cache.get("sandboxes") is not None:
+        return cache["sandboxes"], problem, now - cache.get("at", now)
+    return [], problem, None
+
+
+def _age(seconds):
+    for unit, step in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= step:
+            return f"{int(seconds // step)}{unit}"
+    return f"{int(seconds)}s"
+
+
+def remote_ls_rows(args, config):
+    """[(host, row dict or None, note)] for every configured remote, queried in
+    parallel. A row None is the one line an unreachable remote gets."""
+    import concurrent.futures
+    remotes = configured_remotes(config)
+    out = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(remotes)))) as pool:
+        futures = {name: pool.submit(query_remote_ls, name, remote_dest(name, config), args.refresh)
+                   for name in sorted(remotes)}
+        for name, fut in futures.items():
+            rows, problem, stale = fut.result()
+            if problem:
+                out.append((name, None, problem + (f" (rows below are {_age(stale)} old)"
+                                                   if stale is not None and rows else "")))
+            for row in rows:
+                out.append((name, row, f"stale {_age(stale)}" if stale is not None else ""))
+    return out
+
+
+def remote_key_candidates():
+    """Public keys the laptop could authorize on a host: the agent's, then ~/.ssh/*.pub."""
+    out = []
+    proc = subprocess.run(["ssh-add", "-L"], capture_output=True, text=True)
+    for line in proc.stdout.splitlines() if proc.returncode == 0 else []:
+        if _parse_pub_line(line):
+            out.append(("agent", line.strip()))
+    try:
+        for f in sorted(os.listdir(SSH_DIR)):
+            if f.endswith(".pub"):
+                with open(os.path.join(SSH_DIR, f), encoding="utf-8") as fh:
+                    line = fh.read().strip()
+                if _parse_pub_line(line) and all(line.split()[1] != l.split()[1] for _, l in out):
+                    out.append((f"~/.ssh/{f}", line))
+    except OSError:
+        pass  # no ~/.ssh: nothing to list
+    return out
+
+
+def remote_test(name, config, batch=True):
+    """Run the host's `host check --json` and say what matters from here."""
+    dest = remote_dest(name, config)
+    # Not batch: ssh may need to ask about the host key, on the terminal.
+    proc = subprocess.run(ssh_argv(dest, tty=False, batch=batch)
+                          + [shlex.join(["msbctl", "host", "check", "--json"])],
+                          capture_output=True, text=True,
+                          stdin=subprocess.DEVNULL if batch else None)
+    try:
+        data = json.loads(proc.stdout)
+    except ValueError:
+        reason = _short_reason(proc) if proc.returncode else "not JSON (host msbctl too old?)"
+        write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
+                   {"at": time.time(), "ok": False, "summary": reason})
+        die(f"{name} ({dest}): {reason}")
+    say(f"{name}  {dest}")
+    for c in data.get("checks", []):
+        mark = {True: "ok  ", False: "WARN", None: "info"}[c.get("ok")]
+        note(f"{mark}  {c.get('check', '?'):<16} {c.get('detail', '')}")
+    problems = []
+    if not data.get("restricted"):
+        problems.append("this key is not restricted")
+        warn("this key can get a shell on the host: run `msbctl host authorize \"<this key>\"` "
+             "there and remove its unrestricted line")
+    theirs = str(data.get("msbctl", "")).split()[0]
+    mine = version_string().split()[0]
+    if theirs.split("+")[0] != mine.split("+")[0]:
+        problems.append(f"msbctl {theirs} there, {mine} here")
+        warn(f"the host runs msbctl {theirs}, this machine {mine}")
+    write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
+               {"at": time.time(), "ok": not problems, "summary": "; ".join(problems) or "ok"})
+
+
+def cmd_remote(args, config):
+    """remote add|ls|test|rm — the ssh destinations this machine drives."""
+    if args.action == "ls":
+        remotes = configured_remotes(config)
+        if not remotes:
+            note("no remotes — `msbctl remote add NAME user@host`")
+            return
+        for name in sorted(remotes):
+            test = read_json(os.path.join(REMOTES_DIR, f"{name}.test.json"))
+            last = (f"{'ok' if test.get('ok') else test.get('summary', '?')}, "
+                    f"{_age(time.time() - test['at'])} ago") if test.get("at") else "not tested"
+            note(f"{name:<16} {remotes[name].get('ssh', '?'):<32} {last}")
+        return
+    name = args.name or die(f"remote {args.action} needs a NAME")
+    if not SANDBOX_NAME.fullmatch(name):
+        die(f"{name!r}: a remote's name is lowercase letters, digits and dashes")
+    if args.action == "add":
+        dest = args.dest or die("remote add NAME DEST: DEST is user@host")
+        if not REMOTE_DEST.fullmatch(dest):
+            die(f"{dest!r} is not user@host or host")
+        if name in configured_remotes(config):
+            die(f"{name} is already a remote (`msbctl remote rm {name}` first)")
+        ensure_local_config()
+        set_toml_key(CONFIG_FILE, "ssh", dest, table=f"remotes.{name}")
+        note(f"remotes.{name} = {dest}  ({tilde(CONFIG_FILE)})")
+        say("On the host, authorize this machine's everyday key")
+        note("It gets a forced command there: msbctl verbs from host serve's allowlist,")
+        note("no shell, and nothing that can read a stored secret or approve a policy.")
+        cands = remote_key_candidates()
+        for where, line in cands:
+            parts = line.split()
+            note(f"  {where:<22} {parts[0]} …{parts[1][-12:]} {' '.join(parts[2:])}")
+        line = cands[0][1] if cands else "ssh-ed25519 AAAA... you@this-machine"
+        note("")
+        note(f"  msbctl host authorize \"{line}\"")
+        note("")
+        note("For policy changes from here, use a SEPARATE key the agent does not hold —")
+        note("a FIDO2 one: `ssh-keygen -t ed25519-sk`, then on the host `msbctl host authorize --admin`.")
+        say(f"Testing {name}")
+        # Not batch mode, this once: an unknown host key has to be accepted at
+        # a prompt, and BatchMode fails on it with a message that does not say so.
+        try:
+            remote_test(name, load_config(), batch=False)
+        except SystemExit as exc:
+            warn(str(exc.code).replace("msbctl: ", "", 1))
+            note(f"once the key is authorized there: `msbctl remote test {name}`")
+    elif args.action == "test":
+        remote_test(name, config)
+    elif args.action == "rm":
+        if not remove_toml_table(CONFIG_FILE, f"remotes.{name}"):
+            die(f"no remote {name!r}")
+        for f in (f"{name}.json", f"{name}.test.json"):
+            try:
+                os.unlink(os.path.join(REMOTES_DIR, f))
+            except FileNotFoundError:
+                pass  # never queried
+        note(f"{name} removed from {tilde(CONFIG_FILE)}; the host itself is untouched")
 
 
 # ----------------------------------------------------------------------- main
@@ -6174,7 +8094,7 @@ def cmd_status(args, config):
         else:
             print(f"   as     {DIM}no identity — a repo without one cannot commit{RESET}")
         print(f"   image  {image_short(box.image_or_none())}")
-        print(f"   dir    {tilde(box.project)}")
+        print(f"   {'repo' if box.is_repo else 'dir '}   {box.location}")
         if box.observing:
             # Unmissable in the sidebar: this one is not enforcing anything, and
             # a sandbox silently left that way is the failure mode of the whole
@@ -6342,7 +8262,40 @@ def cmd_menu(args, config):
             note(f"not an option: {choice}")
 
 
-def main():
+def preflight(args):
+    """Die unless this machine can run sandboxes: `msb` on PATH and /dev/kvm.
+
+    Checked for every subcommand, including `add`. Registering a project from
+    inside a container would write a registry entry naming a path that only
+    exists in that container, which fails later and confusingly.
+    The ssh-agent filter daemon needs neither (it only proxies a socket), and
+    `config` only reads files. One function, so the tests and the screenshot
+    harness replace exactly this and nothing else.
+    """
+    if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
+        return
+    # `host check` reports a missing msb or /dev/kvm itself; the other host
+    # verbs need neither (serve re-runs msbctl, which checks then).
+    if args.func in (cmd_host, cmd_remote):
+        return
+    # A sandbox on a remote needs ssh here, not msb; nor does `ls` once there
+    # are remotes (this machine's rows simply are not shown without msb).
+    if remote_names(args) and len(remote_names(args)) == len(
+            [args.name] if getattr(args, "name", None) else list(getattr(args, "names", None) or [])):
+        return
+    if args.func is cmd_add and getattr(args, "remote", None):
+        return
+    if args.func is cmd_ls and configured_remotes():
+        return
+    if not shutil.which("msb"):
+        die("msb is not on PATH")
+    if not os.path.exists("/dev/kvm"):
+        die("no /dev/kvm — msbctl runs on the host, not inside a container")
+
+
+def build_parser():
+    """The whole command line. One function, so `host serve` validates a
+    command with exactly the parser that will then run it."""
     parser = argparse.ArgumentParser(
         prog="msbctl", description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -6351,8 +8304,22 @@ def main():
     parser.add_argument("--version", action="version", version=f"msbctl {version_string()}")
     sub = parser.add_subparsers(dest="cmd")
 
-    p = sub.add_parser("add", help="register a project")
+    p = sub.add_parser("add", help="register a project folder, or a repo to clone (--repo)")
     p.add_argument("dir", nargs="?")
+    p.add_argument("--repo", metavar="OWNER/NAME|URL",
+                   help="no host folder: clone this GitHub repo inside the sandbox")
+    p.add_argument("--ref", help="with --repo: branch, tag or commit (default: the default branch)")
+    # dest is not `name`: main() resolves every args.name against the cwd.
+    p.add_argument("--name", dest="new_name",
+                   help="with --repo: the sandbox name (default: the repo's)")
+    p.add_argument("--guest-path", metavar="PATH", help="with --repo: where the clone is (default /work)")
+    p.add_argument("--workspace-disk", metavar="SIZE", help="with --repo: the clone's volume size")
+    p.add_argument("--identity", help="with --repo: an [identities] name")
+    p.add_argument("--claude-token", metavar="NAME", help="with --repo: a stored Claude token's name")
+    p.add_argument("--autostart", action="store_true", help="with --repo: start it with the others")
+    p.add_argument("-y", "--yes", action="store_true", help="with --repo: no confirmation")
+    p.add_argument("--remote", metavar="HOST",
+                   help="register it on a remote instead (`msbctl remote ls`); the rest is sent there")
     p.set_defaults(func=cmd_add)
 
     p = sub.add_parser("ls", help="one line per sandbox")
@@ -6360,6 +8327,7 @@ def main():
     p.add_argument("--porcelain", action="store_true", help="tab-separated, for scripts")
     p.add_argument("--picker", action="store_true",
                    help="name<TAB>padded display text, for msb-picker")
+    p.add_argument("--json", action="store_true", help="one JSON document, for scripts")
     p.set_defaults(func=cmd_ls)
 
     p = sub.add_parser("entry", help="edit a sandbox's registry entry")
@@ -6373,6 +8341,7 @@ def main():
 
     p = sub.add_parser("show", help="everything about one sandbox")
     p.add_argument("name", nargs="?", help=NAME_HELP)
+    p.add_argument("--json", action="store_true", help="one JSON document; no secret values")
     p.set_defaults(func=cmd_show)
 
     # `names` (plural) marks a verb as repeatable: main() loops over them. The
@@ -6385,6 +8354,9 @@ def main():
     ):
         p = sub.add_parser(verb, help=helptext)
         p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
+        if verb == "start":
+            p.add_argument("--autostart", action="store_true",
+                           help="no names: every sandbox whose entry says autostart = true")
         p.set_defaults(func=func)
 
     # Single-name on purpose: each of these hands the terminal to one thing.
@@ -6426,10 +8398,20 @@ def main():
     p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("secret", help="add, remove or list extra secrets for a sandbox")
-    p.add_argument("action", choices=["add", "rm", "ls"])
+    p.add_argument("action", choices=["add", "rm", "ls", "set"])
     p.add_argument("name", help=DOT_HELP)
-    p.add_argument("var", nargs="?", help="for rm: the variable name")
+    p.add_argument("var", nargs="?", help="for rm and set: the variable name")
+    p.add_argument("--stdin", action="store_true",
+                   help="for set: read the value from stdin (one trailing newline dropped)")
+    p.add_argument("--restart", action="store_true",
+                   help="for set: restart a running sandbox so the value is used now")
     p.set_defaults(func=cmd_secret)
+
+    p = sub.add_parser("policy", help="show or approve the project policy a sandbox is pinned to")
+    p.add_argument("name", help=DOT_HELP)
+    p.add_argument("action", nargs="?", choices=["show", "approve", "update"], default="show")
+    p.add_argument("ref", nargs="?", help="for update: a branch, tag or commit to move to")
+    p.set_defaults(func=cmd_policy)
 
     p = sub.add_parser("allow", help="add egress rules to a sandbox (host, host:port, or a full rule)")
     p.add_argument("name", help=DOT_HELP)
@@ -6475,6 +8457,9 @@ def main():
 
     p = sub.add_parser("setup", help="your machine-level settings: identities, Claude login, network, defaults")
     p.add_argument("--welcome", action="store_true", help="the guided first-run walk-through")
+    p.add_argument("--claude-token", metavar="NAME",
+                   help="no menu: store a Claude token under this name (main is the default)")
+    p.add_argument("--stdin", action="store_true", help="with --claude-token: read it from stdin")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("edit", help="edit an existing sandbox, one wizard section at a time")
@@ -6495,6 +8480,21 @@ def main():
                    help="remove the restriction: every host key")
     p.set_defaults(func=cmd_keys)
 
+    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart")
+    p.add_argument("action", choices=["serve", "authorize", "check", "autostart"])
+    p.add_argument("arg", nargs="?", metavar="KEY|install",
+                   help="authorize: one public key line, quoted; autostart: install")
+    p.add_argument("--admin", action="store_true",
+                   help="authorize: no forced command (use a FIDO2 sk- key)")
+    p.add_argument("--json", action="store_true", help="check: one JSON document")
+    p.set_defaults(func=cmd_host)
+
+    p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, ls, test, rm")
+    p.add_argument("action", choices=["add", "ls", "test", "rm"])
+    p.add_argument("name", nargs="?", help="the remote's name, as in NAME:sandbox")
+    p.add_argument("dest", nargs="?", help="for add: user@host, as ssh takes it")
+    p.set_defaults(func=cmd_remote)
+
     p = sub.add_parser("_agent-filter", help=argparse.SUPPRESS)
     p.add_argument("name")
     p.set_defaults(func=cmd_agent_filter)
@@ -6513,28 +8513,31 @@ def main():
                    help="claude (default), gh, gitleaks, bun, apt")
     p.set_defaults(func=cmd_update)
 
-    argv = sys.argv[1:]
-    # msb's own flags for `exec`/`shell` are taken out before argparse, which
-    # would otherwise reject them or take a flag's value for the name; this
-    # also turns `msbctl exec -- cmd` into `exec . -- cmd`.
+    return parser
+
+
+def split_cli(argv):
+    """(argv for argparse, msb exec flags). msb's own flags for `exec`/`shell`
+    are taken out before argparse, which would otherwise reject them or take a
+    flag's value for the name; this also turns `msbctl exec -- cmd` into
+    `exec . -- cmd`."""
     verb = next((i for i, a in enumerate(argv) if not a.startswith("-")), None)
-    msb_flags = []
     if verb is not None and argv[verb] in ("exec", "shell"):
-        argv, msb_flags = split_msb_flags(argv, verb)
-    args = parser.parse_args(argv)
+        return split_msb_flags(argv, verb)
+    return argv, []
+
+
+def parse_cli(argv, parser=None):
+    argv, msb_flags = split_cli(argv)
+    args = (parser or build_parser()).parse_args(argv)
     if msb_flags:
         args.msb_flags = msb_flags
+    return args
 
-    # Checked for every subcommand, including `add`. Registering a project from
-    # inside a container would write a registry entry naming a path that only
-    # exists in that container, which fails later and confusingly.
-    # The ssh-agent filter daemon needs neither (it only proxies a socket), and
-    # `config` only reads files.
-    if args.func not in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
-        if not shutil.which("msb"):
-            die("msb is not on PATH")
-        if not os.path.exists("/dev/kvm"):
-            die("no /dev/kvm — msbctl runs on the host, not inside a container")
+
+def main():
+    args = parse_cli(sys.argv[1:])
+    preflight(args)
 
     try:
         try:
@@ -6543,11 +8546,33 @@ def main():
             if args.func not in (cmd_setup, cmd_self_update):   # these can still work with a broken config.toml
                 raise
             config = None
-        if args.func is not cmd_agent_filter:
+        raw_argv = sys.argv[1:]
+        # host:name — after parsing, from the name's own slot only: argv is
+        # never scanned for the shape, since a port spec (3000:5173) and an
+        # allow target (mirror:443) have it too.
+        if args.func not in (cmd_agent_filter, cmd_remote):
+            if args.func is cmd_add and getattr(args, "remote", None):
+                add_remote_forward(args, config, raw_argv)
+            if getattr(args, "name", None) and split_remote(args.name):
+                exec_remote(args, config, raw_argv)
+            args.raw_names = list(getattr(args, "names", None) or [])
+        if getattr(args, "autostart", False):
+            if args.names:
+                die("start --autostart takes no names")
+            # The autostart set: each one not already running. The same loop as
+            # named starts, so one broken entry does not stop the rest.
+            table = msb_table()
+            args.names = [n for n in registered()
+                          if read_toml(registry_path_for(n)).get("autostart") is True
+                          and state_of(n, table) != "running"]
+            if not args.names:
+                note("nothing in the autostart set needs starting")
+                return
+        elif args.func not in (cmd_agent_filter, cmd_remote):
             if hasattr(args, "name"):
                 args.name = resolve_here(args.name)
             if hasattr(args, "names"):
-                args.names = [resolve_here(n) for n in args.names or [None]]
+                args.names = [n if split_remote(n) else resolve_here(n) for n in args.names or [None]]
         if not hasattr(args, "names"):
             args.func(args, config)
             if BOOTSTRAP_FAILURES:
@@ -6560,7 +8585,10 @@ def main():
             for name in args.names:
                 args.name = name
                 try:
-                    args.func(args, config)
+                    if split_remote(name):
+                        run_remote_verb(args, config, raw_argv, name)
+                    else:
+                        args.func(args, config)
                 except SystemExit as exc:
                     if exc.code:
                         failed.append(str(exc.code).replace("msbctl: ", "", 1))

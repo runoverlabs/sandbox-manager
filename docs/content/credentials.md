@@ -81,10 +81,40 @@ MY_TOKEN:query@api.example.com          # also substitute in the query string
 MY_TOKEN@one.example.com,two.example.com
 ```
 
+**Where the value comes from** depends on where the binding is written. A
+binding in the project's `.msb/sandbox.toml` takes its value from that
+sandbox's own `secrets/<name>.env` only, never from `global.env`: that file is
+committed and writable from inside the sandbox, and it decides which host the
+value is sent to. A binding in the registry entry (yours, machine-local) may
+also use a value from `global.env`, shared between sandboxes. `msbctl secret
+add` stores the value per sandbox either way.
+
+**Reserved variables.** `GH_TOKEN` and the Claude token variables
+(`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_<NAME>`) have fixed
+bindings and can't appear in `secret_binds` in any file: a second
+`GH_TOKEN@somewhere.example` would send the real token there. A create or
+rebuild refuses such a line; a sandbox that already exists starts without it.
+
 A secret doesn't open the network: its hosts must also be allowed by an egress
 rule. `msbctl add` warns when they aren't; after `msbctl secret add`, check
 with `msbctl show` and [`msbctl allow`](egress.md#adding-a-host) what's
 missing.
+
+### Scripting: storing a token from a password manager
+
+Every token can be stored without a menu, and without the value ever being an
+argument (where `ps` and your shell history would see it):
+
+```console
+$ pass show github/webshop | msbctl secret set webshop GH_TOKEN --stdin
+$ op read op://dev/npm/token | msbctl secret set webshop NPM_TOKEN --stdin --restart
+$ pass show claude/work | msbctl setup --claude-token work --stdin
+```
+
+One trailing newline is dropped; an empty value, one with whitespace in it, or
+one over 8 KiB is refused, and nothing is printed back. `secret set` only
+stores values for variables the sandbox already binds. `msbctl ls --json` and
+`msbctl show --json` say whether a token is stored, and never what it is.
 
 ### Why a placeholder can break an agent, and why it doesn't here
 

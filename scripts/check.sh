@@ -5,8 +5,8 @@
 #
 #   scripts/check.sh
 #
-# Needs no msb, no KVM and no network: Python 3.11+, bash, git, and (if
-# installed; CI has them) shellcheck, ruff and gitleaks. Each check records its
+# Needs no msb, no KVM and no network (the tests use a fake msb): Python 3.11+,
+# bash, git, and (if installed; CI has them) shellcheck, ruff and gitleaks. Each check records its
 # outcome and the failures are summarized together, same as bootstrap.sh, so
 # one run shows everything that is wrong rather than the first thing.
 
@@ -57,6 +57,19 @@ if command -v ruff >/dev/null 2>&1; then
 else
 	skip "ruff not installed"
 fi
+
+echo "tests"
+# The unit tests, against the fake msb in tests/fake. -t . makes `tests` a
+# package; a run that finds nothing reports "Ran 0 tests" and OK, so that is a
+# failure here, not a pass.
+if python3 -I -m unittest discover -s tests -t . -q >/tmp/check.$$ 2>&1; then
+	ran=$(grep -Eo '^Ran [0-9]+ tests?' /tmp/check.$$ | grep -Eo '[0-9]+')
+	if [ "${ran:-0}" -gt 0 ]; then ok "$ran tests pass"; else bad "no tests found"; fi
+else
+	bad "unit tests failed:"
+	sed 's/^/        /' /tmp/check.$$
+fi
+rm -f /tmp/check.$$
 
 echo "toml"
 for f in defaults.toml .msb/sandbox.toml; do

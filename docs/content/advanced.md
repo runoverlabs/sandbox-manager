@@ -27,7 +27,9 @@ rule covers.
 
 The mode lives in the **registry entry only**, never in `.msb/sandbox.toml`.
 That file is committed, and an unfiltered sandbox must never ship to everyone
-who clones the project.
+who clones the project. An `egress_mode` written there is ignored, with a
+warning: the file is writable from inside the sandbox, which must not be able
+to switch its own filtering off.
 
 The report also shows **secret-policy blocks**: requests msb killed because
 they carried a placeholder somewhere substitution isn't allowed. Those are
@@ -123,6 +125,39 @@ repo, and offers the rebuild the new mount needs.
 
 Both are also in `msbctl edit` → "Name & folder".
 
+## Sandboxes without a folder
+
+`msbctl add --repo owner/name` registers a sandbox that has no folder on this
+machine. Its first start clones the repo into a disk volume
+(`<name>-workspace`, at `/work`), with the sandbox's own GitHub token as a
+placeholder, the same way every other token works. A rebuild finds the clone
+there and leaves it alone, unpushed work included; `msbctl purge` deletes it.
+Work leaves the sandbox with `git push` from inside it.
+
+```console
+$ msbctl add --repo acme/webshop --ref main -y
+$ msbctl secret set webshop GH_TOKEN      # a private repo needs it to clone
+$ msbctl start webshop
+```
+
+**Which `.msb/` governs** is the copy msbctl fetched from GitHub at the pinned
+commit, never the checkout inside the sandbox: editing `.msb/sandbox.toml` in
+the guest changes nothing until it's pushed and `msbctl policy webshop update`
+is run on the host. A rebuild stays on the pinned commit and fetches nothing,
+so it can run unattended. A repo with no `.msb/` gets your defaults. A repo
+can't set `conf`, and its `dev.yaml` follows the [same rules](configuration.md#msbdevyaml)
+as a folder's.
+
+`msbctl allow`, `secret add` and `edit` write to the registry entry, since
+there's no checkout to edit, and what they add sits on top of the repo's rules
+and bindings rather than replacing them. A change meant to last belongs in the
+repo. `code` and `move` refuse: there is no folder. No ssh-agent is forwarded,
+so `ssh_keys = []`, and git uses HTTPS with the token.
+
+`guest_path` can't be `"host"` (there's no host path) and can't contain a dot
+(a disk volume can't be mounted there). The volume's size is `workspace_disk`
+(`--workspace-disk`, default 20G), fixed when it's created.
+
 ## Where the project appears in the sandbox
 
 By default the project is mounted at `/work`. `msbctl add` asks where it
@@ -191,8 +226,18 @@ create-time, like mounts.
 
 For hosts on your LAN (a Git server, a package mirror), define a group once in
 `config.toml`, or use `msbctl setup` → "your network". If those names resolve
-to private addresses, list the group under `private_dns_groups`, so projects
-that use it get `allow_private_dns = true` automatically. See
+to private addresses, list the group under `private_dns_groups`, so sandboxes
+that use it get `allow_private_dns` automatically.
+
+A group of your own stays on your machine. `msbctl add` and `msbctl edit` →
+"Features & agents" put it in the sandbox's registry entry as
+`extra_rule_groups`, which adds to the project's `rule_groups`, rather than
+in the project's committed `.msb/sandbox.toml`: nobody who clones the project
+has that group, and in their copy it would make every create fail with
+"unknown rule group". A shipped group you redefined keeps its name everywhere,
+so it stays in the project. If an older msbctl put one of yours in the
+project, `msbctl show` warns, and `msbctl edit` → "Features & agents" moves
+it. Machine-local groups aren't part of the [policy pin](egress.md#the-policy-pin). See
 [DNS resolution is part of the rule](egress.md#dns-resolution-is-part-of-the-rule).
 
 ## Your CLAUDE.md additions
@@ -212,5 +257,7 @@ shows the whole file as that sandbox will receive it.
 ## Autostart
 
 Mark a sandbox to start whenever the picker opens:
-`msbctl edit .` → "Identity & autostart". An idle sandbox costs about 300 MB,
+`msbctl edit .` → "Identity & autostart". `msbctl start --autostart` starts
+that set from anywhere; on a host with nobody at it, `msbctl host autostart
+install` runs it at boot (see [Remote hosts](remote-hosts.md#setting-up-a-host)). An idle sandbox costs about 300 MB,
 and a running one is the only kind whose installed versions can be checked.

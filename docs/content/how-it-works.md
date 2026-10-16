@@ -14,6 +14,7 @@ description: The security model, the four configuration layers, and what is fixe
 | The agent steals an SSH key | keys never enter the VM. A per-sandbox filter in front of your agent only lists and signs, and only with the keys you picked |
 | The agent rewrites your git identity or host config | identity is set with `git config --system` *inside* the guest, never in `/work/.git/config`; your host config isn't mounted |
 | One project's sandbox reads another's transcripts or your Claude login | each sandbox has its own `~/.claude`, and the Claude credential is a placeholder too |
+| The agent edits the project's `.msb/sandbox.toml` to widen its own egress or re-aim a secret | the [policy pin](egress.md#the-policy-pin): a changed policy is shown and must be approved on the host before a rebuild applies it, and `.msb/` is read-only in the guest |
 | The central instructions get edited by the agent | `CLAUDE.md` is copied in from a read-only mount on every start |
 
 What it does **not** protect: anything the agent can reach through an allowed

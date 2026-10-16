@@ -8,9 +8,22 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- `msbctl remote add` registers another machine; `host:name` addresses a sandbox there, and `ls` and the picker show every host.
+- `msbctl host serve|authorize|check`: run a machine as a remote sandbox host whose SSH key for everyday use cannot read secrets or change policy.
+- `msbctl start --autostart` and `msbctl host autostart install` start the autostart set after a reboot, with no picker or login.
+- `ls --json`, `show --json`, `msbctl secret set … --stdin` and `msbctl setup --claude-token NAME --stdin` for scripts; no secret value is ever printed.
+- `msbctl add --repo owner/name` creates a sandbox with no host folder: the repo is cloned into a disk volume that survives rebuilds, and its policy is read from the repo's `.msb/` at a recorded commit (`msbctl policy <name> update` moves it).
+- Changes to a project's egress rules, secret bindings or resources must be approved on the host (`msbctl policy`) before a create or rebuild applies them, and `.msb/` is read-only inside the sandbox; the first rebuild after upgrading asks once.
+
 ### Changed
 - The `containers` egress group also allows `mcr.microsoft.com`, so podman in a sandbox can pull the devcontainers images. Needs a rebuild.
+- An egress group you defined yourself is written to the sandbox's registry entry (`extra_rule_groups`, added to the project's groups) instead of the committed `.msb/sandbox.toml`, where it broke every other clone; `msbctl edit` → Features & agents moves one that is already there. Needs a rebuild.
 - Sandboxes with Claude Code get `IS_SANDBOX=1` (so bypass-permissions mode is offered, including through `claude-agent-acp` in Zed), `DISABLE_BUG_COMMAND` and `DISABLE_AUTOUPDATER` on top of the telemetry and feedback opt-outs. Those now come from a new `[agent_env.claude]` table and are no longer set in sandboxes without Claude. Needs a rebuild.
+
+### Fixed
+- A project's `sandbox.toml` can no longer bind `GH_TOKEN` or a Claude token, read values from `secrets/global.env`, or switch on observe mode; store a project binding's value per sandbox with `msbctl secret add`.
+- A project's `.msb/dev.yaml` is no longer passed to msb, which let a repo mount host paths or read the bound secrets; only its `image` is read, and create refuses a file that sets more (move `env:` to `sandbox.toml`, or use the new registry-only `msb_conf`).
 
 ## [0.2.4] - 2026-10-09
 

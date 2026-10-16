@@ -41,9 +41,18 @@ identity = "{{IDENTITY}}"
 # value is read on every start, so a change needs a restart, not a rebuild.
 claude_token = "{{CLAUDE_TOKEN}}"
 
-# Started by the picker's "start autostart set" action. Each idle sandbox costs
+# Started by `msbctl start --autostart`: when the picker opens, and on a host
+# after a reboot (`msbctl host autostart install`). Each idle sandbox costs
 # ~300 MB, so this is cheap, but a stopped sandbox cannot be version-probed.
 autostart = {{AUTOSTART}}
+
+# WRITTEN BY msbctl. The digest of the project policy last approved for this
+# sandbox: the egress rules, secret bindings and resources in
+# {{PROJECT}}/.msb/sandbox.toml. That file is committed and writable from inside
+# the sandbox, so a create or rebuild that finds it changed shows the
+# difference and asks first (`msbctl policy {{NAME}}` shows it,
+# `msbctl policy {{NAME}} approve` accepts it). Without a terminal it refuses.
+policy_pin = ""
 
 # --------------------------------------------------------------- ssh keys
 #
@@ -63,6 +72,17 @@ autostart = {{AUTOSTART}}
 # project. Fixed at create time: `msbctl mount {{NAME}} ...` adds one, then
 # `msbctl rebuild {{NAME}}` applies it.
 {{MOUNTS}}
+
+# ------------------------------------------------------ this machine's groups
+#
+# Egress groups only THIS machine defines (your own, in config.toml's [rules],
+# such as one for a homelab's LAN hosts), added to the project's rule_groups.
+# Here and not in the project because nobody who clones it has them: in its
+# sandbox.toml they would make every other machine's create fail with "unknown
+# rule group". `msbctl add` and `msbctl edit {{NAME}}` → Features & agents put
+# them here. A group listed in [defaults] private_dns_groups turns on
+# allow_private_dns for this sandbox as well. Fixed at create time: rebuild.
+{{EXTRA_RULE_GROUPS}}
 
 # --------------------------------------------------------- published ports
 #
@@ -88,9 +108,19 @@ autostart = {{AUTOSTART}}
 # cpus        = 8
 # memory      = "16G"
 # root_disk   = "32G"
-# conf        = ".msb/dev.yaml"     # relative to project
+# conf        = ".msb/dev.yaml"     # relative to project, and must stay inside
+#                                   # it; read for `image:` only
 # rule_groups = ["github", "npm", "python"]
 # extra_rules = ["allow@mirror.example.com:tcp:443"]
+# msb_conf    = "~/.config/msb/conf/{{NAME}}.yaml"
+#                                   # YOUR msb config file, passed as --conf, for
+#                                   # what msbctl does not model (user, rlimits,
+#                                   # security, ...). Absolute path. Here only and
+#                                   # never in a project: msb's config can mount
+#                                   # host paths and copy host files in. It may
+#                                   # not contain `${`, which msb fills in from
+#                                   # its environment — the one holding the
+#                                   # bound secrets. Flags msbctl emits win.
 # volumes     = "old-name"          # prefix of the cache/container disk volumes;
 #                                   # `msbctl rename` sets it, since msb cannot
 #                                   # rename a volume. Defaults to the name.

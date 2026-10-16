@@ -47,12 +47,27 @@ The rules:
   644, except `bootstrap.sh` (piped into the guest, never executed). `check.sh`
   reads the git index, so `git add` after a `chmod`.
 
+## The tests
+
+`tests/` holds unit tests that need neither KVM nor `msb`: each one runs
+`msbctl`'s own `main()` in a throwaway `HOME` against a fake `msb`
+(`tests/fake/msb`), which records every call it gets, argv and the environment
+variables a test asks about, so a test can assert what reached `msb` and what
+did not (a planted token in argv, for one). `check.sh` runs them, and fails if
+none are found:
+
+```console
+$ python3 -I -m unittest discover -s tests -t .
+```
+
+A new behaviour gets a test there. The fake refuses any call it does not
+know, so teach it the new one rather than loosening it.
+
 ## Testing against a real msb
 
 `msbctl` needs `/dev/kvm` and `msb`. Use a throwaway `MSB_CONFIG_DIR` and
 `MSB_STATE_DIR`, and `msb rm -f` whatever you create. Without KVM,
-`scripts/check.sh` is what you can run, plus exercising functions against a stub
-`msb` on `PATH`.
+`scripts/check.sh` and the tests above are what you can run.
 
 ## The spikes
 

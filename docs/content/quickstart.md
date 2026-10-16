@@ -69,7 +69,7 @@ Nothing is started yet. The wizard writes three things:
 | File | What | Committed? |
 | --- | --- | --- |
 | `<project>/.msb/sandbox.toml` | the portable policy: egress groups, packages, resources | yes, if the project folder is the checkout |
-| `<project>/.msb/dev.yaml` | the `msb --conf` file: image, cpus, memory | yes, likewise |
+| `<project>/.msb/dev.yaml` | the image (read by msbctl, never passed to msb) | yes, likewise |
 | `~/.config/msb/sandboxes/<name>.toml` | the machine-local entry: host path, identity, keys, mounts | never |
 
 ### The GitHub token
