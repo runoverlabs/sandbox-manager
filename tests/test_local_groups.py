@@ -2,9 +2,8 @@
 
 import os
 import tomllib
-import unittest
+from unittest import main, mock
 
-from unittest import mock
 
 from tests.harness import MsbctlTest
 
@@ -70,4 +69,4 @@ class LocalGroupsTest(MsbctlTest):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
