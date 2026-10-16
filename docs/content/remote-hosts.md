@@ -42,7 +42,7 @@ On the host, as a dedicated user with no sudo and a 0700 home (msb needs
 $ curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh
 $ curl -fsSL https://github.com/runoverlabs/sandbox-manager/releases/latest/download/get.sh | sh
 $ msbctl host authorize "ssh-ed25519 AAAA... you@laptop"     # the laptop's everyday key
-$ msbctl host authorize --admin "sk-ssh-ed25519@openssh.com AAAA... you@laptop"   # optional
+$ msbctl host authorize "sk-ssh-ed25519@openssh.com AAAA... you@laptop" --admin   # optional
 $ msbctl host autostart install
 $ msbctl host check
 ```
