@@ -52,7 +52,8 @@ it entirely rather than splicing two host lists together, because rule order
 matters and half a group is worse than either. For a sandbox, the registry
 entry overrides the project file, which overrides your machine defaults. `[env]`
 tables *merge* across the layers, so a project adding one variable keeps the
-telemetry opt-outs.
+telemetry opt-outs (which come from `[agent_env.claude]` when the sandbox has
+Claude Code).
 
 ```console
 $ msbctl config      # every value, and which file it came from

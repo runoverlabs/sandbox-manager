@@ -125,17 +125,14 @@ identity = ""
 # of the two wins is unverified, and a telemetry switch whose effective value
 # depends on an unverified precedence is worse than one set in a single place.
 [env]
-# Telemetry, error reporting and the feedback paths, all off.
+# The Claude Code opt-outs are in [agent_env.claude] below, applied only where
+# Claude is installed. These are for every sandbox.
 #
 # This is also what keeps the egress allowlist honest: `base` contains no
 # telemetry hosts, and the reason it needs none is that the traffic is turned
-# off here. Allowing a telemetry host later would be widening the list for
-# something deliberately disabled — fix it here instead.
-DISABLE_TELEMETRY = "1"
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
-DISABLE_FEEDBACK_COMMAND = "1"
-DISABLE_ERROR_REPORTING = "1"
-CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = "1"
+# off here and there. Allowing a telemetry host later would be widening the list
+# for something deliberately disabled — fix it here instead.
+#
 # Not Claude-specific — the cross-vendor opt-out convention, honoured by a
 # number of the CLIs a sandbox is likely to grow.
 DO_NOT_TRACK = "1"
@@ -146,6 +143,35 @@ DO_NOT_TRACK = "1"
 # exits silently, so /memory appears to do nothing. nano is installed by
 # bootstrap.sh so this holds on any image. Override per project in [env].
 EDITOR = "nano"
+
+# Guest environment for a coding agent, emitted only into sandboxes that install
+# it (an agent ticked in `msbctl add`; for Claude, unless [bootstrap] claude =
+# false). Applied UNDER every [env] table, so any of them can still override a
+# key, and fixed at create time in the same way: `msbctl rebuild` to change one.
+# Your config.toml merges over this key by key, like [env].
+[agent_env.claude]
+# Telemetry, error reporting and the feedback paths, all off. NONESSENTIAL_TRAFFIC
+# alone implies most of them; each is still set by name, so none depends on
+# what the umbrella happens to imply in a given release. Turning telemetry off also turns off feature-flag
+# evaluation (GrowthBook), so DISABLE_GROWTHBOOK is not needed.
+DISABLE_TELEMETRY = "1"
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = "1"
+DISABLE_ERROR_REPORTING = "1"
+DISABLE_FEEDBACK_COMMAND = "1"
+# The older name of /feedback (/bug); still read.
+DISABLE_BUG_COMMAND = "1"
+CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY = "1"
+# `msbctl update` installs Claude Code and records the version, so a rebuild
+# reproduces it. An auto-update would drift away from that record unseen.
+DISABLE_AUTOUPDATER = "1"
+# Tells Claude Code (and claude-agent-acp, the adapter editors like Zed use)
+# that it is already inside a sandbox. It runs as root here, and both refuse
+# bypass-permissions mode (--dangerously-skip-permissions) for root unless this
+# is set. The VM is the boundary — egress allowlist, placeholder credentials —
+# so the mode is offered; it is still never on unless you pick it. To withhold
+# it, set IS_SANDBOX = "" in an [env]: the adapter treats any non-empty value,
+# "0" included, as set.
+IS_SANDBOX = "1"
 
 [versions]
 # Defaults for bootstrap.sh. A sandbox entry's [versions] table overrides these

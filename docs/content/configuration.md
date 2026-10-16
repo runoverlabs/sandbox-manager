@@ -73,9 +73,18 @@ shipped name redefined here replaces that group entirely. See
 
 ### `[env]`
 
-Environment variables every sandbox gets. The shipped set turns off telemetry,
-error reporting and feedback prompts, and sets `EDITOR = "nano"`. Projects
-merge their own over these. Fixed at create time.
+Environment variables every sandbox gets. The shipped set is `DO_NOT_TRACK = "1"`
+and `EDITOR = "nano"`. Projects merge their own over these. Fixed at create
+time.
+
+### `[agent_env.claude]`
+
+Environment variables only for sandboxes with Claude Code. The shipped set turns
+off telemetry, error reporting, feedback prompts and the auto-updater, and sets
+`IS_SANDBOX = "1"`. Claude Code runs as root in the sandbox, and without that
+setting it and `claude-agent-acp` (the adapter Zed uses) don't offer bypass-permissions mode
+(`--dangerously-skip-permissions`). Every `[env]` table, yours or a project's,
+overrides these. Fixed at create time.
 
 ### `[versions]`
 

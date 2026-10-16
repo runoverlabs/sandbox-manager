@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Changed
+- Sandboxes with Claude Code get `IS_SANDBOX=1` (so bypass-permissions mode is offered, including through `claude-agent-acp` in Zed), `DISABLE_BUG_COMMAND` and `DISABLE_AUTOUPDATER` on top of the telemetry and feedback opt-outs. Those now come from a new `[agent_env.claude]` table and are no longer set in sandboxes without Claude. Needs a rebuild.
+
 ## [0.2.4] - 2026-10-09
 
 ### Added

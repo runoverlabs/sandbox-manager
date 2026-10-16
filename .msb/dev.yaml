@@ -28,12 +28,12 @@ workdir: /work
 
 # env: project-specific variables only.
 #
-# The telemetry and feedback opt-outs are NOT here: they are machine-wide, in
-# ~/.config/msb/config.toml's [env] table, and msbctl emits them as --env for
-# every sandbox. Keep them out of this file. Setting a key in both places makes
-# its effective value depend on whether --env or --conf wins, which is
-# unverified — and an opt-out that might not apply is worse than no opt-out,
-# because it reads as settled.
+# The telemetry and feedback opt-outs are NOT here: msbctl emits them as --env
+# from the machine-wide [env] and [agent_env.claude] tables (defaults.toml,
+# overridable in ~/.config/msb/config.toml). Keep them out of this file.
+# Setting a key in both places makes its effective value depend on whether
+# --env or --conf wins, which is unverified — and an opt-out that might not
+# apply is worse than no opt-out, because it reads as settled.
 #
 # A key only this project needs goes in [env] in ./sandbox.toml, which merges
 # over the machine-wide set rather than replacing it.

@@ -899,7 +899,8 @@ class Sandbox:
         return bool(fp) and (keys is None or fp in keys)
 
     def env_vars(self):
-        """Guest environment: config.toml [env] < sandbox.toml [env] < registry.
+        """Guest environment: [agent_env.<agent>] for each agent this sandbox
+        installs < config.toml [env] < sandbox.toml [env] < registry.
 
         A MERGE, deliberately, where rule_groups is a pick. A project that adds
         one variable keeps the machine-wide set rather than silently replacing
@@ -911,7 +912,12 @@ class Sandbox:
         telemetry switch whose value depends on an unverified precedence is
         worse than one in a single place.
         """
-        merged = dict(self.config.get("env", {}))
+        merged = {}
+        # Under every [env], so a project can still override an agent's default.
+        for agent, _, _ in AGENTS:
+            if self.wants_component(agent):
+                merged.update(self.config.get("agent_env", {}).get(agent, {}))
+        merged.update(self.config.get("env", {}))
         merged.update(self.project_cfg.get("env", {}))
         merged.update(self.entry.get("env", {}))
         # TOML gives real types; msb wants KEY=value strings. `true` would
