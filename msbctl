@@ -2990,7 +2990,7 @@ def cmd_move(args, config):
     if state_of(box.name) == "absent":
         note("not created yet, so it applies at first start")
     elif args.rebuild or confirm(f"the folder is mounted at create time — rebuild {box.name} now?"):
-        cmd_rebuild(argparse.Namespace(name=box.name), config)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
         note(f"until then it still sees the old folder: `msbctl rebuild {box.name}`")
 
@@ -3411,7 +3411,7 @@ def cmd_allow(args, config):
         note(f"allowed: {rule}")
     note(f"written to {tilde(target)}")
     if args.rebuild:
-        cmd_rebuild(argparse.Namespace(name=box.name), config)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
         note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
 
@@ -3617,7 +3617,7 @@ def _observe_set(box, mode, args, config):
     # Network settings are fixed when msb creates the sandbox, so this is inert
     # until it is built again — exactly like `allow` and `mount`.
     if args.rebuild:
-        cmd_rebuild(argparse.Namespace(name=box.name), config)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
         note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
 
@@ -3917,7 +3917,7 @@ def cmd_mount(args, config):
         return
     note(f"{tilde(src)} -> {dest} ({mode}) recorded in {tilde(entry_path)}")
     if args.rebuild:
-        cmd_rebuild(argparse.Namespace(name=box.name), config)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
         note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
 
@@ -3960,7 +3960,7 @@ def cmd_port(args, config):
         return
     set_toml_key(registry_path(box), "ports", new or None)
     if args.rebuild:
-        cmd_rebuild(argparse.Namespace(name=box.name), config)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
         note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
     if add:
@@ -4400,7 +4400,7 @@ def maybe_welcome(config):
         "later             ask again next time",
         "no thanks         never ask again (`msbctl setup` still works)"], 0)
     if choice.startswith("set up"):
-        cmd_setup(argparse.Namespace(welcome=True), config)
+        cmd_setup(verb_args("setup", welcome=True), config)
         return load_config()
     if choice.startswith("no thanks"):
         mark_welcomed()
@@ -4966,8 +4966,8 @@ def _summary_resources(box):
 def section_resources(box, config, ctx):
     if state_of(box.name) != "absent":
         # Live: msb modify keeps the sandbox's state (see cmd_resize).
-        cmd_resize(argparse.Namespace(name=box.name, cpus=None, memory=None,
-                                      root_disk=None, yes=False), config)
+        cmd_resize(verb_args("resize", name=box.name, cpus=None, memory=None,
+                               root_disk=None, yes=False), config)
         return
     plan = {}
     pick_resources(plan, config, current=(int(box.cpus), str(box.memory)))
@@ -5123,7 +5123,7 @@ def _summary_keys(box):
 
 
 def section_keys(box, config, ctx):
-    cmd_keys(argparse.Namespace(name=box.name, all=False), config)
+    cmd_keys(verb_args("keys", name=box.name, all=False), config)
 
 
 def _summary_secrets(box):
@@ -5135,7 +5135,7 @@ def section_secrets(box, config, ctx):
         box = Sandbox(box.name, config)
         action = choose_one("secrets", ["add a secret", "remove a secret", "list", "back"], 0)
         if action.startswith("add"):
-            cmd_secret(argparse.Namespace(action="add", name=box.name, var=None), config)
+            cmd_secret(verb_args("secret", action="add", name=box.name, var=None), config)
         elif action.startswith("remove"):
             names = [secret_var(x) for x in box.secret_binds]
             if not names:
@@ -5143,9 +5143,9 @@ def section_secrets(box, config, ctx):
                 continue
             var = choose_one("remove which", names + ["cancel"], 0)
             if var != "cancel":
-                cmd_secret(argparse.Namespace(action="rm", name=box.name, var=var), config)
+                cmd_secret(verb_args("secret", action="rm", name=box.name, var=var), config)
         elif action == "list":
-            cmd_secret(argparse.Namespace(action="ls", name=box.name, var=None), config)
+            cmd_secret(verb_args("secret", action="ls", name=box.name, var=None), config)
         else:
             return
 
@@ -5489,7 +5489,7 @@ def cmd_edit(args, config):
     why = ", ".join(sorted(ctx["rebuild"])) or "the files you edited by hand"
     note(f"These only take effect when the sandbox is created: {why}.")
     if confirm(f"rebuild {name} now?"):
-        cmd_rebuild(argparse.Namespace(name=name), config)
+        cmd_rebuild(verb_args("rebuild", name=name), config)
     else:
         note(f"later: msbctl rebuild {name}")
 
@@ -8179,7 +8179,7 @@ def write_sidebar(path, config):
     with open(path, "w", encoding="utf-8") as fh:
         stdout, sys.stdout = sys.stdout, fh
         try:
-            cmd_status(argparse.Namespace(quick=False), config)
+            cmd_status(verb_args("status", quick=False), config)
         finally:
             sys.stdout = stdout
 
@@ -8203,7 +8203,7 @@ def cmd_menu(args, config):
         else:
             # Same actions, no dependency. The sidebar prints above the list
             # instead of beside it.
-            cmd_status(argparse.Namespace(quick=True), config)
+            cmd_status(verb_args("status", quick=True), config)
             say("msbctl")
             note(f"{len(names)} registered, {running} running" if names
                  else "nothing registered yet — start with 1")
@@ -8226,7 +8226,7 @@ def cmd_menu(args, config):
             # Its own try: a cancelled or failed wizard should return to the
             # menu, not take the whole program down with it.
             try:
-                cmd_add(argparse.Namespace(dir=None), config)
+                cmd_add(verb_args("add", dir=None), config)
             except SystemExit as exc:
                 if exc.code:
                     warn(str(exc.code).replace("msbctl: ", "", 1))
@@ -8242,7 +8242,7 @@ def cmd_menu(args, config):
                 subprocess.run([picker])
         elif choice == "config":
             try:
-                cmd_setup(argparse.Namespace(welcome=False), config)
+                cmd_setup(verb_args("setup", welcome=False), config)
             except SystemExit as exc:
                 if exc.code:
                     warn(str(exc.code).replace("msbctl: ", "", 1))
@@ -8259,7 +8259,7 @@ def cmd_menu(args, config):
             edit_file(PROFILE_LOCAL)
             note("appended to msb-manager's own text and copied into every sandbox on its next start.")
         elif choice == "refresh":
-            cmd_ls(argparse.Namespace(refresh=True, porcelain=False, picker=False), config)
+            cmd_ls(verb_args("ls", refresh=True, porcelain=False, picker=False), config)
         else:
             note(f"not an option: {choice}")
 
@@ -8293,6 +8293,28 @@ def preflight(args):
         die("msb is not on PATH")
     if not os.path.exists("/dev/kvm"):
         die("no /dev/kvm — msbctl runs on the host, not inside a container")
+
+
+def verb_args(verb, **values):
+    """The arguments `msbctl <verb>` parses to with every option at its
+    default, then `values`. For calling a cmd_* handler from inside msbctl: a
+    hand-built Namespace misses whatever option is added to the verb later,
+    and the handler dies on it (the menu's "add" did, when --repo arrived)."""
+    sub = next(a for a in build_parser()._actions
+               if isinstance(a, argparse._SubParsersAction)).choices[verb]
+    args = argparse.Namespace(**sub._defaults)
+    for action in sub._actions:
+        if action.dest is not argparse.SUPPRESS and action.default is not argparse.SUPPRESS:
+            setattr(args, action.dest, action.default)
+    if "name" in values and hasattr(args, "names"):
+        # A verb taking several names gets one at a time, as main() hands them.
+        args.names = [values["name"]]
+        args.name = None
+    for key, value in values.items():
+        if not hasattr(args, key):
+            raise TypeError(f"msbctl {verb} has no {key!r}")
+        setattr(args, key, value)
+    return args
 
 
 def build_parser():

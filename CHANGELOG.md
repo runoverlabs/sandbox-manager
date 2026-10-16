@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Fixed
+- Bare `msbctl` → "register a new project" crashed with `AttributeError: 'Namespace' object has no attribute 'repo'`, and "refresh version info" likewise.
+
 ## [0.3.0] - 2026-10-16
 
 ### Added
