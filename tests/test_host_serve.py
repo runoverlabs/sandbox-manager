@@ -1,8 +1,7 @@
 """host serve, the forced command: which commands a laptop's key may run."""
 
 import os
-import unittest
-from unittest import mock
+from unittest import main, mock
 
 from tests.harness import MsbctlTest
 
@@ -206,4 +205,4 @@ class AutostartTest(MsbctlTest):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
