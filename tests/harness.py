@@ -17,9 +17,8 @@ import re
 import shutil
 import sys
 import tempfile
-import unittest
+from unittest import TestCase, mock
 import urllib.error
-from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MSBCTL = os.path.join(ROOT, "msbctl")
@@ -40,7 +39,7 @@ def _no_network(*_args, **_kwargs):
     raise urllib.error.URLError("the network is off in tests")
 
 
-class MsbctlTest(unittest.TestCase):
+class MsbctlTest(TestCase):
     """setUp gives each test its own HOME and its own msbctl module (self.m)."""
 
     env_keys = ()          # variables the fake msb records, per test class
