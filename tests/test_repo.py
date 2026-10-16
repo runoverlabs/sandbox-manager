@@ -4,8 +4,7 @@ import base64
 import json
 import os
 import shutil
-import unittest
-from unittest import mock
+from unittest import main, mock
 
 from tests.harness import MsbctlTest, repo_image
 
@@ -234,4 +233,4 @@ class RepoTest(MsbctlTest):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()

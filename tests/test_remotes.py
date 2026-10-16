@@ -3,8 +3,7 @@
 import json
 import os
 import subprocess
-import unittest
-from unittest import mock
+from unittest import main, mock
 
 from tests.harness import MsbctlTest
 
@@ -40,7 +39,7 @@ class RemoteTest(MsbctlTest):
                 code, out, err = self.run_main(*argv, stdin=stdin)
             except Exec:
                 return seen["argv"]
-        self.fail(f"no exec: {code} {err}")
+        raise self.failureException(f"no exec: {code} {err}")
 
     def ssh_answers(self, answer):
         """subprocess.run, with every ssh call answered by `answer(argv)`."""
@@ -201,4 +200,4 @@ class NoRemotesTest(MsbctlTest):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    main()
