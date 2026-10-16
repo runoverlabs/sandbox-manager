@@ -41,7 +41,8 @@ identity = "{{IDENTITY}}"
 # value is read on every start, so a change needs a restart, not a rebuild.
 claude_token = "{{CLAUDE_TOKEN}}"
 
-# Started by the picker's "start autostart set" action. Each idle sandbox costs
+# Started by `msbctl start --autostart`: when the picker opens, and on a host
+# after a reboot (`msbctl host autostart install`). Each idle sandbox costs
 # ~300 MB, so this is cheap, but a stopped sandbox cannot be version-probed.
 autostart = {{AUTOSTART}}
 

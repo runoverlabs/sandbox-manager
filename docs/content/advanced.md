@@ -247,5 +247,7 @@ shows the whole file as that sandbox will receive it.
 ## Autostart
 
 Mark a sandbox to start whenever the picker opens:
-`msbctl edit .` → "Identity & autostart". An idle sandbox costs about 300 MB,
+`msbctl edit .` → "Identity & autostart". `msbctl start --autostart` starts
+that set from anywhere; on a host with nobody at it, `msbctl host autostart
+install` runs it at boot (see [Remote hosts](remote-hosts.md#setting-up-a-host)). An idle sandbox costs about 300 MB,
 and a running one is the only kind whose installed versions can be checked.

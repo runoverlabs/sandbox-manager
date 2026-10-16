@@ -106,10 +106,13 @@ terminal editor.
 
 ```text
 msbctl start [name…]
+msbctl start --autostart
 ```
 
 Start a stopped sandbox, or create it if it doesn't exist yet. Creating runs
-the bootstrap, once.
+the bootstrap, once. `--autostart` starts every sandbox whose registry entry
+says `autostart = true` and isn't running; the picker runs it when it opens,
+and so does the unit [`msbctl host autostart install`](#msbctl-host) writes.
 
 ### `msbctl stop`
 
@@ -373,6 +376,26 @@ msbctl self-update [--version vX.Y.Z]
 
 Upgrade a packaged install to the latest release, or a given one, verifying it
 the same way the installer does. In a git checkout it tells you to `git pull`.
+
+## Remote hosts
+
+### `msbctl host`
+
+```text
+msbctl host serve
+msbctl host authorize "PUBLIC KEY LINE" [--admin]
+msbctl host check [--json]
+msbctl host autostart install
+```
+
+For running this machine as a [remote host](remote-hosts.md). `serve` is the
+forced command a laptop's key runs: it reads `SSH_ORIGINAL_COMMAND`, refuses
+anything outside [its allowlist](remote-hosts.md#what-the-restricted-key-may-run)
+with exit status 126, and runs the rest with `MSB_RESTRICTED=1`. `authorize`
+adds a key to `~/.ssh/authorized_keys` with that forced command, or with
+`--admin` without one. `check` reports the host's hygiene, as heuristics.
+`autostart install` writes and enables a systemd user unit that runs `msbctl
+start --autostart` at boot. Under `host serve`, only `check` is allowed.
 
 ## Environment variables
 

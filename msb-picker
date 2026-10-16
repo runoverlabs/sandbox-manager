@@ -51,20 +51,11 @@ fi
 # are current by the time it appears. Each idle sandbox costs ~300 MB and a
 # stopped one cannot be version-probed, which is the whole reason the flag
 # exists.
+# `msbctl start --autostart` is the one implementation, shared with the systemd
+# unit `msbctl host autostart install` writes for a host with nobody at it.
 if [ "${MSB_NO_AUTOSTART:-0}" != 1 ]; then
-	# mapfile, not a `while read` fed by a pipe: the loop body backgrounds a
-	# job per sandbox, and in a pipeline that body runs in a subshell where the
-	# parent's `wait` cannot see those jobs. They would then race the first
-	# `msbctl show` in the preview pane.
-	mapfile -t to_start < <(
-		$LIST 2>/dev/null | awk -F'\t' '$5 == "yes" && $2 != "running" {print $1}'
-	)
-	for name in "${to_start[@]}"; do
-		[ -n "$name" ] || continue
-		printf '  starting %s …\n' "$name"
-		"$MSBCTL" start "$name" >/dev/null 2>&1 &
-	done
-	wait
+	printf '  starting the autostart set …\n'
+	"$MSBCTL" start --autostart >/dev/null 2>&1
 fi
 
 HEADER=$(cat <<-'EOF'

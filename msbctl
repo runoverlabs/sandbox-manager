@@ -7,6 +7,7 @@
     msbctl ls [--refresh]         one line per sandbox
     msbctl show <name>            everything about one, including versions
     msbctl start|stop <name>…         repeatable: acts on each in turn
+    msbctl start --autostart      every sandbox marked autostart that is not running
     msbctl rebuild <name>         destroy and recreate; keeps ~/.claude state
     msbctl purge <name>           destroy, delete state, secret and registration
     msbctl rename <name> <new>    new name; recreates it, everything else moves along
@@ -29,6 +30,7 @@
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
     msbctl code <name>            open the editor on the project, on the host
     msbctl reclaim <name>         give the guest's page cache back to the host
+    msbctl host serve|authorize|check|autostart   run this machine as a remote host
 
 Inside a registered project folder the name can be left out where it is the
 only argument (`msbctl shell`, `msbctl stop`), and `.` stands for it where more
@@ -59,12 +61,14 @@ import base64
 import contextlib
 import datetime as dt
 import hashlib
+import io
 import ipaddress
 import json
 import os
 import pydoc
 import re
 import select
+import shlex
 import shutil
 import signal
 import socket
@@ -7124,6 +7128,15 @@ def cmd_add_repo(args, config):
         note(f"image        {image or defaults.get('image', '?') + '  (the default)'}")
         if not os.path.isfile(os.path.join(tmp, ".msb", "sandbox.toml")):
             note("(no .msb/sandbox.toml in the repo: the machine's defaults apply)")
+        if restricted():
+            # Under host serve the caller is the laptop, which may name any repo:
+            # its policy must not bind a variable that already has a value here
+            # (a fresh name has none, so ordinary use never meets this).
+            own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env"))
+            stored = [secret_var(sp) for sp in cfg.get("secret_binds", []) if secret_var(sp) in own]
+            if stored:
+                die(f"{repo}'s policy binds {', '.join(stored)}, which already has a value stored "
+                    f"for {name} — refused here; add it on the host")
         if meta["private"] and not token:
             warn(f"{repo} is private and there is no token for {name}: the clone will fail "
                  f"until `msbctl secret set {name} GH_TOKEN`")
@@ -7187,6 +7200,379 @@ def capture_token(name):
     set_env_file_value(path, "GH_TOKEN", token)
     note(f"stored in {tilde(path)} (0600)")
     return True
+
+
+# ------------------------------------------------------------- a remote host
+#
+# A remote host is an ordinary install, driven over ssh: `ssh host msbctl ...`.
+# The laptop is the adversary in this design (code run as the operator there:
+# an agent outside any sandbox, a compromised dependency), so the key it uses
+# every day must not be able to READ a stored secret or RE-AIM one at a host of
+# its choosing — and a plain shell does both (`cat secrets/global.env`). So
+# that key gets a forced command, `msbctl host serve`, which runs msbctl verbs
+# only, from an allowlist that looks at the arguments too, and with
+# MSB_RESTRICTED=1 so nothing it runs approves a policy change by prompting:
+# behind a pty, code on the laptop can answer a prompt as easily as you can.
+# Policy changes are made on the host itself, or with a second key the laptop's
+# agent does not hold (a FIDO2 `sk-` key). `msbctl host authorize` writes both
+# kinds of authorized_keys line. Hardening, not a permission system: the table
+# below is the whole of it, and is meant to be read in one sitting.
+
+HOST_EXIT_REFUSED = 126
+
+# What `msb exec` accepts (msb 0.7.7, crates/cli/lib/commands/exec.rs). Every
+# one acts inside the guest. Anything else is refused until it has been read:
+# a future msb flag must not pass unreviewed.
+MSB_EXEC_VALUE_FLAGS = ("-e", "--env", "-w", "--workdir", "-u", "--user", "--timeout", "--rlimit")
+MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream")
+
+
+def _msb_flags_problem(flags):
+    i = 0
+    while i < len(flags):
+        flag = flags[i]
+        name = flag.split("=", 1)[0] if flag.startswith("--") else flag
+        if name in MSB_EXEC_BARE_FLAGS and "=" not in flag:
+            i += 1
+        elif name in MSB_EXEC_VALUE_FLAGS:
+            if "=" not in flag:
+                if i + 1 >= len(flags):
+                    return f"{flag} needs a value"
+                i += 1
+            i += 1
+        else:
+            return f"msb exec flag {flag!r} is not one host serve passes on"
+    return None
+
+
+def restricted_problem(argv):
+    """None if `msbctl <argv>` may run under `host serve`, else the reason.
+    Each refusal says what it would let a compromised laptop do."""
+    if argv in (["--version"], ["-V"]):
+        return None
+    try:
+        split, flags = split_cli(argv)
+    except (ValueError, IndexError):
+        return "the command line does not parse"
+    problem = _msb_flags_problem(flags)
+    if problem:
+        return problem
+    try:
+        with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+            args = build_parser().parse_args(split)
+    except SystemExit as exc:
+        # -h prints help and exits 0: harmless, and the child prints it again.
+        return None if exc.code == 0 and ("-h" in split or "--help" in split) else \
+            "the command line does not parse"
+    func = args.func
+    names = list(getattr(args, "names", None) or [])
+    if hasattr(args, "name"):
+        names.append(args.name)
+    elif hasattr(args, "names") and not names and not getattr(args, "autostart", False):
+        names = [None]                  # omitted: the folder's sandbox
+    for name in names:
+        # `.` and an omitted name mean "the folder I am in", which on the host
+        # is nothing the caller chose; a path-like name is never a sandbox.
+        if name is None:
+            return "name the sandbox: the host's current folder means nothing to the caller"
+        if not SANDBOX_NAME.fullmatch(name):
+            return f"{name!r} is not a sandbox name"
+    if func is cmd_rename and not SANDBOX_NAME.fullmatch(args.new):
+        return f"{args.new!r} is not a sandbox name"
+
+    # Allowed as they are: they read, start, stop, or act inside a sandbox, and
+    # anything among them that would apply a changed policy (create, rebuild,
+    # rename) refuses under MSB_RESTRICTED. `purge` destroys unpushed work and
+    # leaks nothing, so it is outside the threat as stated.
+    plain = (cmd_ls, cmd_status, cmd_show, cmd_config, cmd_start, cmd_stop, cmd_reclaim,
+             cmd_shell, cmd_exec, cmd_update, cmd_resize, cmd_rebuild, cmd_purge, cmd_rename)
+    if func in plain:
+        return None
+    if func is cmd_self_update:
+        # Only forward: the latest release is how a remote gets upgraded without
+        # the admin key; --version is the way DOWN, to a weaker host serve.
+        return "self-update --version can downgrade host serve itself" if args.version else None
+    if func is cmd_cache:
+        return None if args.action in ("ls", "clear") else "cache: only ls and clear"
+    if func is cmd_observe:
+        # `on` lifts deny-by-default: everything the guest reads it could send.
+        return None if args.action in ("report", "off") else \
+            "observe on turns off egress filtering"
+    if func is cmd_secret:
+        # `add` binds a variable to a host, which decides where a stored value
+        # is sent. Storing a value (`set`) is not reading one.
+        return None if args.action in ("ls", "set", "rm") else \
+            "secret add binds a stored value to a host"
+    if func is cmd_setup:
+        # The menu edits identities, egress groups and defaults. Storing a
+        # Claude token is how one reaches the host at all.
+        return None if args.claude_token and args.stdin and not args.welcome else \
+            "setup: only --claude-token NAME --stdin"
+    if func is cmd_add:
+        # A folder `add` mounts a host path of the caller's choosing.
+        return None if args.repo else "add: only --repo (a folder add mounts a host path)"
+    if func is cmd_policy:
+        return None if args.action == "show" else f"policy {args.action} changes what is approved"
+    if func is cmd_host:
+        return None if args.action == "check" else f"host {args.action} is for the host itself"
+    # allow: a new egress rule. mount: a host path. port: a host port. keys:
+    # which of the host's ssh keys a sandbox may sign with. code: runs an
+    # editor on the host. move/entry/edit: rewrite the registry and the policy.
+    # _agent-filter: the host's ssh-agent. The menu: all of the above.
+    return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
+
+
+def host_serve():
+    """The forced command: validate SSH_ORIGINAL_COMMAND and run it, restricted."""
+    def refuse(reason):
+        print(f"msbctl host serve: refused: {reason}", file=sys.stderr)
+        sys.exit(HOST_EXIT_REFUSED)
+
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND")
+    if raw is None:
+        # Also what an interactive login with this key gets: there is no shell.
+        refuse("this key runs msbctl commands only and gets no shell "
+               "(`ssh host msbctl ls`); see `msbctl host authorize`")
+
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        refuse("the command does not parse as shell words")
+    if not argv or argv[0] != "msbctl":
+        refuse("only msbctl commands")
+    argv = argv[1:]
+    problem = restricted_problem(argv)
+    if problem:
+        refuse(problem)
+    os.environ["MSB_RESTRICTED"] = "1"
+    # sshd runs a forced command with its own minimal PATH, so an msb in
+    # ~/.local/bin (where get.sh puts it) would not be found by any verb.
+    here = os.path.dirname(os.path.realpath(__file__))
+    os.environ["PATH"] = os.pathsep.join(
+        [os.path.join(HOME, ".local", "bin"), here, os.environ.get("PATH", "")])
+    me = os.path.realpath(__file__)
+    os.execv(sys.executable, [sys.executable, me, *argv])
+
+
+def authorized_keys_path():
+    return os.path.join(SSH_DIR, "authorized_keys")
+
+
+def host_authorize(args):
+    parsed = _parse_pub_line(args.arg or "")
+    if not parsed or "\n" in args.arg:
+        die("give one public key line, in quotes: \"ssh-ed25519 AAAA... comment\"")
+    _, ktype, comment = parsed
+    blob = args.arg.split()[1]
+    comment = re.sub(r"[^\w@.: ()+-]", "", comment)    # it lands on an options-bearing line
+    path = authorized_keys_path()
+    os.makedirs(SSH_DIR, mode=0o700, exist_ok=True)
+    os.chmod(SSH_DIR, 0o700)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except FileNotFoundError:
+        text = ""
+    existing = text.splitlines()
+    for line in existing:
+        if blob in line.split():
+            die(f"that key is already in {tilde(path)}:\n  {line}\nedit the file by hand to change it")
+    if args.admin:
+        if not ktype.startswith("sk-"):
+            warn("a plain key as the admin key: if the laptop's ssh-agent holds it, the")
+            warn("code this host is guarded against can use it without asking. A FIDO2")
+            warn("`sk-` key (or one loaded with `ssh-add -c`) needs a touch or a yes.")
+            if not confirm("authorize it unrestricted anyway?"):
+                die("cancelled — nothing written")
+        line = f"{ktype} {blob} {comment}".rstrip()
+    else:
+        # As found on PATH, not resolved: a packaged install's `current` link
+        # moves on self-update, and the line must follow it.
+        me = shutil.which("msbctl")
+        if not me:
+            me = os.path.realpath(__file__)
+            warn(f"msbctl is not on PATH; the line names {me}, which an upgrade may move")
+        line = f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}'.rstrip()
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as fh:
+        fh.write(("" if not text or text.endswith("\n") else "\n") + line + "\n")
+    os.chmod(path, 0o600)
+    note(f"added to {tilde(path)}:")
+    note(f"  {line}")
+    if not args.admin:
+        note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
+
+
+def _check(name, ok, detail):
+    return {"check": name, "ok": ok, "detail": detail}
+
+
+def host_checks():
+    """The hygiene report. Heuristics, each labelled as such: none of these can
+    prove the host is safe, only point at what plainly is not."""
+    out = []
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+    try:
+        import grp
+        groups = {grp.getgrgid(g).gr_name for g in os.getgroups()}
+    except (ImportError, KeyError):
+        groups = set()
+    admin = sorted(groups & {"sudo", "wheel", "admin"})
+    out.append(_check("user", os.getuid() != 0 and not admin,
+                      f"{user}, uid {os.getuid()}" + (f", in {', '.join(admin)} (can become root)"
+                                                     if admin else "") +
+                      (" — root" if os.getuid() == 0 else "")))
+    home_mode = os.stat(HOME).st_mode & 0o777
+    out.append(_check("home", home_mode & 0o077 == 0, f"{tilde(HOME)} is {home_mode:04o}"))
+    if os.path.isdir(SECRETS_DIR):
+        loose = [f for f in sorted(os.listdir(SECRETS_DIR))
+                 if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077]
+        dmode = os.stat(SECRETS_DIR).st_mode & 0o777
+        out.append(_check("secrets", dmode == 0o700 and not loose,
+                          f"{tilde(SECRETS_DIR)} {dmode:04o}" +
+                          (f"; not 0600: {', '.join(loose)}" if loose else ", every file 0600")))
+    else:
+        out.append(_check("secrets", True, "no secrets stored yet"))
+
+    def read(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return fh.read().strip()
+        except OSError:
+            return None
+    dumpable = read("/proc/sys/fs/suid_dumpable")
+    out.append(_check("core dumps", dumpable == "0", f"fs.suid_dumpable = {dumpable}"))
+    pattern = read("/proc/sys/kernel/core_pattern") or ""
+    out.append(_check("core pattern", None if pattern.startswith("|") else True,
+                      pattern + (" (a pipe: dumps may land on disk unless its Storage=none)"
+                                 if pattern.startswith("|") else "")))
+    swaps = [line.split()[0] for line in (read("/proc/swaps") or "").splitlines()[1:] if line.split()]
+    # zram is compressed memory, not a disk; anything else must sit on dm-crypt.
+    plain = [sw for sw in swaps if not sw.startswith("/dev/zram") and not _on_dm_crypt(sw)]
+    out.append(_check("swap", not plain, "none" if not swaps else
+                      f"{', '.join(swaps)}" + (f" — not encrypted: {', '.join(plain)}" if plain
+                                              else " (in memory, or on dm-crypt)")))
+    mounts = [line.split()[:2] for line in (read("/proc/mounts") or "").splitlines() if line.split()]
+    best = max((m for m in mounts if HOME == m[1] or HOME.startswith(m[1].rstrip("/") + "/")),
+               key=lambda m: len(m[1]), default=None)
+    crypt = best is not None and _on_dm_crypt(best[0])
+    out.append(_check("disk", crypt, f"{tilde(HOME)} is on {best[0] if best else '?'}"
+                      f" ({best[1] if best else '?'}): "
+                      + ("dm-crypt found below it" if crypt else
+                         "no dm-crypt found below it — is the disk encrypted some other way?")))
+    keys = []
+    for line in (read(authorized_keys_path()) or "").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            keys.append(line)
+    open_keys = [line for line in keys if "host serve" not in line
+                 and not any(part.startswith("sk-") for part in line.split()[:3])]
+    out.append(_check("authorized_keys", not open_keys,
+                      f"{len(keys)} key(s); " + (f"{len(open_keys)} can get a shell and are not sk- keys"
+                                                 if open_keys else "each is host serve or an sk- key")))
+    out.append(_check("restricted", None, "yes: this key runs under host serve"
+                      if restricted() else "no: this session is unrestricted"))
+    linger = os.path.exists(f"/var/lib/systemd/linger/{user}")
+    unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
+    out.append(_check("autostart", linger and unit,
+                      f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
+                      f"{'enabled' if unit else 'not enabled'} (`msbctl host autostart install`)"))
+    msb = shutil.which("msb")
+    version = run(["msb", "--version"], capture=True, check=False).stdout.strip() if msb else ""
+    out.append(_check("msb", bool(msb) and os.path.exists("/dev/kvm"),
+                      f"{version or 'not found'}{' at ' + msb if msb else ''}, "
+                      f"/dev/kvm {'present' if os.path.exists('/dev/kvm') else 'MISSING'}"))
+    out.append(_check("msbctl", True, version_string()))
+    return out
+
+
+def _on_dm_crypt(device):
+    """Whether a block device is, or sits on, a dm-crypt (LUKS) mapping: its
+    device-mapper chain, walked through /sys, has a CRYPT- uuid. LVM alone is
+    device-mapper too and encrypts nothing, so the name is not enough."""
+    try:
+        start = os.path.basename(os.path.realpath(device))
+    except OSError:
+        return False
+    seen, todo = set(), [start]
+    while todo:
+        dev = todo.pop()
+        if dev in seen:
+            continue
+        seen.add(dev)
+        try:
+            with open(f"/sys/class/block/{dev}/dm/uuid", encoding="utf-8") as fh:
+                if fh.read().startswith("CRYPT-"):
+                    return True
+        except OSError:
+            pass  # not a device-mapper device
+        try:
+            todo += os.listdir(f"/sys/class/block/{dev}/slaves")
+        except OSError:
+            pass  # a leaf: nothing below it
+    return False
+
+
+def host_check(args):
+    checks = host_checks()
+    if args.json:
+        print_json({"msbctl": version_string(), "restricted": restricted(), "checks": checks})
+        return
+    say("Host check (heuristics: they point at what is plainly wrong, and prove nothing)")
+    for c in checks:
+        mark = {True: "ok  ", False: "WARN", None: "info"}[c["ok"]]
+        note(f"{mark}  {c['check']:<16} {c['detail']}")
+
+
+SYSTEMD_USER_DIR = os.path.join(HOME, ".config", "systemd", "user")
+AUTOSTART_UNIT = "msb-autostart.service"
+
+
+def host_autostart(args):
+    if args.arg != "install":
+        die("host autostart: the only action is `install`")
+    me = shutil.which("msbctl") or os.path.realpath(__file__)
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    path = os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(f"""# Written by `msbctl host autostart install`. Starts every sandbox whose
+# registry entry says autostart = true, after a reboot, with nobody logged in
+# (that part needs `loginctl enable-linger`, once, as root).
+[Unit]
+Description=Start the msb-manager autostart sandboxes
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH={os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin
+ExecStart={me} start --autostart
+
+[Install]
+WantedBy=default.target
+""")
+    note(f"wrote {tilde(path)}")
+    if shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        run(["systemctl", "--user", "enable", AUTOSTART_UNIT], check=False)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
+    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
+        note("a user unit runs with nobody logged in only with lingering on; once, as root:")
+        note(f"  loginctl enable-linger {user}")
+
+
+def cmd_host(args, config):
+    """host serve|authorize|check|autostart — running this machine as a remote."""
+    if args.action == "serve":
+        host_serve()
+    elif restricted() and args.action != "check":
+        die(f"host {args.action} is for the host itself")
+    elif args.action == "authorize":
+        host_authorize(args)
+    elif args.action == "check":
+        host_check(args)
+    elif args.action == "autostart":
+        host_autostart(args)
 
 
 # ----------------------------------------------------------------------- main
@@ -7463,13 +7849,19 @@ def preflight(args):
     """
     if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
         return
+    # `host check` reports a missing msb or /dev/kvm itself; the other host
+    # verbs need neither (serve re-runs msbctl, which checks then).
+    if args.func is cmd_host:
+        return
     if not shutil.which("msb"):
         die("msb is not on PATH")
     if not os.path.exists("/dev/kvm"):
         die("no /dev/kvm — msbctl runs on the host, not inside a container")
 
 
-def main():
+def build_parser():
+    """The whole command line. One function, so `host serve` validates a
+    command with exactly the parser that will then run it."""
     parser = argparse.ArgumentParser(
         prog="msbctl", description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -7526,6 +7918,9 @@ def main():
     ):
         p = sub.add_parser(verb, help=helptext)
         p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
+        if verb == "start":
+            p.add_argument("--autostart", action="store_true",
+                           help="no names: every sandbox whose entry says autostart = true")
         p.set_defaults(func=func)
 
     # Single-name on purpose: each of these hands the terminal to one thing.
@@ -7649,6 +8044,15 @@ def main():
                    help="remove the restriction: every host key")
     p.set_defaults(func=cmd_keys)
 
+    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart")
+    p.add_argument("action", choices=["serve", "authorize", "check", "autostart"])
+    p.add_argument("arg", nargs="?", metavar="KEY|install",
+                   help="authorize: one public key line, quoted; autostart: install")
+    p.add_argument("--admin", action="store_true",
+                   help="authorize: no forced command (use a FIDO2 sk- key)")
+    p.add_argument("--json", action="store_true", help="check: one JSON document")
+    p.set_defaults(func=cmd_host)
+
     p = sub.add_parser("_agent-filter", help=argparse.SUPPRESS)
     p.add_argument("name")
     p.set_defaults(func=cmd_agent_filter)
@@ -7667,18 +8071,30 @@ def main():
                    help="claude (default), gh, gitleaks, bun, apt")
     p.set_defaults(func=cmd_update)
 
-    argv = sys.argv[1:]
-    # msb's own flags for `exec`/`shell` are taken out before argparse, which
-    # would otherwise reject them or take a flag's value for the name; this
-    # also turns `msbctl exec -- cmd` into `exec . -- cmd`.
+    return parser
+
+
+def split_cli(argv):
+    """(argv for argparse, msb exec flags). msb's own flags for `exec`/`shell`
+    are taken out before argparse, which would otherwise reject them or take a
+    flag's value for the name; this also turns `msbctl exec -- cmd` into
+    `exec . -- cmd`."""
     verb = next((i for i, a in enumerate(argv) if not a.startswith("-")), None)
-    msb_flags = []
     if verb is not None and argv[verb] in ("exec", "shell"):
-        argv, msb_flags = split_msb_flags(argv, verb)
-    args = parser.parse_args(argv)
+        return split_msb_flags(argv, verb)
+    return argv, []
+
+
+def parse_cli(argv, parser=None):
+    argv, msb_flags = split_cli(argv)
+    args = (parser or build_parser()).parse_args(argv)
     if msb_flags:
         args.msb_flags = msb_flags
+    return args
 
+
+def main():
+    args = parse_cli(sys.argv[1:])
     preflight(args)
 
     try:
@@ -7688,7 +8104,19 @@ def main():
             if args.func not in (cmd_setup, cmd_self_update):   # these can still work with a broken config.toml
                 raise
             config = None
-        if args.func is not cmd_agent_filter:
+        if getattr(args, "autostart", False):
+            if args.names:
+                die("start --autostart takes no names")
+            # The autostart set: each one not already running. The same loop as
+            # named starts, so one broken entry does not stop the rest.
+            table = msb_table()
+            args.names = [n for n in registered()
+                          if read_toml(registry_path_for(n)).get("autostart") is True
+                          and state_of(n, table) != "running"]
+            if not args.names:
+                note("nothing in the autostart set needs starting")
+                return
+        elif args.func is not cmd_agent_filter:
             if hasattr(args, "name"):
                 args.name = resolve_here(args.name)
             if hasattr(args, "names"):
