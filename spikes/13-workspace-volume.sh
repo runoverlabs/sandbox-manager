@@ -18,8 +18,11 @@
 #      meaningful for a private repo; a public one is reported INCONCLUSIVE
 #
 # Observed 2026-10-16 on msb 0.7.6, nested in a sandbox with a public repo: 1 no
-# lost+found; 2 the clone works; 3 PASS. The placeholder half of 2 and the
-# denied half 4 need a real host and a private repo, and are still to be run.
+# lost+found; 2 the clone works; 3 PASS. Then the same day on a real host with
+# a private repo: PASS throughout — 1 no lost+found; 2 the guest's GH_TOKEN is
+# the placeholder and the clone works; 3 PASS; 4 the fetch fails without the
+# binding. (Nested, the placeholder half of 2 is INCONCLUSIVE: there the host's
+# GH_TOKEN is itself a placeholder.)
 #
 # Needs: /dev/kvm, msb, GH_TOKEN (a token that can read SPIKE_REPO), SPIKE_REPO
 # (owner/name, ideally PRIVATE). No defaults on purpose. IMAGE defaults to
