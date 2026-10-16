@@ -21,7 +21,7 @@ writes are the long-form documentation of every key; this page is the map.
 | `~/.config/msb/secrets/global.env` | the Claude token, and an optional `GH_TOKEN` for version checks (0600) |
 | `~/.config/msb/secrets/<name>.env` | that sandbox's tokens (0600) |
 | `<project>/.msb/sandbox.toml` | the project's portable policy |
-| `<project>/.msb/dev.yaml` | the file passed to `msb --conf`: image, cpus, memory |
+| `<project>/.msb/dev.yaml` | the image, and nothing else; read by msbctl, never passed to msb |
 | `~/.local/state/msb/claude/<name>/` | that sandbox's `~/.claude` |
 | `~/.local/state/msb/profile/` | the assembled `CLAUDE.md`, mounted read-only |
 | `~/.local/state/msb/agent/` | the SSH-agent filters' sockets and logs |
@@ -139,6 +139,30 @@ name, so it's safe to commit.
 | `containers_storage` | `"fuse-overlayfs"` for podman without a container disk |
 | `script` | a project script run last, inside the guest, from the project folder |
 
+## .msb/dev.yaml
+
+One line msbctl reads: `image:`, which must be an image reference
+(`registry/name:tag@sha256:…`); a path is refused. The file is **never passed
+to msb**. msb's own config file can mount host paths, copy host files into the
+guest and fill in `${VAR}` from msb's environment, which holds the bound
+secrets, and the project folder is writable from inside the sandbox. So a
+create or rebuild refuses a `dev.yaml` that sets anything else. The `cpus`,
+`memory` and `workdir` keys older versions wrote are accepted and ignored.
+`msbctl show` warns about a file a rebuild would refuse; a sandbox that already
+exists keeps starting.
+
+| A `dev.yaml` with | moves to |
+| --- | --- |
+| `env:` | `[env]` in `.msb/sandbox.toml` |
+| `cpus:`, `memory:` | `.msb/sandbox.toml` |
+| `mounts:`, `ports:` | `msbctl mount`, `msbctl port` (the registry entry) |
+| anything else | a file of your own, named by `msb_conf` in the registry entry |
+
+`msb_conf` is the operator's escape hatch for msb features msbctl doesn't model
+(`user`, `rlimits`, `security`, …). It lives in the registry entry only, must
+be an absolute path, and may not contain `${`. The flags msbctl emits win over
+it.
+
 ## The registry entry
 
 `~/.config/msb/sandboxes/<name>.toml` is machine-local and never committed.
@@ -156,5 +180,6 @@ Any key it sets overrides the project's file.
 | `ports` | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
 | `egress_mode` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
-| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides |
+| `msb_conf` | your own msb config file, passed as `--conf`: an absolute path, never in a project, no `${` in it. See [dev.yaml](#msbdevyaml) |
+| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides. `conf` must name a file inside the project |
 | `[versions]` | what `msbctl update` installed, so a rebuild reproduces it |

@@ -67,6 +67,11 @@ class MsbctlTest(unittest.TestCase):
             os.environ.pop(var, None)
         self.m = self.load_msbctl()
 
+    def fresh(self):
+        """A new HOME and a new msbctl, for each case of a subTest loop. The
+        cleanups stack, so the environment is still restored to the original."""
+        self.setUp()
+
     def _restore_env(self):
         os.environ.clear()
         os.environ.update(self._saved_env)

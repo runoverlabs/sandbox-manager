@@ -88,9 +88,19 @@ autostart = {{AUTOSTART}}
 # cpus        = 8
 # memory      = "16G"
 # root_disk   = "32G"
-# conf        = ".msb/dev.yaml"     # relative to project
+# conf        = ".msb/dev.yaml"     # relative to project, and must stay inside
+#                                   # it; read for `image:` only
 # rule_groups = ["github", "npm", "python"]
 # extra_rules = ["allow@mirror.example.com:tcp:443"]
+# msb_conf    = "~/.config/msb/conf/{{NAME}}.yaml"
+#                                   # YOUR msb config file, passed as --conf, for
+#                                   # what msbctl does not model (user, rlimits,
+#                                   # security, ...). Absolute path. Here only and
+#                                   # never in a project: msb's config can mount
+#                                   # host paths and copy host files in. It may
+#                                   # not contain `${`, which msb fills in from
+#                                   # its environment — the one holding the
+#                                   # bound secrets. Flags msbctl emits win.
 # volumes     = "old-name"          # prefix of the cache/container disk volumes;
 #                                   # `msbctl rename` sets it, since msb cannot
 #                                   # rename a volume. Defaults to the name.

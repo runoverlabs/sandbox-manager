@@ -1,52 +1,30 @@
-# .msb/dev.yaml — the msb config for this project's sandbox. COMMIT THIS FILE.
+# .msb/dev.yaml — the image for this project's sandbox. COMMIT THIS FILE.
 #
-# Passed to msb with --conf by msbctl. Holds only what is the same on any
-# machine that clones this repo. Three kinds of thing are deliberately absent
-# and belong elsewhere:
+# Read by msbctl, for the `image:` line only, and NEVER passed to msb. msb's
+# own config file is code rather than data: it can mount host paths, copy host
+# files into the guest, and fill in `${VAR}` from msb's environment, which is
+# where the bound secrets are. This folder is writable from inside the
+# sandbox, so handing it to msb would let the guest rewrite what the next
+# rebuild runs. `msbctl rebuild` therefore refuses a file that sets anything
+# but `image` (or the `cpus`, `memory` and `workdir` older versions wrote,
+# which are accepted and ignored).
 #
-#   host paths            they resolve against THIS FILE rather than the
-#                         working directory, so msbctl passes absolute paths
-#                         on the command line instead
-#   machine-local values  $SSH_AUTH_SOCK and friends — the launcher's job
-#   CLI-only settings     --root-disk, --tls-intercept, --net-rule, --secret
-#                         have no config-file equivalent
+# Where everything else goes:
 #
-# Top-level keys are validated strictly: an unknown one is rejected with the
-# full accepted list. So if this file loads, every key in it is real.
+#   cpus, memory, root_disk   .msb/sandbox.toml (or the registry entry)
+#   env                       [env] in .msb/sandbox.toml, which merges over the
+#                             machine-wide set rather than replacing it. The
+#                             telemetry opt-outs are machine-wide already
+#                             ([env] and [agent_env.claude] in defaults.toml).
+#   egress rules, secrets     .msb/sandbox.toml; msbctl emits them as flags
+#   workdir                   `guest_path` in the registry entry
+#   mounts, ports             the registry entry (`msbctl mount`, `msbctl port`):
+#                             host paths and host ports are machine-local
+#   anything else msb's       a file of your own, named by `msb_conf` in the
+#   config file can do        registry entry — the operator's, never a repo's
 
 # Pinned tag@digest: a tag moves, a digest does not. `msbctl add` resolves
 # the digest for a tag, and `msbctl show` reports when a newer one exists.
+# Must be an image reference; a path is refused.
 # yamllint disable-line rule:line-length
 image: {{IMAGE}}
-
-cpus: {{CPUS}}
-# A ceiling, not a reservation: ~300 MB idle. Page cache does park against it
-# and is never returned on its own — `msbctl reclaim {{NAME}}` is the fix.
-memory: "{{MEMORY}}"
-
-# No workdir here: msbctl passes --workdir at create, set to where the project
-# is mounted (/work, or the host's own path — `guest_path` in the registry
-# entry), and that flag wins over this file.
-
-# env: project-specific variables only.
-#
-# The telemetry and feedback opt-outs are NOT here: msbctl emits them as --env
-# from the machine-wide [env] and [agent_env.claude] tables (defaults.toml,
-# overridable in ~/.config/msb/config.toml). Keep them out of this file.
-# Setting a key in both places makes its effective value depend on whether
-# --env or --conf wins, which is unverified — and an opt-out that might not
-# apply is worse than no opt-out, because it reads as settled.
-#
-# A key only this project needs goes in [env] in ./sandbox.toml, which merges
-# over the machine-wide set rather than replacing it.
-
-# Deliberately absent, each for a specific reason:
-#
-#   mounts      host paths resolve against this file, not the cwd. msbctl
-#               passes --mount-dir with absolute paths.
-#   network     the rules are verified as CLI flags; the nested YAML shape is
-#               not. They live in .msb/sandbox.toml and msbctl emits
-#               --net-rule. Egress policy must not be subtly wrong.
-#   secrets     bound by msbctl from ~/.config/msb/secrets/, so that no file
-#               in this repo ever references a credential by value or by path.
-#   root_disk   not a config field at all; --root-disk is CLI-only.

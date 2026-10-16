@@ -60,7 +60,7 @@ Four TOML files, later wins:
 
 Put new defaults and rule groups in `defaults.toml`, never in the template skeleton.
 
-`dev.yaml` is passed to `msb --conf`, but egress rules are deliberately **not** put in its `network:` block; msbctl emits verified `--net-rule` flags from the `sandbox.toml` group list instead. Env overrides: `MSB_CONFIG_DIR`, `MSB_STATE_DIR`.
+A project's `dev.yaml` is **never passed to msb**: msbctl reads its `image:` line (validated as an OCI reference by `image_problem()`, because msb boots a host directory given as the image — spike 12) and nothing else, and create/rebuild refuse a file with any other top-level key than `CONF_KEYS_READ` or any nested line (`conf_problems()`). msb's `--conf` is code, not data: it mounts host paths, copies host files in and interpolates `${VAR}` from msb's own environment, which holds the bound secrets, and the project folder is writable from the guest. Everything is emitted as flags instead (egress as verified `--net-rule` flags from the `sandbox.toml` group list). `conf` must stay inside the project. The operator's escape hatch is `msb_conf` in the registry entry (registry-only, absolute path, no `${`). Env overrides: `MSB_CONFIG_DIR`, `MSB_STATE_DIR`.
 
 ## Wizard features
 

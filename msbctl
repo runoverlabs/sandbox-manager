@@ -354,6 +354,68 @@ def read_env_file(path):
     return values
 
 
+# ------------------------------------------------------- the project's dev.yaml
+#
+# A project's .msb/dev.yaml is READ BY MSBCTL, for its `image:` line, and never
+# handed to msb. msb's config file can mount host paths, copy host files into
+# the guest and interpolate `${VAR}` from msb's own environment — the one that
+# holds the bound secrets — and the project folder is writable from inside the
+# sandbox. So the file is checked line by line, without a YAML parser, and a
+# create refuses one that says anything msbctl does not read: a key that looks
+# harmless today is one msb may act on tomorrow, and a silently ignored setting
+# reads as applied.
+
+# Top-level keys a dev.yaml may carry. Only `image` is read; the others are
+# what older `msbctl add` runs wrote, and are accepted and ignored (cpus and
+# memory come from sandbox.toml, the workdir from `guest_path`).
+CONF_KEYS_READ = ("image", "cpus", "memory", "workdir")
+_CONF_KEY = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*)\s*:")
+
+
+def conf_problems(path):
+    """Human-readable problems with a project dev.yaml; [] if there are none,
+    and for a missing file (the image lookup reports that)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+    problems = []
+    for n, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or line == "---":
+            continue
+        if line[0] in " \t":
+            problems.append(f"line {n}: nested values are not read ({stripped[:40]!r})")
+            continue
+        match = _CONF_KEY.match(line)
+        if not match:
+            problems.append(f"line {n}: not a `key: value` line ({stripped[:40]!r})")
+        elif match.group(1) not in CONF_KEYS_READ:
+            problems.append(f"line {n}: `{match.group(1)}` is not read by msbctl")
+    return problems
+
+
+# An OCI image reference: [registry[:port]/]path[:tag][@sha256:digest], the
+# path lowercase. Validated because the positional image is the one value from
+# a project that still reaches msb's argv, and a path-shaped one (`/home/you`,
+# `./rootfs`, `~/x`, `file:///x`) is not an image a repo gets to name.
+IMAGE_REF = re.compile(
+    r"(?:[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[0-9]+)?/)?"
+    r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*"
+    r"(?:/[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*)*"
+    r"(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?"
+    r"(?:@sha256:[0-9a-f]{64})?")
+
+
+def image_problem(ref):
+    """Why `ref` is not an OCI image reference, or None."""
+    if not isinstance(ref, str) or not IMAGE_REF.fullmatch(ref):
+        return ("not an image reference like registry/name:tag@sha256:… "
+                "(a path is never accepted)")
+    return None
+
+
 # ---------------------------------------------------------------------- config
 
 class Sandbox:
@@ -397,6 +459,15 @@ class Sandbox:
         self.identity_name = self._pick("identity", defaults.get("identity"))
 
         self.conf_path = os.path.join(self.project, self.conf)
+        # Inside the project, always. An absolute `conf` (or one climbing out
+        # with ../, or a symlink) would make os.path.join ignore the project,
+        # and the file it names is read for the image and checked by
+        # conf_problems() as if the project had written it.
+        real_project = os.path.realpath(self.project)
+        real_conf = os.path.realpath(self.conf_path)
+        if not real_conf.startswith(real_project.rstrip(os.sep) + os.sep):
+            die(f"{name}: conf {self.conf!r} is outside the project folder — it must name a "
+                f"file under {tilde(self.project)} (set in {tilde(self._origin('conf'))})")
         # Disk volumes are named after the sandbox, but msb cannot rename a
         # volume, so a renamed sandbox keeps its old prefix here (`volumes` in
         # the registry entry) rather than losing its caches and images.
@@ -509,25 +580,59 @@ class Sandbox:
 
     @property
     def image(self):
-        """Resolved from the registry entry, else from the --conf file.
+        """Resolved from the registry entry, else from the project's dev.yaml.
 
         Extracted from the YAML with an anchored regex rather than parsed. The
-        alternative is a PyYAML dependency for one scalar, and the alternative
-        to THAT is duplicating the digest into sandbox.toml, where it would
-        drift from the file msb actually reads. `image:` is one line in
-        a file this tool generates, and a non-match is an error rather than a
-        guess.
+        alternative is a PyYAML dependency for one scalar. `image:` is one line
+        in a file this tool generates, and a non-match is an error rather than
+        a guess. Whatever the source, it must be an OCI reference: the
+        positional image is the one thing a project still hands to msb, and a
+        path-shaped value (`/home/you`, `./rootfs`) is not something msbctl
+        lets a repo choose. See image_problem().
         """
         if "image" in self.entry:
-            return self.entry["image"]
-        if not os.path.isfile(self.conf_path):
-            die(f"{tilde(self.conf_path)} does not exist — `msbctl add` writes it")
-        with open(self.conf_path, encoding="utf-8") as fh:
-            for line in fh:
-                match = re.match(r"^image:\s*(\S+)\s*$", line)
-                if match:
-                    return match.group(1)
-        die(f"no `image:` line in {tilde(self.conf_path)}")
+            ref, where = self.entry["image"], registry_path(self)
+        else:
+            if not os.path.isfile(self.conf_path):
+                die(f"{tilde(self.conf_path)} does not exist — `msbctl add` writes it")
+            ref, where = None, self.conf_path
+            with open(self.conf_path, encoding="utf-8") as fh:
+                for line in fh:
+                    match = re.match(r"^image:\s*(\S+)\s*$", line)
+                    if match:
+                        ref = match.group(1)
+                        break
+            if ref is None:
+                die(f"no `image:` line in {tilde(self.conf_path)}")
+        problem = image_problem(ref)
+        if problem:
+            die(f"{self.name}: image {ref!r} in {tilde(where)}: {problem}")
+        return ref
+
+    @property
+    def msb_conf(self):
+        """The operator's own msb config file (`msb_conf` in the registry
+        entry), or None. REGISTRY ONLY, never `_pick`: it is the escape hatch
+        for msb config-file features msbctl does not model (`user`, `rlimits`,
+        `security`, ...), and those are exactly the features — host mounts,
+        host file copies, `${VAR}` from msb's environment — that a project must
+        not be able to reach. It must not contain `${` at all: msb interpolates
+        that from its own environment, which holds every bound secret."""
+        raw = self.entry.get("msb_conf")
+        if not raw:
+            return None
+        path = os.path.expanduser(str(raw))
+        where = tilde(registry_path(self))
+        if not os.path.isabs(path):
+            die(f"{self.name}: msb_conf {raw!r} must be an absolute path (in {where})")
+        if not os.path.isfile(path):
+            die(f"{self.name}: msb_conf {tilde(path)} is not a file (in {where})")
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            if "${" in fh.read():
+                die(f"{self.name}: msb_conf {tilde(path)} contains `${{`, which msb would "
+                    "fill in from its own environment — the one holding the bound secrets. "
+                    "Write the value out instead.")
+        return path
 
     # -------------------------------------------------------------- the rules
 
@@ -780,9 +885,18 @@ class Sandbox:
     # ----------------------------------------------------------- all together
 
     def create_flags(self):
-        flags = ["--conf", self.conf_path]
-        # After --conf, which it overrides: a project's committed dev.yaml says
-        # `workdir: /work`, and a sandbox mounted elsewhere must not start there.
+        # The project's dev.yaml is NEVER passed to msb. msb's --conf file is
+        # code, not data: it can mount host paths (relative to the file),
+        # copy host files into the guest, and fill `${VAR}` from msb's own
+        # environment, which is where the bound secrets are. The project folder
+        # is writable from inside the sandbox, so passing it would let the guest
+        # rewrite what the next rebuild executes. msbctl reads its `image:` and
+        # nothing else (see conf_problems()); everything else is a flag below.
+        # `msb_conf` is the operator's own file, from the registry only.
+        conf = self.msb_conf
+        flags = ["--conf", conf] if conf else []
+        # Where the project is mounted, which a `workdir:` in an msb_conf must
+        # not override: flags win over --conf.
         flags += ["--workdir", self.guest_project]
         flags += self.mount_flags()
         for key, value in self.env_vars().items():
@@ -822,7 +936,7 @@ class Sandbox:
         # them, in either mode. msb binds the host side on 127.0.0.1 unless the
         # spec names an address, and dials the guest's own address rather than
         # its loopback — so the server inside must listen on 0.0.0.0. Whether
-        # these merge with a `ports:` list in the project's dev.yaml or replace
+        # these merge with a `ports:` list in an operator's msb_conf or replace
         # it is unverified; set them in one place.
         for spec, *_ in self.published_ports:
             flags += ["--port", spec]
@@ -834,10 +948,9 @@ class Sandbox:
         # too, even though nothing is being enforced.
         flags += ["--tls-intercept"]
         flags += ["--root-disk", str(self.root_disk)]
-        # Explicit flags, not just dev.yaml: that file is written once by the
-        # wizard, so a cpus/memory override in the registry entry or sandbox.toml
-        # would otherwise be resolved and shown but never reach msb. Flags win
-        # over --conf (verified on 0.7.6).
+        # From sandbox.toml / the registry / [defaults], never from dev.yaml,
+        # which is not passed to msb. Flags also win over an msb_conf
+        # (verified on 0.7.6).
         flags += ["--cpus", str(self.cpus), "--memory", str(self.memory)]
         return flags
 
@@ -907,10 +1020,11 @@ class Sandbox:
         it — these are defaults to extend. Egress rules are the opposite case:
         a project may legitimately need a narrower set, so it overrides there.
 
-        Do NOT also set a key here that the project's --conf dev.yaml sets in
-        its own `env:` block. Which of the two wins is unverified, and a
-        telemetry switch whose value depends on an unverified precedence is
-        worse than one in a single place.
+        A project's dev.yaml cannot set any: it is not passed to msb, and
+        create refuses one with an `env:` block (conf_problems()). Do not set
+        a key both here and in an operator's msb_conf either: which of the two
+        wins is unverified, and a telemetry switch whose value depends on an
+        unverified precedence is worse than one in a single place.
         """
         merged = {}
         # Under every [env], so a project can still override an agent's default.
@@ -1908,8 +2022,24 @@ def warn_missing_prereqs(box):
     note("   Continuing; the bootstrap reports what actually failed.")
 
 
+def refuse_conf_problems(box):
+    """Die if the project's dev.yaml says more than msbctl reads. Only create
+    and rebuild check: an existing sandbox keeps running and starting, since
+    nothing in the file reaches msb either way."""
+    problems = conf_problems(box.conf_path)
+    if not problems:
+        return
+    lines = [f"{tilde(box.conf_path)} sets what msbctl does not read, and is never passed to msb:"]
+    lines += [f"  {p}" for p in problems]
+    lines += ["Move `env:` to [env] in .msb/sandbox.toml, and cpus/memory there too.",
+              "Anything else msb's config file can do goes in a file of your own, named by",
+              f"`msb_conf` in {tilde(registry_path(box))} (registry only, never a repo)."]
+    die("\n".join(lines))
+
+
 def do_create(box):
     say(f"Creating {box.name}")
+    refuse_conf_problems(box)
     warn_missing_prereqs(box)
     ensure_agent_filter(box)
     secret_flags, env = box.secret_env()
@@ -4415,7 +4545,7 @@ def section_files(box, config, ctx):
         if os.path.isfile(project_path(box)):
             files.append(("sandbox.toml     this project, portable", project_path(box)))
         if os.path.isfile(box.conf_path):
-            files.append(("dev.yaml         msb config", box.conf_path))
+            files.append(("dev.yaml         the image", box.conf_path))
         label = choose_one("edit which file", [l for l, _ in files] + ["back"], 0)
         if label == "back":
             return
@@ -4695,7 +4825,11 @@ def cmd_show(args, config):
     note(f"project    {tilde(box.project)}")
     note(f"in guest   {box.guest_project}")
     note(f"repo       {box.repo or '(no GitHub remote)'}")
-    note(f"conf       {box.conf}")
+    note(f"conf       {box.conf}  (read for the image only)")
+    for problem in conf_problems(box.conf_path):
+        warn(f"{box.conf} {problem} — ignored by msbctl, and a rebuild will refuse")
+    if box.msb_conf:
+        note(f"msb_conf   {tilde(box.msb_conf)}")
     note(f"image      {box.image}")
     note(f"resources  {box.cpus} cpu, {box.memory} ceiling, {box.root_disk} disk")
     note(f"autostart  {'yes' if box.autostart else 'no'}")
@@ -5986,6 +6120,10 @@ def cmd_add(args, config):
     os.makedirs(msb_dir, exist_ok=True)
     defaults = config.get("defaults", {})
 
+    # Whether a written file is committable depends on the layout, and saying
+    # "commit this" for a file that is not in any repo is worse than saying
+    # nothing.
+    inside_repo = os.path.isdir(os.path.join(project, ".git"))
     sandbox_toml = os.path.join(msb_dir, "sandbox.toml")
     if os.path.exists(sandbox_toml):
         note(f"kept existing {tilde(sandbox_toml)}")
@@ -6023,10 +6161,6 @@ def cmd_add(args, config):
                                                 '# containers_storage = "fuse-overlayfs"'),
                             ALLOW_PRIVATE_DNS="true" if needs_private_dns else "false",
                             SECRET_GITHUB="true" if want_github else "false"))
-        # Whether this is committable depends on the layout, and saying
-        # "commit this" for a file that is not in any repo is worse than
-        # saying nothing.
-        inside_repo = os.path.isdir(os.path.join(project, ".git"))
         note(f"wrote {tilde(sandbox_toml)}" +
              ("  — commit this" if inside_repo else "  (outside the checkout)"))
 
@@ -6035,8 +6169,7 @@ def cmd_add(args, config):
         note(f"kept existing {tilde(dev_yaml)}")
     else:
         with open(dev_yaml, "w", encoding="utf-8") as fh:
-            fh.write(render("dev.yaml.in", NAME=name, IMAGE=image,
-                            CPUS=plan["cpus"], MEMORY=plan["memory"]))
+            fh.write(render("dev.yaml.in", IMAGE=image))
         note(f"wrote {tilde(dev_yaml)}" +
              ("  — commit this" if inside_repo else "  (outside the checkout)"))
 
