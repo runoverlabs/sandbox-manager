@@ -121,6 +121,10 @@ allows. So the only way to learn what a sandbox needs is to stop blocking for a
 while and write down where it goes. That's **observe mode**, covered in
 [Advanced usage](advanced.md#observe-mode-building-an-allowlist).
 
+Observe mode is set per machine, in the sandbox's registry entry, by
+`msbctl observe`. A project's `sandbox.toml` can't turn it on: an
+`egress_mode` there is ignored with a warning.
+
 > **Warning:** In observe mode nothing is blocked. Secrets stay protected
 > (substitution still happens on the host and only to their named hosts), but
 > the agent can reach anywhere. Turn it off as soon as you've collected what

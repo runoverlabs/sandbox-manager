@@ -27,7 +27,9 @@ rule covers.
 
 The mode lives in the **registry entry only**, never in `.msb/sandbox.toml`.
 That file is committed, and an unfiltered sandbox must never ship to everyone
-who clones the project.
+who clones the project. An `egress_mode` written there is ignored, with a
+warning: the file is writable from inside the sandbox, which must not be able
+to switch its own filtering off.
 
 The report also shows **secret-policy blocks**: requests msb killed because
 they carried a placeholder somewhere substitution isn't allowed. Those are

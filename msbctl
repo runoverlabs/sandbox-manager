@@ -448,6 +448,10 @@ class Sandbox:
         self.root_disk = self._pick("root_disk", defaults.get("root_disk", "16G"))
         # Size of a dedicated disk for /var/lib/containers, or empty for none.
         self.secret_binds = self._pick("secret_binds", [])
+        # Which layer the bindings came from decides where their VALUES may come
+        # from: see secret_env(). The registry entry is the operator's; the
+        # project's sandbox.toml is a file the sandbox itself can write.
+        self.bindings_layer = "registry" if "secret_binds" in self.entry else "project"
         # {feature: size} for per-package-manager cache disks. See CACHES.
         self.caches = self._pick("caches", {})
         self.containers_disk = self._pick("containers_disk",
@@ -663,8 +667,15 @@ class Sandbox:
         Create-time, like every other network setting: changing it needs a
         rebuild, not a restart.
         """
-        mode = self._pick("egress_mode",
-                          self.config.get("defaults", {}).get("egress_mode", "enforce"))
+        # REGISTRY ONLY, never `_pick`: the project's sandbox.toml is committed
+        # and writable from inside the sandbox, so a project that could set
+        # this could switch its own deny-by-default off.
+        if "egress_mode" in self.project_cfg and not getattr(self, "_warned_egress_mode", False):
+            self._warned_egress_mode = True
+            warn(f"{self.name}: egress_mode in {tilde(project_path(self))} is ignored — it is "
+                 f"machine-local only (`msbctl observe {self.name} on` sets it in the registry entry)")
+        mode = self.entry.get("egress_mode",
+                              self.config.get("defaults", {}).get("egress_mode", "enforce"))
         if mode not in EGRESS_MODES:
             die(f"{self.name}: egress_mode is {mode!r}, expected one of "
                 f"{', '.join(EGRESS_MODES)}")
@@ -797,17 +808,34 @@ class Sandbox:
                      "in this sandbox (git push over SSH still works)")
 
         # Extra bindings, in msb's own `ENV[:OPTIONS]@HOST[,HOST]` syntax so a
-        # hand-written one works too. The value comes from this sandbox's env
-        # file, else the shared one, and — like the others — only ever travels
-        # in the environment of the msb process.
+        # hand-written one works too. Like the others, the value only ever
+        # travels in the environment of the msb process.
+        #
+        # Where the value may come from depends on who wrote the binding. A
+        # binding in the project's sandbox.toml decides which HOST a stored
+        # value is sent to, and that file is committed and writable from inside
+        # the sandbox: if it could reach global.env, `MY_TOKEN@attacker.example`
+        # plus one egress rule would send the operator's shared token there. So
+        # a project binding resolves from this sandbox's own env file only; the
+        # fallback to the shared file is for bindings in the registry entry.
+        # The reserved variables are never bound this way, from any layer.
         own = read_env_file(os.path.join(SECRETS_DIR, f"{self.name}.env"))
         shared = read_env_file(os.path.join(SECRETS_DIR, "global.env"))
         for spec in self.secret_binds:
             var = secret_var(spec)
-            value = own.get(var) or shared.get(var)
+            if is_reserved_var(var):
+                warn(f"{self.name}: secret binding {spec!r} is ignored — {var} has a fixed binding "
+                     "and cannot be bound again (a rebuild refuses this)")
+                continue
+            value = own.get(var) or (shared.get(var) if self.bindings_layer == "registry"
+                                     else None)
             if value:
                 env[var] = value
                 flags += ["--secret", with_transcript_passthrough(spec)]
+            elif self.bindings_layer == "project":
+                note(f"no {var} for {self.name} — a binding from the project's sandbox.toml "
+                     f"takes its value from {tilde(os.path.join(SECRETS_DIR, self.name + '.env'))} "
+                     f"only: `msbctl secret add {self.name}` (skipped for now)")
             else:
                 note(f"no {var} for {self.name} — `msbctl secret add {self.name}` "
                      "(skipped for now)")
@@ -2022,6 +2050,28 @@ def warn_missing_prereqs(box):
     note("   Continuing; the bootstrap reports what actually failed.")
 
 
+def is_reserved_var(var):
+    """Variables with a FIXED binding: GH_TOKEN (github.com, api.github.com) and
+    every Claude token (Anthropic's hosts). No `secret_binds` entry, in any
+    layer, may name one: a second binding `GH_TOKEN@attacker.example` would
+    send the sandbox's real token wherever the binding says."""
+    return (var == "GH_TOKEN" or var == CLAUDE_TOKEN_VAR
+            or var.startswith(CLAUDE_TOKEN_VAR + "_"))
+
+
+def reserved_binding_problems(box):
+    """The `secret_binds` entries that name a reserved variable."""
+    return [spec for spec in box.secret_binds if is_reserved_var(secret_var(spec))]
+
+
+def refuse_reserved_bindings(box):
+    bad = reserved_binding_problems(box)
+    if bad:
+        die(f"{box.name}: {', '.join(repr(b) for b in bad)} in "
+            f"{tilde(box._origin('secret_binds'))}: GH_TOKEN and the Claude tokens have fixed "
+            "bindings and cannot be bound again — remove the line")
+
+
 def refuse_conf_problems(box):
     """Die if the project's dev.yaml says more than msbctl reads. Only create
     and rebuild check: an existing sandbox keeps running and starting, since
@@ -2040,6 +2090,7 @@ def refuse_conf_problems(box):
 def do_create(box):
     say(f"Creating {box.name}")
     refuse_conf_problems(box)
+    refuse_reserved_bindings(box)
     warn_missing_prereqs(box)
     ensure_agent_filter(box)
     secret_flags, env = box.secret_env()
@@ -3371,6 +3422,10 @@ def choose_secret(config, taken=()):
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var):
         warn("not a valid variable name")
         return None
+    if is_reserved_var(var):
+        warn(f"{var} has a fixed binding and cannot be bound again "
+             "(the GitHub and Claude tokens have their own settings)")
+        return None
     hosts = ask("hosts it may be sent to (comma-separated, e.g. api.example.com)").replace(" ", "")
     if not hosts:
         warn("a secret needs at least one host")
@@ -3452,6 +3507,8 @@ def cmd_secret(args, config):
     if not picked:
         return
     spec, preset = picked
+    if is_reserved_var(secret_var(spec)):
+        die(f"{secret_var(spec)} has a fixed binding and cannot be bound again")
     if preset:
         note(f"create it at {preset.get('help', '(see the provider)')}")
         if preset.get("usage"):

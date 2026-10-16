@@ -81,6 +81,20 @@ MY_TOKEN:query@api.example.com          # also substitute in the query string
 MY_TOKEN@one.example.com,two.example.com
 ```
 
+**Where the value comes from** depends on where the binding is written. A
+binding in the project's `.msb/sandbox.toml` takes its value from that
+sandbox's own `secrets/<name>.env` only, never from `global.env`: that file is
+committed and writable from inside the sandbox, and it decides which host the
+value is sent to. A binding in the registry entry (yours, machine-local) may
+also use a value from `global.env`, shared between sandboxes. `msbctl secret
+add` stores the value per sandbox either way.
+
+**Reserved variables.** `GH_TOKEN` and the Claude token variables
+(`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN_<NAME>`) have fixed
+bindings and can't appear in `secret_binds` in any file: a second
+`GH_TOKEN@somewhere.example` would send the real token there. A create or
+rebuild refuses such a line; a sandbox that already exists starts without it.
+
 A secret doesn't open the network: its hosts must also be allowed by an egress
 rule. `msbctl add` warns when they aren't; after `msbctl secret add`, check
 with `msbctl show` and [`msbctl allow`](egress.md#adding-a-host) what's
