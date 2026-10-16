@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""A fake `msb` for the tests: records every call, keeps a little state, and
+refuses anything it does not know so that an unexpected call fails loudly.
+
+    FAKE_MSB_LOG       one JSON line per call: {"argv": [...], "env": {...}}
+    FAKE_MSB_ENV_KEYS  comma-separated variables whose values `env` records;
+                       only these, so a test asks for exactly what it checks
+    FAKE_MSB_STATE     JSON {name: "running"|"stopped", "_volumes": {...}}
+    FAKE_MSB_EXEC_OUT  printed by `exec`, which otherwise prints nothing
+
+`ls` prints the text table msbctl's msb_table() parses (a header, then
+`name image state created`); keep scripts/screenshots/bin/msb on the same shape.
+"""
+import json
+import os
+import re
+import sys
+
+MIB = 1024 * 1024
+UNITS = {"M": 1, "G": 1024, "T": 1024 * 1024}
+
+
+def load():
+    try:
+        with open(os.environ["FAKE_MSB_STATE"], encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {}
+
+
+def save(state):
+    with open(os.environ["FAKE_MSB_STATE"], "w", encoding="utf-8") as fh:
+        json.dump(state, fh)
+
+
+def record(argv):
+    keys = [k for k in os.environ.get("FAKE_MSB_ENV_KEYS", "").split(",") if k]
+    line = {"argv": argv, "env": {k: os.environ[k] for k in keys if k in os.environ}}
+    with open(os.environ["FAKE_MSB_LOG"], "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(line) + "\n")
+
+
+def refuse(argv):
+    print(f"fake msb: unexpected call: {argv[:3]}", file=sys.stderr)
+    sys.exit(2)
+
+
+def size(text):
+    m = re.fullmatch(r"(\d+)([MGT])", text.upper())
+    return int(m.group(1)) * MIB * UNITS[m.group(2)] if m else 0
+
+
+def create(argv, state):
+    name = argv[argv.index("--name") + 1]
+    if name in state:
+        sys.exit(f"fake msb: sandbox {name} already exists")
+    vols = state.setdefault("_volumes", {})
+    for i, arg in enumerate(argv):
+        if arg == "--mount-named":
+            vol, _, opts = argv[i + 1].split(":", 2)
+            if vol not in vols:
+                found = re.search(r"size=([0-9]+[MGTmgt])", opts)
+                vols[vol] = {"kind": "disk", "capacity_bytes": size(found.group(1)) if found else 0,
+                             "used_bytes": 0}
+    state[name] = "running"
+
+
+def main():
+    argv = sys.argv[1:]
+    record(argv)
+    state = load()
+    verb = argv[:1]
+    if argv == ["--version"]:
+        print("msb 0.7.7")
+    elif verb == ["ls"]:
+        print("NAME  IMAGE  STATUS  CREATED")
+        for name, st in state.items():
+            if not name.startswith("_"):
+                print(f"{name}  base  {st}  2026-10-01")
+    elif verb == ["create"]:
+        create(argv, state)
+    elif verb in (["start"], ["stop"]):
+        name = argv[1]
+        if name not in state:
+            sys.exit(f"fake msb: no sandbox {name}")
+        state[name] = "running" if verb == ["start"] else "stopped"
+    elif verb == ["rm"]:
+        name = next(a for a in argv[1:] if not a.startswith("-"))
+        if state.pop(name, None) is None:
+            sys.exit(f"fake msb: no sandbox {name}")
+    elif verb == ["exec"]:
+        sys.stdout.write(os.environ.get("FAKE_MSB_EXEC_OUT", ""))
+    elif verb == ["modify"]:
+        pass
+    elif verb == ["inspect"]:
+        sock = os.path.join(os.environ["MSB_STATE_DIR"], "agent", f"{argv[1]}.sock")
+        print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]}}}))
+    elif argv[:2] == ["volume", "ls"]:
+        vols = state.get("_volumes", {})
+        print(json.dumps([{"name": n, **v} for n, v in vols.items()]))
+    elif argv[:2] == ["volume", "rm"]:
+        if state.get("_volumes", {}).pop(argv[2], None) is None:
+            sys.exit(f"fake msb: no volume {argv[2]}")
+    else:
+        refuse(argv)
+    save(state)
+
+
+if __name__ == "__main__":
+    main()

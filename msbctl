@@ -6342,6 +6342,24 @@ def cmd_menu(args, config):
             note(f"not an option: {choice}")
 
 
+def preflight(args):
+    """Die unless this machine can run sandboxes: `msb` on PATH and /dev/kvm.
+
+    Checked for every subcommand, including `add`. Registering a project from
+    inside a container would write a registry entry naming a path that only
+    exists in that container, which fails later and confusingly.
+    The ssh-agent filter daemon needs neither (it only proxies a socket), and
+    `config` only reads files. One function, so the tests and the screenshot
+    harness replace exactly this and nothing else.
+    """
+    if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
+        return
+    if not shutil.which("msb"):
+        die("msb is not on PATH")
+    if not os.path.exists("/dev/kvm"):
+        die("no /dev/kvm — msbctl runs on the host, not inside a container")
+
+
 def main():
     parser = argparse.ArgumentParser(
         prog="msbctl", description=__doc__.split("\n\n")[0],
@@ -6525,16 +6543,7 @@ def main():
     if msb_flags:
         args.msb_flags = msb_flags
 
-    # Checked for every subcommand, including `add`. Registering a project from
-    # inside a container would write a registry entry naming a path that only
-    # exists in that container, which fails later and confusingly.
-    # The ssh-agent filter daemon needs neither (it only proxies a socket), and
-    # `config` only reads files.
-    if args.func not in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
-        if not shutil.which("msb"):
-            die("msb is not on PATH")
-        if not os.path.exists("/dev/kvm"):
-            die("no /dev/kvm — msbctl runs on the host, not inside a container")
+    preflight(args)
 
     try:
         try:
