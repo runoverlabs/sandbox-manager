@@ -7,6 +7,8 @@ from tests.harness import MsbctlTest
 
 ALLOWED = [
     "msbctl ls",
+    # A laptop that recorded msbctl's path before the key was restricted.
+    "/home/msb/.local/bin/msbctl ls",
     "msbctl ls --json",
     "msbctl --version",
     "msbctl status",
@@ -47,6 +49,9 @@ ALLOWED = [
 
 REFUSED = [
     "msbctl;rm -rf ~",
+    "/bin/sh -c ls",
+    "/home/msb/.local/bin/msbctl-evil ls",
+    "./msbctl ls",
     "rm -rf ~",
     "cat ~/.config/msb/secrets/global.env",
     "bash",

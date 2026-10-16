@@ -6943,6 +6943,18 @@ def add_on_remote(remote, args, config):
     the host's own `add --repo` over ssh, which fetches the repo's policy,
     shows it, asks for its GitHub token and registers it there."""
     dest = remote_dest(remote, config)
+    # Before any question: a host without msbctl would only fail at the end.
+    probe = subprocess.run(ssh_argv(dest, tty=False, batch=True)
+                           + [shlex.join([remote_program(remote, config), "--version"])],
+                           capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if probe.returncode == 127:
+        warn(f"{remote} has no msbctl that an ssh command can find")
+        if not confirm(f"set {remote} up now (`msbctl remote setup {remote}`)?"):
+            die(f"nothing registered; `msbctl remote setup {remote}` first")
+        remote_setup(remote, config)
+        config = load_config()
+    elif probe.returncode:
+        die(f"{remote}: {_short_reason(probe, remote)}")
     say(f"A sandbox on {remote}")
     note("There is no folder of yours on that machine, so the code is cloned inside")
     note("the sandbox, from GitHub, and work leaves it by `git push`.")
@@ -6955,7 +6967,8 @@ def add_on_remote(remote, args, config):
     name = args.new_name or ask("sandbox name", default_name)
     if not SANDBOX_NAME.fullmatch(name):
         die(f"{name!r}: a sandbox name is lowercase letters, digits and dashes")
-    command = ["msbctl", "add", "--repo", repo, "--name", name]
+    program = remote_program(remote, config)
+    command = [program, "add", "--repo", repo, "--name", name]
     for flag in REPO_ONLY_FLAGS:
         value = getattr(args, flag, None)
         if flag != "new_name" and value:
@@ -6968,7 +6981,7 @@ def add_on_remote(remote, args, config):
         die(f"{remote}: add failed (exit {proc.returncode})")
     note(f"from this machine it is {remote}:{name}, for every msbctl verb")
     if wants_tty() and confirm(f"start {remote}:{name} now? (the first start clones and bootstraps)"):
-        subprocess.run(ssh_argv(dest, True) + [shlex.join(["msbctl", "start", name])])
+        subprocess.run(ssh_argv(dest, True) + [shlex.join([program, "start", name])])
 
 
 def cmd_add(args, config):
@@ -7504,7 +7517,9 @@ def host_serve():
         argv = shlex.split(raw)
     except ValueError:
         refuse("the command does not parse as shell words")
-    if not argv or argv[0] != "msbctl":
+    # A path to msbctl too: a laptop that recorded one (`remote_program()`)
+    # before the key was restricted. It names nothing; this msbctl runs.
+    if not argv or not REMOTE_PROGRAM.fullmatch(argv[0]):
         refuse("only msbctl commands")
     argv = argv[1:]
     problem = restricted_problem(argv)
@@ -7793,6 +7808,20 @@ def remote_dest(name, config):
     return dest
 
 
+REMOTE_PROGRAM = re.compile(r"msbctl|/[A-Za-z0-9._/-]+/msbctl")
+
+
+def remote_program(name, config):
+    """What to run on a remote as msbctl. Plain `msbctl` unless `remote setup`
+    found it off the PATH an ssh command gets (both installers use
+    ~/.local/bin, which a non-interactive shell often lacks) and recorded the
+    absolute path. A restricted key ignores it: `host serve` runs itself."""
+    program = str((configured_remotes(config).get(name) or {}).get("msbctl") or "msbctl")
+    if not REMOTE_PROGRAM.fullmatch(program):
+        die(f"remote {name}: msbctl = {program!r} is not `msbctl` or an absolute path to it")
+    return program
+
+
 def ssh_argv(dest, tty, batch=False):
     """ssh to `dest`, sharing one connection per host for ten minutes, ending
     in `--`: the remote command follows as ONE argument (shlex.join), since ssh
@@ -7844,7 +7873,8 @@ def exec_remote(args, config, raw_argv):
     token = args.name
     remote, bare = split_remote(token)
     dest = remote_dest(remote, config)
-    argv = ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *_remote_command(raw_argv, token, bare)])]
+    argv = ssh_argv(dest, wants_tty()) + [shlex.join([remote_program(remote, config),
+                                                      *_remote_command(raw_argv, token, bare)])]
     sys.stdout.flush()
     os.execvp("ssh", argv)
 
@@ -7857,7 +7887,7 @@ def run_remote_verb(args, config, raw_argv, token):
     names = set(args.raw_names)
     verb_at = next(i for i, a in enumerate(raw_argv) if not a.startswith("-"))
     rest = [a for a in raw_argv[verb_at + 1:] if a not in names]
-    command = ["msbctl", raw_argv[verb_at], bare, *rest]
+    command = [remote_program(remote, config), raw_argv[verb_at], bare, *rest]
     proc = subprocess.run(ssh_argv(dest, wants_tty()) + [shlex.join(command)])
     if proc.returncode:
         die(f"{token}: exit {proc.returncode} on {remote}")
@@ -7878,19 +7908,21 @@ def add_remote_forward(args, config, raw_argv):
             continue
         rest.append(a)
     sys.stdout.flush()
-    os.execvp("ssh", ssh_argv(dest, wants_tty()) + [shlex.join(["msbctl", *rest])])
+    os.execvp("ssh", ssh_argv(dest, wants_tty()) + [shlex.join([remote_program(args.remote, config), *rest])])
 
 
 def _remote_cache_path(name):
     return os.path.join(REMOTES_DIR, f"{name}.json")
 
 
-def _short_reason(proc):
+def _short_reason(proc, remote=None):
     text = (proc.stderr or "").strip().splitlines()
+    if proc.returncode == 127 and remote:
+        return f"msbctl not found there — `msbctl remote setup {remote}`"
     return (text[-1] if text else f"ssh exit {proc.returncode}")[:80]
 
 
-def query_remote_ls(name, dest, refresh):
+def query_remote_ls(name, dest, refresh, program="msbctl"):
     """(rows, problem, stale_age) for one remote: its `ls --json` sandboxes, why
     it could not answer (or None), and how old the rows are if they came from
     the cache. A host that failed less than REMOTE_RETRY_AFTER ago is not tried
@@ -7900,7 +7932,7 @@ def query_remote_ls(name, dest, refresh):
     if not refresh and cache.get("failed_at", 0) > now - REMOTE_RETRY_AFTER:
         problem = cache.get("reason", "unreachable")
     else:
-        command = ["msbctl", "ls", "--json"] + (["--refresh"] if refresh else [])
+        command = [program, "ls", "--json"] + (["--refresh"] if refresh else [])
         try:
             proc = subprocess.run(ssh_argv(dest, tty=False, batch=True) + [shlex.join(command)],
                                   capture_output=True, text=True, timeout=REMOTE_LS_TIMEOUT,
@@ -7921,7 +7953,7 @@ def query_remote_ls(name, dest, refresh):
                 # not a parse error worth reporting as one.
                 old = "usage:" in (proc.stderr or "") + (proc.stdout or "")
                 problem = ("host msbctl too old (needs `ls --json`)" if old
-                           else f"error: {_short_reason(proc)}")
+                           else f"error: {_short_reason(proc, name)}")
             else:
                 write_json(_remote_cache_path(name), {"at": now, "sandboxes": rows,
                                                       "msbctl": data.get("msbctl", "")})
@@ -7947,7 +7979,8 @@ def remote_ls_rows(args, config):
     remotes = configured_remotes(config)
     out = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(8, len(remotes)))) as pool:
-        futures = {name: pool.submit(query_remote_ls, name, remote_dest(name, config), args.refresh)
+        futures = {name: pool.submit(query_remote_ls, name, remote_dest(name, config), args.refresh,
+                                     remote_program(name, config))
                    for name in sorted(remotes)}
         for name, fut in futures.items():
             rows, problem, stale = fut.result()
@@ -7983,13 +8016,13 @@ def remote_test(name, config, batch=True):
     dest = remote_dest(name, config)
     # Not batch: ssh may need to ask about the host key, on the terminal.
     proc = subprocess.run(ssh_argv(dest, tty=False, batch=batch)
-                          + [shlex.join(["msbctl", "host", "check", "--json"])],
+                          + [shlex.join([remote_program(name, config), "host", "check", "--json"])],
                           capture_output=True, text=True,
                           stdin=subprocess.DEVNULL if batch else None)
     try:
         data = json.loads(proc.stdout)
     except ValueError:
-        reason = _short_reason(proc) if proc.returncode else "not JSON (host msbctl too old?)"
+        reason = _short_reason(proc, name) if proc.returncode else "not JSON (host msbctl too old?)"
         write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
                    {"at": time.time(), "ok": False, "summary": reason})
         die(f"{name} ({dest}): {reason}")
@@ -8043,6 +8076,8 @@ def local_msb_version():
 # What `remote setup` needs to know about a host, as key=value lines, run by
 # remote_sh().
 REMOTE_PROBE = r"""u="$(id -un)"
+printf 'path=%s\n' "$(command -v msbctl)"
+printf 'bare=%s\n' "$(PATH="$o"; command -v msbctl)"
 printf 'user=%s\n' "$u"
 printf 'msb=%s\n' "$(msb --version 2>/dev/null | head -n1)"
 printf 'msbctl=%s\n' "$(msbctl --version 2>/dev/null | head -n1)"
@@ -8060,7 +8095,7 @@ def remote_sh(dest, script, *args, tty=False, batch=False, capture=False, stdin=
     is; ~/.local/bin because both installers put their commands there and a
     non-login ssh session often does not look. Under `host serve` this is
     refused (exit 126), which is how a key already restricted shows."""
-    command = shlex.join(["sh", "-c", 'PATH="$HOME/.local/bin:$PATH"; ' + script, "sh", *args])
+    command = shlex.join(["sh", "-c", 'o="$PATH"; PATH="$HOME/.local/bin:$PATH"; ' + script, "sh", *args])
     return subprocess.run(ssh_argv(dest, tty=tty, batch=batch) + [command],
                           capture_output=capture, text=True,
                           stdin=subprocess.DEVNULL if batch and stdin is None else None,
@@ -8088,9 +8123,24 @@ def remote_probe(dest, batch=False):
 
 
 def own_release():
-    """The release a host should run to match this machine: this version, or
-    None from a checkout, whose version may not have been released."""
-    return None if IS_CHECKOUT else version_string().split()[0]
+    """The release a host should run to match this machine. From a checkout,
+    the release its VERSION names: VERSION moves only when one is cut, so it
+    is the release the checkout started from."""
+    return version_string().split()[0].split("+")[0]
+
+
+def record_remote_program(name, probe):
+    """Remember where msbctl is on the host if an ssh command's PATH does not
+    find it there; forget it if it does."""
+    program = probe.get("path") if probe.get("path") and not probe.get("bare") else "msbctl"
+    if not REMOTE_PROGRAM.fullmatch(program):
+        warn(f"msbctl on {name} is at {program!r}, which msbctl cannot use as a path")
+        return
+    current = (configured_remotes(load_config()).get(name) or {}).get("msbctl", "msbctl")
+    if program != current:
+        set_toml_key(CONFIG_FILE, "msbctl", program, table=f"remotes.{name}")
+        if program != "msbctl":
+            note(f"msbctl is not on the PATH an ssh command gets on {name}: using {program}")
 
 
 def remote_setup(name, config):
@@ -8104,7 +8154,8 @@ def remote_setup(name, config):
     if probe is None:
         note("this machine's key already runs `msbctl host serve` there, so the host is")
         note("set up; anything more is done on the host itself, or with an admin key")
-        remote_test(name, config)
+        record_remote_program(name, {"bare": "msbctl"})     # host serve finds itself
+        remote_test(name, load_config())
         return
     note(f"{'user':<9} {probe.get('user', '?')}")
     note(f"{'msb':<9} {probe.get('msb') or 'not installed'}")
@@ -8143,15 +8194,18 @@ def remote_setup(name, config):
     installed = bool(theirs)
     if not theirs or theirs.split("+")[0] != mine.split("+")[0]:
         note("")
+        if not theirs:
+            note("msbctl is what this machine talks to there: without it, msb alone")
+            note("cannot be driven from here, and nothing after this step can be set up")
         if "git checkout" in probe.get("msbctl", ""):
             warn(f"{name} runs msbctl from a git checkout ({theirs}): update it there with git pull")
         else:
-            release = f"v{wanted}" if wanted else "the latest release"
-            question = (f"install msbctl ({release}) on {name}?" if not theirs
-                        else f"msbctl {theirs} there, {mine} here — install {release} on {name}?")
+            release = f"v{wanted}" + (" (the release this checkout started from)" if IS_CHECKOUT else "")
+            question = (f"install msbctl {release} on {name}?" if not theirs
+                        else f"msbctl {theirs} there, {mine} here — install msbctl {release} on {name}?")
             if confirm(question):
-                get = f"{RELEASES}/{f'download/v{wanted}' if wanted else 'latest/download'}/get.sh"
-                script = f"curl -fsSL {shlex.quote(get)} | sh" + (f" -s -- --version v{wanted}" if wanted else "")
+                get = f"{RELEASES}/download/v{wanted}/get.sh"
+                script = f"curl -fsSL {shlex.quote(get)} | sh -s -- --version v{wanted}"
                 if remote_sh(dest, script, tty=wants_tty()).returncode:
                     die(f"installing msbctl on {name} failed (above)")
                 installed = True
@@ -8161,6 +8215,8 @@ def remote_setup(name, config):
         note(f"without msbctl on {name} there is nothing more to set up; "
              f"`msbctl remote setup {name}` asks again")
         return
+    # Where it is now, installed or not: for every command from here on.
+    record_remote_program(name, remote_probe(dest) or {"bare": "msbctl"})
     if probe.get("kvm") == "denied":
         note("")
         user = probe.get("user", "")
@@ -8228,6 +8284,9 @@ def remote_restrict_key(name, dest):
     proc = remote_sh(dest, 'msbctl host authorize "$@"', line, *(["--replace"] if replace else []))
     if proc.returncode:
         die(f"authorizing the key on {name} failed (above)")
+    # The forced command finds msbctl itself, and an older one there accepts
+    # nothing but the bare name.
+    record_remote_program(name, {"bare": "msbctl"})
     # The shared connection still has the old key's shell: close it, so the
     # next command logs in again and gets the forced command.
     ssh_close(dest)
