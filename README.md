@@ -231,9 +231,8 @@ it, and only the negative half catches that.
 
 ## Status
 
-Developed against microsandbox 0.7.6 on Fedora, for one operator's machine. It
-is small, dependency-free, and commented for the person who has to debug it at
-2am — but it has not been run anywhere else, and `msb --help` is a more
+Tested on Fedora with KVM, against microsandbox 0.7.6 and 0.7.7. Other
+distros and newer `msb` versions are untested so far. `msb --help` is a more
 reliable guide to that tool than its published documentation.
 
 Issues and PRs welcome, particularly from anyone running a different distro or

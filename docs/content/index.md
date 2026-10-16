@@ -80,8 +80,6 @@ config, your tokens and your keys.
 > indexes them, and [`llms-full.txt`](llms-full.txt) is all of them in one
 > file.
 
-> **Note:** msb-manager is young and developed for one operator's machine
-> (Fedora, `msb` 0.7.6 and 0.7.7). It's small, has no dependencies and is
-> commented for whoever has to debug it at 2am, but it hasn't been run widely.
-> Issues and PRs are welcome, especially from other distros and newer `msb`
-> versions.
+> **Note:** msb-manager has been tested on Fedora with KVM, against `msb`
+> 0.7.6 and 0.7.7. Other distros and newer `msb` versions are untested so far;
+> issues and PRs from them are welcome.
