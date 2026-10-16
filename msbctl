@@ -5586,7 +5586,8 @@ def cmd_ls(args, config):
     names = registered()
     remotes = configured_remotes(config)
     if remotes:
-        return ls_with_remotes(args, config, names)
+        ls_with_remotes(args, config, names)
+        return
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
         return
@@ -6924,7 +6925,8 @@ REPO_ONLY_FLAGS = ("ref", "new_name", "guest_path", "workspace_disk", "identity"
 
 def cmd_add(args, config):
     if args.repo:
-        return cmd_add_repo(args, config)
+        cmd_add_repo(args, config)
+        return
     given = [f"--{f.replace('new_', '').replace('_', '-')}" for f in REPO_ONLY_FLAGS
              if getattr(args, f, None)]
     if given:
