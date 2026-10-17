@@ -375,6 +375,8 @@ containers = [
 go = [
     "allow@proxy.golang.org:tcp:443",
     "allow@sum.golang.org:tcp:443",
+    # The Go vulnerability database, which govulncheck reads.
+    "allow@vuln.go.dev:tcp:443",
 ]
 
 # `playwright install` downloads its browser builds from here, for the npm and
