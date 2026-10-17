@@ -44,8 +44,11 @@ claude_token = "{{CLAUDE_TOKEN}}"
 autostart = {{AUTOSTART}}
 
 # No ssh-agent is forwarded: on a remote host there is nobody's agent to give
-# it, and git uses HTTPS with this sandbox's GitHub token instead.
+# it, and git uses HTTPS with this sandbox's GitHub token instead, through gh's
+# credential helper. Set here rather than left to [defaults] git_push, which
+# may say "ssh" for folder sandboxes that do have an agent.
 ssh_keys = []
+git_push = "gh"
 
 # The size of the clone's volume. Fixed when the volume is first created;
 # msbctl never resizes it. Absent means [defaults] workspace_disk.

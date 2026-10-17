@@ -15,6 +15,7 @@
 # workspaces = "~/workspaces"
 # identity   = "personal"             # a name from [identities] below
 # claude_token = "work"               # a Claude token stored by `msbctl setup`
+# git_push   = "ssh"                  # "gh" (https + token) or "ssh" (agent)
 # rule_groups = ["github", "claude"]  # groups a new sandbox starts with
 # cpus   = 4
 # memory = "8G"
@@ -54,10 +55,18 @@
 # warning. An allowed-signers file with this key is written too, so `git log
 # --show-signature` verifies what the sandbox signed.
 #
+# PUSHING. `push_key` is the public half of the key a sandbox with git_push =
+# "ssh" offers github.com, and the only one: the account it belongs to is the
+# one that pushes. Often the same key as signing_key (GitHub registers it twice,
+# once for authentication and once for signing). A sandbox has to be allowed it
+# in `msbctl keys`, and its registry entry can name another with its own
+# push_key. Unused with git_push = "gh", which pushes with the GitHub token.
+#
 # [identities.personal]
 # name  = "Your Name"
 # email = "you@example.com"
 # signing_key = "ssh-ed25519 AAAA..."
+# push_key    = "ssh-ed25519 AAAA..."
 #
 # [identities.public]
 # name  = "yourhandle"

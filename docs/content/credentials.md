@@ -157,6 +157,43 @@ Inside the guest, `SSH_AUTH_SOCK` is `/tmp/ssh-agent.sock` in `msbctl shell`
 and `exec`. Your `~/.ssh/known_hosts` is mounted **read-only**: the sandbox can
 check hosts you already trust, but can't quietly add a new one.
 
+## git push: gh or ssh
+
+Each sandbox pushes to GitHub one of two ways, chosen in `msbctl add` and
+changed with `msbctl edit` → "Git push" (`git_push` in the registry entry,
+default `[defaults] git_push`). gh handles PRs, Actions and the API in both
+modes. The choice only decides how git itself gets to GitHub.
+
+| `git_push` | Fetch | Push | Needs |
+| --- | --- | --- | --- |
+| `"gh"` (default) | https | https | the [GitHub token](#github) |
+| `"ssh"` | as the remote says | ssh, through the filtered agent | a push key the sandbox is allowed |
+
+The repo's own remote is never changed: in a folder sandbox `.git/config` is
+your host checkout, so rewriting it for the guest would change how you push on
+the host too. msbctl sets rewrites in the guest's `/etc/gitconfig` on every
+start instead. With `"gh"`, a `git@github.com:` origin is fetched and pushed
+over https (`insteadOf`), and gh's credential helper passes git the `GH_TOKEN`
+placeholder. With `"ssh"`, an https origin is pushed over ssh
+(`pushInsteadOf`). Switching needs a restart, not a rebuild.
+
+With `"ssh"`, github.com is offered **one** key: the identity's `push_key`, or
+the registry entry's own `push_key` if it has one. Without one, ssh offers
+every key the sandbox is allowed, and GitHub takes the first it knows, which
+may belong to another account:
+
+```toml title="~/.config/msb/config.toml"
+[identities.work]
+name     = "yourhandle"
+email    = "12345+yourhandle@users.noreply.github.com"
+push_key = "ssh-ed25519 AAAA..."
+```
+
+`msbctl setup` → "Git identities" picks it, preselecting the signing key,
+because one key registered with GitHub for both uses is common. Sandboxes
+[without a folder](advanced.md#sandboxes-without-a-folder) have no agent and
+always use `"gh"`.
+
 ## Commit signing
 
 Give an identity in `config.toml` (or in `msbctl setup` → "Git identities") a

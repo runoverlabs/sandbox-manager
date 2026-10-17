@@ -53,6 +53,7 @@ including a whole egress group, replaces the shipped value.
 | `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
 | `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
 | `identity` | `""` | the `[identities]` entry new sandboxes use |
+| `git_push` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` (https, the GitHub token) or `"ssh"` (the agent). See [git push](credentials.md#git-push-gh-or-ssh) |
 | `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
 
 ### `[identities.<name>]`
@@ -62,11 +63,13 @@ including a whole egress group, replaces the shipped value.
 name        = "yourhandle"
 email       = "12345+yourhandle@users.noreply.github.com"
 signing_key = "ssh-ed25519 AAAA..."      # optional: sign commits with this key
+push_key    = "ssh-ed25519 AAAA..."      # optional: push over ssh with this key
 ```
 
 Applied inside the guest with `git config --system`, the lowest of git's three
 layers, so a repo's own identity still wins. See
-[commit signing](credentials.md#commit-signing).
+[commit signing](credentials.md#commit-signing) and
+[git push](credentials.md#git-push-gh-or-ssh).
 
 ### `[rules]`
 

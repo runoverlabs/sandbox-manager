@@ -88,8 +88,9 @@ once per project. Create one at
 
 Inside the sandbox, `GH_TOKEN` is a placeholder. The real value is swapped in
 on the host, in request headers only, for `github.com` and `api.github.com`.
-`git push` over SSH doesn't use it at all; that goes through the
-[filtered SSH agent](credentials.md#ssh-the-filtered-agent).
+It's also what `git push` uses by default. With `git_push = "ssh"`, pushes go
+through the [filtered SSH agent](credentials.md#ssh-the-filtered-agent) instead
+(see [git push](credentials.md#git-push-gh-or-ssh)).
 
 ## 3. Start it
 

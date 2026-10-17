@@ -12,6 +12,7 @@ release notes.
 - Remote hosts from the menu: bare `msbctl` → **remote hosts** adds, sets up, tests and removes them, and `msbctl remote setup NAME` installs what a host is missing (msb and msbctl at this machine's versions, autostart) and restricts your key there, asking before each step.
 - With remotes configured, `msbctl add` asks where the new sandbox should run, and the menu's sidebar lists every remote's sandboxes too.
 - `msbctl host authorize --replace` rewrites a key's existing line, so a key that already has a shell can be restricted.
+- Git push mode per sandbox (`git_push`, `msbctl edit` → Git push): `gh` (the new default) fetches and pushes over https with the GitHub token through gh's credential helper, even for an SSH origin; `ssh` pushes through the agent with the identity's new `push_key` only. Takes effect on the next start; set `git_push = "ssh"` in a sandbox's registry entry to keep pushing over SSH.
 - `msbctl remote setup` offers to copy your git identities and Claude tokens to the host; `msbctl setup --identity KEY --git-name … --git-email …` and `--default` set them without the menu.
 
 ### Changed

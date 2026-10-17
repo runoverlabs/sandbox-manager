@@ -305,6 +305,8 @@ do_clone() {
 	# it in the Basic header on the way to github.com. Nothing is written to
 	# disk, and `credential.helper store` must never be configured. --system,
 	# on the rootfs: gone after a rebuild, set again by the next bootstrap.
+	# Only for the clone, since gh is not installed yet: msbctl's
+	# ensure_git_push() replaces it with gh's own helper on every start.
 	# shellcheck disable=SC2016  # expanded when git runs the helper, not here
 	git config --system credential.https://github.com.helper \
 		'!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=${GH_TOKEN:-}"; }; f' || return 1

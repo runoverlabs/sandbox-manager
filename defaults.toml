@@ -118,6 +118,17 @@ claude_token = "main"
 # the repo itself.
 identity = ""
 
+# How a sandbox's git reaches GitHub, unless its registry entry says otherwise
+# (`msbctl edit <name>` → Git push). Applied on every start, in the guest's
+# --system git config, never the repo's own:
+#   "gh"   https for fetch and push, an ssh origin rewritten to https, with the
+#          GitHub token's placeholder handed over by gh's credential helper.
+#   "ssh"  push over ssh through the forwarded agent, offering github.com only
+#          the identity's push_key.
+# gh does PRs, Actions and the API either way. A sandbox cloned from a repo
+# (`add --repo`) has no agent and is always written with "gh".
+git_push = "gh"
+
 [identities]
 
 # Guest environment, emitted as `--env KEY=value` at create time. Every sandbox

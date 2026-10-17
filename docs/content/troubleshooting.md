@@ -124,6 +124,10 @@ directly), run `msbctl shell .` once, or delete what podman names yourself:
 
 ## `git push` over SSH fails
 
+- Check that the sandbox pushes over ssh at all: `msbctl show .` → `push`. With
+  `gh` it pushes over https with the GitHub token, whatever the remote says.
+- Check that the key is the right one for the account: the identity's
+  `push_key` is the only key github.com is offered.
 - Check that the key is selected: `msbctl keys .`.
 - Check that it's loaded in your **host** agent (`ssh-add -l`). msbctl tries to
   load selected keys at start, and warns if it can't.

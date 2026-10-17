@@ -509,6 +509,12 @@ class Sandbox:
         self.claude_token_pinned = self.entry.get("claude_token", "")
         self.claude_token = self.claude_token_pinned or default_claude_token(config)
         self.identity_name = self._pick("identity", defaults.get("identity"))
+        # Registry only, like the identity's keys it may name: how git reaches
+        # GitHub is this machine's credentials, not the project's. See GIT_PUSH.
+        self.git_push = self.entry.get("git_push") or defaults.get("git_push", "gh")
+        if self.git_push not in GIT_PUSH:
+            die(f"{self.name}: git_push {self.git_push!r} is not one of "
+                f"{', '.join(GIT_PUSH)} — fix it in {tilde(registry_path(self))}")
 
         self.conf_path = os.path.join(self.project, self.conf)
         # Inside the project, always. An absolute `conf` (or one climbing out
@@ -912,7 +918,11 @@ class Sandbox:
                 note(f"no GH_TOKEN for {self.name} — " + (
                     "the clone of a private repo, git push and the GitHub API need one: "
                     f"`msbctl secret set {self.name} GH_TOKEN`" if self.is_repo else
-                    "the GitHub API is unavailable in this sandbox (git push over SSH still works)"))
+                    "the GitHub API is unavailable in this sandbox (git push over SSH still works)"
+                    if self.git_push == "ssh" else
+                    "git push and the GitHub API need one: "
+                    f"`msbctl secret set {self.name} GH_TOKEN` (or push over ssh: "
+                    f"`msbctl edit {self.name}` → Git push)"))
 
         # Extra bindings, in msb's own `ENV[:OPTIONS]@HOST[,HOST]` syntax so a
         # hand-written one works too. Like the others, the value only ever
@@ -1166,6 +1176,34 @@ class Sandbox:
         fp = self.signing_fp
         keys = self.ssh_keys
         return bool(fp) and (keys is None or fp in keys)
+
+    @property
+    def push_pub(self):
+        """The public key line git pushes to GitHub with when git_push is
+        "ssh": the registry entry's own `push_key`, else the identity's. None
+        for neither, which leaves ssh offering every key the filter allows."""
+        return self.entry.get("push_key") or (self.identity or {}).get("push_key") or None
+
+    @property
+    def push_fp(self):
+        parsed = _parse_pub_line(self.push_pub) if self.push_pub else None
+        return parsed[0] if parsed else None
+
+    @property
+    def push_active(self):
+        """Like signing_active: the push key is pinned only while the sandbox
+        may use it, since pinning a key the agent filter hides fails every push."""
+        fp = self.push_fp
+        keys = self.ssh_keys
+        return bool(fp) and (keys is None or fp in keys)
+
+    @property
+    def github_token_bound(self):
+        """Whether GH_TOKEN reaches the guest as a placeholder: the same test
+        secret_env() applies, without emitting anything."""
+        wants = self.is_repo or self.project_cfg.get("secrets", {}).get("github", bool(self.repo))
+        return bool(wants and read_env_file(
+            os.path.join(SECRETS_DIR, f"{self.name}.env")).get("GH_TOKEN"))
 
     def env_vars(self):
         """Guest environment: [agent_env.<agent>] for each agent this sandbox
@@ -1942,14 +1980,16 @@ def assemble_profile():
 
 def sandbox_profile_section(box):
     """A few lines appended to THIS sandbox's copy of CLAUDE.md naming its
-    features, so the agent knows podman is there before it goes looking. From the
+    features, so the agent knows podman is there before it goes looking, and how
+    git pushes, so it does not "fix" a remote that git rewrites anyway. From the
     current config, so after an edit that still needs a rebuild it is ahead of the VM."""
     feats = current_features(box)
-    if not feats:
-        return ""
-    lines = ["## This sandbox", "",
-             f"`{box.name}` was set up with these features, each installed and its egress allowed:", ""]
-    lines += [f"- **{key}**: {desc}" for key, desc, _ in FEATURES if key in feats]
+    lines = ["## This sandbox", ""]
+    if feats:
+        lines += [f"`{box.name}` was set up with these features, each installed and its egress allowed:", ""]
+        lines += [f"- **{key}**: {desc}" for key, desc, _ in FEATURES if key in feats]
+        lines += [""]
+    lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push]]
     return "\n".join(lines)
 
 
@@ -2055,6 +2095,87 @@ def ensure_identity(box):
              f"cannot use, so commits are NOT signed — `msbctl keys {box.name}` to allow it")
 
 
+# How git reaches GitHub from the guest, per sandbox (`git_push`, registry or
+# [defaults]). Either way gh is what talks to the API; this is only transport.
+GIT_PUSH = {
+    "gh": "https, with the GitHub token through gh's credential helper",
+    "ssh": "ssh, through the forwarded agent, with the identity's push key",
+}
+# What sandbox_profile_section() tells the agent about each, so it neither
+# switches a remote to the other protocol nor reaches for `gh auth`.
+GIT_PUSH_PROFILE = {
+    "gh": ("every github.com remote, ssh or https, is fetched and pushed over https with "
+           "the GitHub token, through gh's credential helper (already configured in "
+           "/etc/gitconfig). Just `git push`; do not change a remote's URL."),
+    "ssh": ("pushes go over ssh through the forwarded agent, with one key chosen on the "
+            "host, even for an https remote (`pushInsteadOf` in /etc/gitconfig); fetches "
+            "stay as they are. Just `git push`; do not change a remote's URL."),
+}
+# Where ensure_git_push() puts the push key's PUBLIC half, and the ssh_config
+# snippet that names it. ssh accepts a .pub as IdentityFile and asks the agent
+# for the private half, so nothing secret is written.
+GUEST_PUSH_PUB = "/etc/git/github_push.pub"
+GUEST_PUSH_SSH_CONFIG = "/etc/ssh/ssh_config.d/50-msb-github.conf"
+
+
+def ensure_git_push(box):
+    """Point the guest's git at GitHub the way `git_push` says. Per boot, like
+    the identity, so switching needs a restart rather than a rebuild.
+
+    Everything is --system, in the guest's /etc, and never the repo's own
+    .git/config: in a folder sandbox that file is the HOST's checkout, and
+    changing its remote to suit the guest would change how the host pushes
+    too. So the remote stays what it is and git rewrites it on the way out:
+
+    gh   every github.com URL is fetched and pushed over https (insteadOf
+         turns an ssh origin into https), and gh's credential helper hands git
+         the GH_TOKEN placeholder, which msb swaps for the real token in the
+         Basic header on the way to github.com.
+    ssh  pushes go over ssh (pushInsteadOf turns an https origin into ssh;
+         fetches stay https, through the same helper, for a private repo), and
+         ssh offers github.com only the push key, if there is one. Without
+         IdentitiesOnly it offers every key the agent filter allows, in order,
+         and GitHub takes the first one it knows, which may be the wrong
+         account.
+
+    The credential helper is set in both modes and replaces bootstrap's inline
+    one (do_clone), which exists only because gh is installed after the clone.
+    Everything this writes is cleared first, so the guest's /etc/gitconfig,
+    which outlives the setting that wrote it, never keeps the other mode's
+    rewrites."""
+    pub = box.push_pub.split()[:2] if box.git_push == "ssh" and box.push_active else []
+    # The mode and the key are positional args, never spliced into the script.
+    script = (
+        "git config --system --unset-all url.https://github.com/.insteadOf; "
+        "git config --system --unset-all url.git@github.com:.pushInsteadOf; "
+        f"rm -f {GUEST_PUSH_PUB} {GUEST_PUSH_SSH_CONFIG}; "
+        "if command -v gh >/dev/null; then h='!gh auth git-credential'; else "
+        "h='!f() { test \"$1\" = get || exit 0; echo username=x-access-token; "
+        "echo \"password=${GH_TOKEN:-}\"; }; f'; fi; "
+        "git config --system --replace-all credential.https://github.com.helper \"$h\"; "
+        'if [ "$1" = gh ]; then '
+        "git config --system --add url.https://github.com/.insteadOf git@github.com: && "
+        "git config --system --add url.https://github.com/.insteadOf ssh://git@github.com/; "
+        "else "
+        "git config --system url.git@github.com:.pushInsteadOf https://github.com/; "
+        'if [ -n "$3" ]; then '
+        f'mkdir -p {GUEST_PUSH_PUB.rsplit("/", 1)[0]} {GUEST_PUSH_SSH_CONFIG.rsplit("/", 1)[0]} && '
+        f"printf '%s %s\\n' \"$2\" \"$3\" > {GUEST_PUSH_PUB} && "
+        f"printf 'Host github.com\\n  IdentityFile {GUEST_PUSH_PUB}\\n  IdentitiesOnly yes\\n' "
+        f"> {GUEST_PUSH_SSH_CONFIG}; "
+        "fi; fi; true")
+    run(["msb", "exec", box.name, "--no-tty", "--", "sh", "-c", script, "_", box.git_push, *pub],
+        check=False, quiet=True)
+    if box.git_push != "ssh":
+        return
+    if box.push_fp and not box.push_active:
+        warn(f"{box.name}: git pushes over ssh with a key this sandbox cannot use, so ssh "
+             f"offers whatever else it may — `msbctl keys {box.name}` to allow it")
+    elif box.ssh_keys == []:
+        warn(f"{box.name}: git pushes over ssh, but this sandbox may use no ssh key — "
+             f"`msbctl keys {box.name}`, or `msbctl edit {box.name}` → Git push → gh")
+
+
 def ensure_git_checkstat(box):
     """Set core.checkStat=minimal in the project's own repo, unless it already
     sets core.checkStat. Per boot, so an existing sandbox gets it on its next
@@ -2133,6 +2254,7 @@ def ensure_running(box, table=None):
     ensure_bridge(box)
     ensure_profile(box)
     ensure_identity(box)
+    ensure_git_push(box)
     ensure_git_checkstat(box)
     ensure_podman_runtime(box)
 
@@ -2667,6 +2789,7 @@ def do_create(box):
     ensure_bridge(box)
     ensure_profile(box)
     ensure_identity(box)
+    ensure_git_push(box)
     ensure_git_checkstat(box)
     ensure_podman_runtime(box)
     if boot.returncode != 0:
@@ -4419,6 +4542,38 @@ def pick_signing_key(current_pub):
     return pub
 
 
+def pick_push_key(current_pub, signing_pub=None):
+    """Choose the ssh key an identity pushes to GitHub with, or none. Like
+    pick_signing_key(), and with the signing key ticked when there is no push
+    key yet, since one key registered for both is the common case."""
+    cur = current_pub or signing_pub
+    fp = (_parse_pub_line(cur) or (None,))[0] if cur else None
+    note("Push over ssh with which key? The one key a sandbox on this identity offers")
+    note("github.com when it pushes over ssh (git_push = \"ssh\"), or none.")
+    chosen = pick_ssh_keys([fp] if fp else [], preselect_all=False, single=True)
+    if not chosen:
+        return None
+    pub = public_line(chosen[0][0])
+    if not pub:
+        warn("could not read that key's public half — no push key saved")
+    return pub
+
+
+def pick_git_push(current, identity_name, ident):
+    """Ask how git reaches GitHub from the sandbox. Returns a GIT_PUSH key."""
+    say("Git push")
+    note("gh does PRs, Actions and the API either way; this is how git itself")
+    note("fetches and pushes. The checkout's own remote is left as it is.")
+    has_key = bool(ident.get("push_key"))
+    rows = [f"gh   {GIT_PUSH['gh']}",
+            f"ssh  {GIT_PUSH['ssh']}" + ("" if has_key else
+                                         f"  ({identity_name or 'no identity'} has none: "
+                                         "ssh offers every allowed key)")]
+    keys = list(GIT_PUSH)
+    choice = choose_one("git push", rows, keys.index(current) if current in keys else 0)
+    return choice.split()[0]
+
+
 def section_identities(config, ctx):
     while True:
         config = load_config()
@@ -4429,7 +4584,8 @@ def section_identities(config, ctx):
         note("for anything that can reach a public repo: https://github.com/settings/emails")
         for key in sorted(local):
             note(f"  {key:<12} {local[key].get('name', '?')} <{local[key].get('email', '?')}>"
-                 + ("  (signs commits)" if local[key].get("signing_key") else ""))
+                 + ("  (signs commits)" if local[key].get("signing_key") else "")
+                 + ("  (pushes over ssh)" if local[key].get("push_key") else ""))
         action = choose_one("identities", ["add or change one", "remove one",
                                            "which is the default for new sandboxes", "back"], 0)
         if action.startswith("add"):
@@ -4445,9 +4601,11 @@ def section_identities(config, ctx):
                 continue
             table = f"identities.{key}"
             signing = pick_signing_key(cur.get("signing_key"))
+            push = pick_push_key(cur.get("push_key"), signing)
             set_toml_key(CONFIG_FILE, "name", name, table=table)
             set_toml_key(CONFIG_FILE, "email", email, table=table)
             set_toml_key(CONFIG_FILE, "signing_key", signing, table=table)
+            set_toml_key(CONFIG_FILE, "push_key", push, table=table)
             note(f"saved {key}")
             if len(local) == 0 and not config.get("defaults", {}).get("identity"):
                 set_toml_key(CONFIG_FILE, "identity", key, table="defaults")
@@ -5269,6 +5427,50 @@ def section_claude_token(box, config, ctx):
     ensure_running(Sandbox(box.name, config))
 
 
+def _summary_git_push(box):
+    if box.git_push == "gh":
+        return "gh (https)" + ("" if box.github_token_bound else ", NO GitHub token")
+    if not box.push_fp:
+        return "ssh, any allowed key"
+    return "ssh, " + ("its own key" if box.entry.get("push_key") else
+                      f"{box.identity_name}'s key") + ("" if box.push_active else ", NOT allowed")
+
+
+def section_git_push(box, config, ctx):
+    path = registry_path(box)
+    ident = box.identity or {}
+    mode = pick_git_push(box.git_push, box.identity_name, ident)
+    set_toml_key(path, "git_push", mode)
+    if mode == "ssh":
+        own = box.entry.get("push_key")
+        rows = ([f"{box.identity_name}'s push key"] if ident.get("push_key") else []) \
+            + ["a key for this sandbox only"] \
+            + ([] if ident.get("push_key") else ["none: offer every allowed key"])
+        pick = choose_one("push with", rows, rows.index("a key for this sandbox only") if own else 0)
+        if pick.startswith("a key"):
+            set_toml_key(path, "push_key", pick_push_key(own, ident.get("signing_key")))
+        else:
+            set_toml_key(path, "push_key", None)
+        box = Sandbox(box.name, config)
+        fp, keys = box.push_fp, box.ssh_keys
+        if fp and keys is not None and fp not in keys and confirm(
+                "this sandbox is not allowed that key — allow it (or git push fails)?"):
+            labels = _key_labels(keys + [fp])
+            write_ssh_keys(box, [(k, labels.get(k, "")) for k in keys + [fp]])
+            if os.environ.get("SSH_AUTH_SOCK"):
+                ensure_keys_loaded(Sandbox(box.name, config))
+    else:
+        box = Sandbox(box.name, config)
+        if not box.github_token_bound:
+            note("no GitHub token is bound, so git over https cannot authenticate —")
+            note("set one under GitHub token.")
+    if state_of(box.name) == "running":
+        ensure_git_push(Sandbox(box.name, config))
+        note("applied")
+    else:
+        note("applied on the next start")
+
+
 def _summary_identity(box):
     return f"{box.identity_name or 'no identity'}, autostart {'on' if box.autostart else 'off'}"
 
@@ -5399,6 +5601,7 @@ EDIT_SECTIONS = [
     ("Published ports", section_ports, _summary_ports),
     ("Egress rules", section_egress, _summary_egress),
     ("SSH keys", section_keys, _summary_keys),
+    ("Git push", section_git_push, _summary_git_push),
     ("Claude token", section_claude_token, _summary_claude_token),
     ("GitHub token", section_github, _summary_github),
     ("Secrets", section_secrets, _summary_secrets),
@@ -5773,6 +5976,7 @@ def show_data(box, table=None):
         "claude_token": {"name": box.claude_token,
                          "stored": box.claude_token in claude_tokens(shared)},
         "github_token_stored": bool(own.get("GH_TOKEN")),
+        "git_push": box.git_push,
         "secrets": secrets,
     }
     if box.is_repo:
@@ -5866,6 +6070,7 @@ def cmd_show(args, config):
                  f"use — `msbctl keys {box.name}`")
     else:
         note("  git  no identity set; a repo without one cannot commit here")
+    note(f"  push {_summary_git_push(box)}  (`msbctl edit {box.name}` → Git push)")
     if box.claude_auth == "secret":
         missing = "" if box.claude_token in claude_tokens() else f"  {RED}NOT STORED{RESET}"
         note(f"  claude  token {box.claude_token!r}"
@@ -7060,8 +7265,9 @@ def cmd_add(args, config):
         note(f"nothing checked out in {tilde(project)} yet")
         note(f"clone into {tilde(target)}?")
         note("")
-        note("SSH, matching the convention that origin is an SSH remote — the")
-        note("sandbox pushes through the forwarded agent, not through a token.")
+        note("SSH, on this machine with your own key. Inside the sandbox git rewrites")
+        note("the URL to however it pushes (the Git push step below), so the checkout's")
+        note("origin stays one this machine can use.")
         url = f"git@github.com:{repo}.git"
         if os.path.exists(target):
             note(f"{tilde(target)} already exists — leaving it alone")
@@ -7097,6 +7303,9 @@ def cmd_add(args, config):
         if identity and identity not in idents:
             die(f"unknown identity: {identity}")
 
+    git_push = pick_git_push(config.get("defaults", {}).get("git_push", "gh"),
+                             identity, idents.get(identity, {}) if identity else {})
+
     say("SSH keys")
     note("Which keys in your host ssh-agent this sandbox may use, for git over")
     note("ssh and for signing. Nothing is ticked by default: a sandbox gets no")
@@ -7106,7 +7315,13 @@ def cmd_add(args, config):
     if sign_fp:
         note(f"{identity} signs commits with the key marked{SIGNS_MARK.strip()}; it is ticked")
         note("for you, and without it this sandbox commits unsigned.")
-    ssh_keys = pick_ssh_keys([sign_fp] if sign_fp else None, preselect_all=False, signing=sign_fp)
+    push_pub = idents.get(identity, {}).get("push_key") if identity and git_push == "ssh" else None
+    push_fp = (_parse_pub_line(push_pub) or (None,))[0] if push_pub else None
+    if push_fp and push_fp != sign_fp:
+        note(f"{identity} pushes with the other key ticked for you; without it git push fails.")
+    ticked = [fp for fp in (sign_fp, push_fp) if fp]
+    ssh_keys = pick_ssh_keys(list(dict.fromkeys(ticked)) or None, preselect_all=False,
+                             signing=sign_fp)
 
     groups = sorted(g for g in config.get("rules", {}) if g != "base")
     default_groups = config.get("defaults", {}).get("rule_groups", [])
@@ -7158,7 +7373,7 @@ def cmd_add(args, config):
         fh.write(render("registry.toml.in", NAME=name, PROJECT=project,
                         GUEST_PATH=guest_path,
                         REPO=repo, DATE=today, IDENTITY=identity,
-                        CLAUDE_TOKEN=claude_token,
+                        GIT_PUSH=git_push, CLAUDE_TOKEN=claude_token,
                         SSH_KEYS=format_ssh_keys(ssh_keys),
                         MOUNTS=format_list("mounts", mounts, '# mounts = ["~/reference:/mnt/reference:ro"]'),
                         EXTRA_RULE_GROUPS=format_list("extra_rule_groups", local_groups,
@@ -8185,9 +8400,8 @@ def remote_setup(name, config):
     wanted = own_release()
     if not probe.get("curl") and (not probe.get("msb") or not probe.get("msbctl")):
         die(f"{name} has no curl, which both installers need — install it there first")
-    # The same msb as here: a sandbox's behaviour is msb's (spike 11 is a
-    # difference between two patch releases), and what works here should work
-    # there. Without msb here, the latest release.
+    # The same msb as here: a sandbox's behaviour is msb's, and what works
+    # here should work there. Without msb here, the latest release.
     want = local_msb_version()
     match = MSB_VERSION.search(probe.get("msb") or "")
     there = match.group(0) if match else ""

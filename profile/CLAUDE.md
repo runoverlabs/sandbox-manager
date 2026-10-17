@@ -46,9 +46,15 @@ address pools, which is why plaintext is simply off.
 Three things are wired in, and none of them puts a usable secret inside this VM.
 
 **SSH** goes through an agent forwarded from the host. The agent protocol
-crosses; the private key never does. `git push` works where the remote is SSH.
+crosses; the private key never does.
 `~/.ssh/known_hosts` is mounted read-only — you can verify hosts the operator
 already trusts and cannot silently add a new one.
+
+**`git push`** to GitHub is already set up, one of two ways, and the section
+"This sandbox" at the end says which: over https with `GH_TOKEN` through gh's
+credential helper, or over SSH through the agent with one chosen key. Either
+way git rewrites the remote's URL itself (`insteadOf` in `/etc/gitconfig`), so
+never change a remote's URL or add a credential helper to make a push work.
 
 **`GH_TOKEN`** is an opaque placeholder. The real token is substituted on the
 host, into request **headers only**, on the way out to `github.com` and

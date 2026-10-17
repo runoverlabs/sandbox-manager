@@ -36,6 +36,20 @@ repo = "{{REPO}}"
 # no identity of its own. Empty for none.
 identity = "{{IDENTITY}}"
 
+# How git reaches GitHub from inside, set on every start (so a change needs a
+# restart, not a rebuild). The repo's own remote is never touched — it is your
+# checkout, shared with the host — git rewrites the URL on the way out instead:
+#   "gh"   fetch and push over https. An ssh origin is turned into https, and
+#          gh's credential helper hands git the GitHub token's placeholder.
+#          Needs the GitHub token (`msbctl edit {{NAME}}` → GitHub token).
+#   "ssh"  push over ssh, through the forwarded agent, offering github.com only
+#          the identity's push_key (a key allowed under ssh keys, below). With
+#          no push key, ssh offers every allowed key and GitHub takes the first
+#          it knows, which may be another account.
+# gh still does PRs, Actions and the API in both. `msbctl edit {{NAME}}` → Git
+# push. Empty follows [defaults] git_push.
+git_push = "{{GIT_PUSH}}"
+
 # Which Claude token this sandbox logs in with, by the name it was stored under
 # (`msbctl setup` → Claude login). Empty follows [defaults] claude_token. The
 # value is read on every start, so a change needs a restart, not a rebuild.
@@ -121,6 +135,9 @@ policy_pin = ""
 #                                   # not contain `${`, which msb fills in from
 #                                   # its environment — the one holding the
 #                                   # bound secrets. Flags msbctl emits win.
+# push_key    = "ssh-ed25519 AAAA... laptop"
+#                                   # the public key git_push = "ssh" pushes
+#                                   # with, instead of the identity's push_key.
 # volumes     = "old-name"          # prefix of the cache/container disk volumes;
 #                                   # `msbctl rename` sets it, since msb cannot
 #                                   # rename a volume. Defaults to the name.
