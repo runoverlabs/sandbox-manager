@@ -40,22 +40,17 @@ It is designed never to guess:
 you land in `/work/src` (or in `~/proj/src` itself, if the sandbox uses the
 [host's own path](advanced.md#where-the-project-appears-in-the-sandbox)).
 
-## shell, exec, code
+## shell and exec
 
 ```console
 $ msbctl shell myproject                  # bash -l, SSH agent wired up
 $ msbctl exec myproject -- npm test       # one command
-$ msbctl code myproject                   # your editor on the project, on the host
 ```
 
 `shell` and `exec` start a stopped sandbox first, but they never *create* one:
 creating is the one step that runs the bootstrap and fixes the network policy,
 so it should never happen as a side effect. Use `msbctl start` (or
 `msbctl rebuild`) for that.
-
-`code` opens `$MSB_EDITOR` (default `codium`) on the project folder **on the
-host**, detached from the terminal. The editor works on the same files the
-sandbox sees.
 
 ## Looking around
 
@@ -87,7 +82,6 @@ what's out of date inside it, and binds a key to each action:
 | Key | Action |
 | --- | --- |
 | `enter` (or `e`) | edit, one wizard section at a time (`msbctl edit`) |
-| `c` | open the editor on the project (`msbctl code`) |
 | `t` | shell |
 | `s` / `x` | start / stop |
 | `u` | update claude, gh and apt packages |

@@ -234,15 +234,6 @@ $ msbctl exec -e DEBUG=1 --no-tty -- ./run.sh
 `-w`/`--workdir` replaces the matching subfolder of the project, and for `shell`,
 `--no-tty` or `--stream` replaces the terminal it would otherwise allocate.
 
-### `msbctl code`
-
-```text
-msbctl code [name]
-```
-
-Open your editor on the project folder, on the host: `$MSB_EDITOR`, default
-`codium`.
-
 ## Changing a sandbox
 
 ### `msbctl edit`
@@ -441,7 +432,6 @@ addresses a sandbox there for every verb, and `ls` shows every host. See
 | --- | --- |
 | `MSB_CONFIG_DIR` | config directory (default `~/.config/msb`) |
 | `MSB_STATE_DIR` | state directory (default `~/.local/state/msb`) |
-| `MSB_EDITOR` | the editor `msbctl code` opens (default `codium`) |
 | `MSB_NO_AUTOSTART=1` | the picker doesn't start autostart sandboxes |
 | `MSB_MANAGER_SKIP_ATTEST=1` | installer and `self-update`: skip the provenance check |
 | `MSB_MANAGER_REPO`, `MSB_MANAGER_BASE_URL` | installer: another repository, or a mirror (`file://` works; needs `--version`) |

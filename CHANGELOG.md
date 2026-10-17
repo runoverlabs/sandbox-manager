@@ -15,7 +15,10 @@ release notes.
 - `msbctl remote setup` offers to copy your git identities and Claude tokens to the host; `msbctl setup --identity KEY --git-name … --git-email …` and `--default` set them without the menu.
 
 ### Changed
-- In the picker, Enter now edits the sandbox (`msbctl edit`); the editor on its project moved to `c`.
+- In the picker, Enter now edits the sandbox (`msbctl edit`).
+
+### Removed
+- `msbctl code` and `MSB_EDITOR`: open the project folder in your editor yourself.
 
 ### Fixed
 - Bare `msbctl` → "register a new project" crashed with `AttributeError: 'Namespace' object has no attribute 'repo'`, and "refresh version info" likewise.

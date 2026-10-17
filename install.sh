@@ -188,10 +188,6 @@ if ! command -v konsole >/dev/null; then
 fi
 note "terminal: $TERMINAL"
 
-EDITOR_BIN="${MSB_EDITOR:-codium}"
-command -v "$EDITOR_BIN" >/dev/null \
-	|| warn "$EDITOR_BIN not found — 'open editor' will fail until you set MSB_EDITOR"
-
 [ -e /dev/kvm ] || warn "no /dev/kvm — microsandbox cannot run on this machine"
 
 if [ "${#missing[@]}" -gt 0 ]; then

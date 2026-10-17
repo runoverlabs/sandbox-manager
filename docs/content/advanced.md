@@ -151,7 +151,7 @@ as a folder's.
 `msbctl allow`, `secret add` and `edit` write to the registry entry, since
 there's no checkout to edit, and what they add sits on top of the repo's rules
 and bindings rather than replacing them. A change meant to last belongs in the
-repo. `code` and `move` refuse: there is no folder. No ssh-agent is forwarded,
+repo. `move` refuses: there is no folder. No ssh-agent is forwarded,
 so `ssh_keys = []`, and git uses HTTPS with the token.
 
 `guest_path` can't be `"host"` (there's no host path) and can't contain a dot

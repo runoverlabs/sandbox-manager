@@ -202,12 +202,11 @@ class RepoTest(MsbctlTest):
         self.assertFalse(os.path.exists(self.m.policy_dir("webshop")))
         self.assertFalse(os.path.exists(self.entry_path("webshop")))
 
-    def test_code_and_move_refuse(self):
+    def test_move_refuses(self):
         self.add()
-        for argv in (("code", "webshop"), ("move", "webshop", "/tmp")):
-            code, _, err = self.main(*argv)
-            self.assertNotEqual(code, 0)
-            self.assertIn("no folder on this machine", err)
+        code, _, err = self.main("move", "webshop", "/tmp")
+        self.assertNotEqual(code, 0)
+        self.assertIn("no folder on this machine", err)
 
     def test_allow_adds_to_the_repo_rules(self):
         self.add()

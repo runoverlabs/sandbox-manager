@@ -5,8 +5,7 @@
 # A management console, not an attach menu: it lists every registered sandbox
 # with its state and what is out of date inside it, and binds a key to each
 # lifecycle action. Enter edits the sandbox under the cursor (`msbctl edit`,
-# the wizard's sections); c opens the editor on its project folder on the host,
-# and t a shell inside it.
+# the wizard's sections), and t opens a shell inside it.
 #
 # Nothing here knows anything about microsandbox. Every key runs an `msbctl`
 # subcommand, so this file stays a keymap and the behaviour has exactly one
@@ -59,8 +58,8 @@ if [ "${MSB_NO_AUTOSTART:-0}" != 1 ]; then
 fi
 
 HEADER=$(cat <<-'EOF'
-	enter edit   c code     t shell    s start    x stop
-	u update     l reclaim  f refresh  n add new
+	enter edit   t shell    s start    x stop     l reclaim
+	u update     f refresh  n add new
 	R rebuild    D purge    (capitals: they destroy; rebuild does not ask)
 	space select  a all  j/k move  q quit
 	start/stop/rebuild/update/purge/reclaim act on every selected row
@@ -87,8 +86,8 @@ fi
 # below take `names...`, so one invocation covers the whole selection and this
 # file stays a keymap with no loop in it.
 #
-# enter, e, c and t keep {1}: each hands the terminal (or a window) to one
-# thing, and "edit four sandboxes" or "open four editors" is not a useful action.
+# enter, e and t keep {1}: each hands the terminal to one thing, and "edit
+# four sandboxes" is not a useful action.
 #
 # Plain letters are the keys: no ctrl-, nothing to chord. --disabled turns the
 # fuzzy search off and INPUT_OPTS hides the input line, so no letter is ever a
@@ -127,7 +126,6 @@ exec fzf \
 	--bind="e:execute($MSBCTL edit {1})+reload($LIST)" \
 	--bind="enter:execute($MSBCTL edit {1})+reload($LIST)" \
 	--bind="n:execute($MSBCTL add)+reload($LIST)" \
-	--bind="c:execute-silent($MSBCTL code {1})" \
 	--bind="q:abort" \
 	--bind="esc:abort" \
 	< <($LIST)

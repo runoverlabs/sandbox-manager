@@ -14,9 +14,9 @@
 <rect x="18.0" y="174.0" width="4.2" height="18.0" fill="#ff7b72"/>
 <path d="M568.2 48.0V66.0M1441.8 48.0V66.0M568.2 66.0V84.0M1441.8 66.0V84.0M568.2 84.0V102.0M1441.8 84.0V102.0M568.2 102.0V120.0M1441.8 102.0V120.0M568.2 120.0V138.0M1441.8 120.0V138.0M568.2 138.0V156.0M1441.8 138.0V156.0M568.2 156.0V174.0M1441.8 156.0V174.0M568.2 174.0V192.0M1441.8 174.0V192.0M568.2 192.0V210.0M1441.8 192.0V210.0M568.2 210.0V228.0M1441.8 210.0V228.0M568.2 228.0V246.0M1441.8 228.0V246.0M568.2 246.0V264.0M1441.8 246.0V264.0M568.2 264.0V282.0M1441.8 264.0V282.0M568.2 282.0V300.0M1441.8 282.0V300.0M568.2 300.0V318.0M1441.8 300.0V318.0M568.2 318.0V336.0M1441.8 318.0V336.0M568.2 336.0V354.0M1441.8 336.0V354.0M568.2 354.0V372.0M1441.8 354.0V372.0M568.2 372.0V390.0M1441.8 372.0V390.0M568.2 390.0V408.0M568.2 408.0V426.0M568.2 426.0V444.0M568.2 444.0V462.0M568.2 462.0V480.0M568.2 480.0V498.0M568.2 498.0V516.0M568.2 516.0V534.0M568.2 534.0V552.0M568.2 552.0V570.0M568.2 570.0V588.0M568.2 588.0V606.0M568.2 606.0V624.0M568.2 624.0V642.0M568.2 642.0V660.0" stroke="#77847a" stroke-width="1.2" fill="none"/>
 <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, 'DejaVu Sans Mono', 'Liberation Mono', monospace" font-size="14.0" xml:space="preserve">
-<text x="34.8" y="61.0" fill="#6cc3f5" textLength="436.8" lengthAdjust="spacingAndGlyphs">enter edit   c code     t shell    s start    x stop</text>
+<text x="34.8" y="61.0" fill="#6cc3f5" textLength="462.0" lengthAdjust="spacingAndGlyphs">enter edit   t shell    s start    x stop     l reclaim</text>
 <text x="1404.0" y="61.0" fill="#0b0e0c" textLength="33.6" lengthAdjust="spacingAndGlyphs">1/58</text>
-<text x="34.8" y="79.0" fill="#6cc3f5" textLength="369.6" lengthAdjust="spacingAndGlyphs">u update     l reclaim  f refresh  n add new</text>
+<text x="34.8" y="79.0" fill="#6cc3f5" textLength="277.2" lengthAdjust="spacingAndGlyphs">u update     f refresh  n add new</text>
 <text x="580.8" y="79.0" fill="#eef5ee" font-weight="bold" textLength="176.4" lengthAdjust="spacingAndGlyphs">== webshop  [running]</text>
 <text x="34.8" y="97.0" fill="#6cc3f5" textLength="520.8" lengthAdjust="spacingAndGlyphs">R rebuild    D purge    (capitals: they destroy; rebuild doe··</text>
 <text x="606.0" y="97.0" fill="#cfd8cf" textLength="260.4" lengthAdjust="spacingAndGlyphs">project    ~/workspaces/webshop</text>

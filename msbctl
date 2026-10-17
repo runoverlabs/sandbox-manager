@@ -28,7 +28,6 @@
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
     msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (then rebuild)
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
-    msbctl code <name>            open the editor on the project, on the host
     msbctl reclaim <name>         give the guest's page cache back to the host
     msbctl host serve|authorize|check|autostart   run this machine as a remote host
     msbctl remote add|ls|test|rm  the machines this one drives; then HOST:name anywhere
@@ -3076,21 +3075,6 @@ def cmd_reclaim(args, config):
     # second. Anonymous memory needs no help.
     run(["msb", "exec", box.name, "--no-tty", "--", "sh", "-c",
          "sync; echo 3 > /proc/sys/vm/drop_caches; echo reclaimed"], check=False)
-
-
-def cmd_code(args, config):
-    box = Sandbox(args.name, config)
-    refuse_repo_sandbox(box, "open (`msbctl shell` gets you into the clone)")
-    editor = os.environ.get("MSB_EDITOR", "codium")
-    if not shutil.which(editor):
-        die(f"{editor} is not on PATH — set MSB_EDITOR to the one you use")
-    # Detached: the picker that invoked this should not wait for the editor,
-    # and closing the terminal should not close the editor.
-    subprocess.Popen([editor, box.project],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
-    note(f"{editor} opening {tilde(box.project)}")
-    note(f"From its terminal: msbctl shell {box.name}")
 
 
 def confirm(question):
@@ -7528,8 +7512,8 @@ def restricted_problem(argv):
     if func is cmd_host:
         return None if args.action == "check" else f"host {args.action} is for the host itself"
     # allow: a new egress rule. mount: a host path. port: a host port. keys:
-    # which of the host's ssh keys a sandbox may sign with. code: runs an
-    # editor on the host. move/entry/edit: rewrite the registry and the policy.
+    # which of the host's ssh keys a sandbox may sign with. move/entry/edit:
+    # rewrite the registry and the policy.
     # _agent-filter: the host's ssh-agent. The menu: all of the above.
     return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
 
@@ -8640,12 +8624,9 @@ def local_status(args, config, names):
 # ----------------------------------------------------------------------- menu
 
 def text_editor():
-    """A TERMINAL editor, deliberately not MSB_EDITOR.
-
-    MSB_EDITOR is the GUI one `msbctl code` opens on a project. The menu runs
-    inside a terminal and edits small config files, where $VISUAL/$EDITOR is
-    the convention and a detached GUI window would leave the menu waiting on
-    nothing.
+    """A TERMINAL editor. The menu runs inside a terminal and edits small
+    config files, where $VISUAL/$EDITOR is the convention and a detached GUI
+    window would leave the menu waiting on nothing.
     """
     for candidate in (os.environ.get("VISUAL"), os.environ.get("EDITOR"),
                       "nano", "vi"):
@@ -8930,10 +8911,6 @@ def build_parser():
         p.set_defaults(func=func)
 
     # Single-name on purpose: each of these hands the terminal to one thing.
-    p = sub.add_parser("code", help="open the editor on the project")
-    p.add_argument("name", nargs="?", help=NAME_HELP)
-    p.set_defaults(func=cmd_code)
-
     p = sub.add_parser("shell", help="interactive shell",
                        usage="msbctl shell [name] [msb exec flags…]",
                        epilog=MSB_EXEC_HINT)

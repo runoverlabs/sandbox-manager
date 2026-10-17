@@ -163,7 +163,7 @@ $ ssh -t msb@host -- 'msbctl shell webshop'
 | `add` | only `--repo` (a folder `add` mounts a host path) |
 | `policy` | `show` |
 | `host` | `check` |
-| `allow`, `mount`, `port`, `keys`, `code`, `move`, `entry`, `edit`, the menu | no |
+| `allow`, `mount`, `port`, `keys`, `move`, `entry`, `edit`, the menu | no |
 
 Every sandbox must be named: `.` and an omitted name mean the host's current
 folder, which means nothing to the caller. `exec` and `shell` pass on only the
