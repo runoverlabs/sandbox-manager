@@ -8376,12 +8376,14 @@ def kandev_name_problem(name):
 
 
 def kandev_secrets(raw, field="secrets"):
-    """[(name, value, [hosts])] from a request, checked."""
+    """({name: value}, [(name, [hosts])]) from a request, checked. Two
+    structures on purpose: what is written to the entry is built from the
+    second alone, which never held a value."""
     if raw is None:
-        return []
+        return {}, []
     if not isinstance(raw, list):
         raise KandevError("invalid_config", f"{field} must be a list")
-    out, seen = [], set()
+    values, bindings, seen = {}, [], set()
     for item in raw:
         if not isinstance(item, dict):
             raise KandevError("invalid_config", f"each of {field} is an object")
@@ -8397,8 +8399,9 @@ def kandev_secrets(raw, field="secrets"):
         if hosts is not None and (not isinstance(hosts, list) or not hosts or any(
                 not isinstance(h, str) or not HOSTNAME.fullmatch(h) for h in hosts)):
             raise KandevError("invalid_config", f"secret {name}: hosts is a list of hostnames")
-        out.append((name, value, hosts or []))
-    return out
+        values[name] = value
+        bindings.append((name, list(hosts or [])))
+    return values, bindings
 
 
 def kandev_registry(raw, image):
@@ -8445,7 +8448,7 @@ def kandev_pull(image, registry):
                 with open(msb_config_file(), encoding="utf-8") as fh:
                     current = json.load(fh)
             except (OSError, ValueError):
-                pass
+                current = {}    # no config of the operator's, or none msb could read either
             hosts = current.setdefault("registries", {}).setdefault("hosts", {})
             hosts.setdefault(host, {})["auth"] = {"username": user,
                                                   "password_env": "MSBCTL_REGISTRY_PASSWORD"}
@@ -8671,8 +8674,8 @@ def kandev_provision(args, config, settings):
     expires = parse_iso(req.get("expires_at"), "expires_at")
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
-    secrets = kandev_secrets(req.get("secrets"))
-    if any(not hosts for _, _, hosts in secrets):
+    values, bindings = kandev_secrets(req.get("secrets"))
+    if any(not hosts for _, hosts in bindings):
         raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
     guest_env = req.get("env") or []
     if not isinstance(guest_env, list):
@@ -8682,7 +8685,7 @@ def kandev_provision(args, config, settings):
         if not isinstance(item, dict) or not isinstance(item.get("value"), str):
             raise KandevError("invalid_config", "each env item is {name, value}")
         problem = kandev_name_problem(item.get("name"))
-        if problem or any(item["name"] == s[0] for s in secrets):
+        if problem or item["name"] in values:
             raise KandevError("invalid_config", f"env {problem or item['name'] + ' is also a secret'}")
         if "\n" in item["value"] or "\0" in item["value"] or len(item["value"]) > 4096:
             raise KandevError("invalid_config", f"env {item['name']}: one line of at most 4096 characters")
@@ -8702,7 +8705,7 @@ def kandev_provision(args, config, settings):
             raise KandevError("rate_limited", "this host is at its [kandev] limits", 30)
         host_ports = kandev_alloc_ports(settings)
         ports = [f"127.0.0.1:{h}:{g}" for h, g in zip(host_ports, KANDEV_GUEST_PORTS, strict=True)]
-        binds = [f"{n}@{','.join(h)}" for n, _, h in secrets]
+        binds = [f"{n}@{','.join(h)}" for n, h in bindings]
         now = utc_now()
         os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
         # The entry FIRST: a crash between here and the end leaves something
@@ -8741,7 +8744,7 @@ def kandev_provision(args, config, settings):
         argv += ["--secret-violation-action", "block-and-log"]
     argv += ["--label", KANDEV_OWNER_LABEL, "--label", f"kandev.env={env}",
              "--max-duration", f"{seconds}s", image]
-    proc = run(argv, env={n: v for n, v, _ in secrets}, check=False, quiet=True)
+    proc = run(argv, env=values, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
     entry = read_toml(registry_path_for(name))
@@ -8845,7 +8848,7 @@ def kandev_start(args, config, settings):
         return kandev_record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
-    given = {n: v for n, v, _ in kandev_secrets(req.get("secrets"))}
+    given, _ = kandev_secrets(req.get("secrets"))
     bound = [secret_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):
         # Never a half-bound start: a missing value would reach the guest's

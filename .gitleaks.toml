@@ -5,3 +5,9 @@ useDefault = true
 [[allowlists]]
 description = "NodeSource's public apt signing-key fingerprint, pinned in bootstrap.sh. A fingerprint is a hash of a public key, not a credential; flagged as generic-api-key on entropy alone."
 regexes = ['''6F71F525282841EEDAF851B42F59B5F99B1BE0B4''']
+
+[[allowlists]]
+description = "A planted test value in tests/test_kandev.py at e14b182, renamed since: the tests assert it never reaches argv or a file. Not a credential; flagged as generic-api-key because the constant was called SECRET."
+condition = "AND"
+commits = ["e14b1828bf625f8f9d4304542d5f7b341872ab96"]
+paths = ['''tests/test_kandev\.py''']

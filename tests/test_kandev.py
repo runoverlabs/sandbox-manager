@@ -9,9 +9,9 @@ from unittest import main, mock
 from tests.harness import MsbctlTest
 
 IMAGE = "ghcr.io/acme/api-sbx@sha256:" + "a" * 64
-SECRET = "npm-secret-planted-4d1"
-NONCE = "nonce-planted-9c2"
-PASSWORD = "registry-password-planted-7e5"
+PLANTED_NPM = "planted-npm-value"
+PLANTED_NONCE = "planted-nonce-value"
+PLANTED_REGISTRY = "planted-registry-value"
 API_ADDR = "100.64.0.5"
 
 
@@ -21,7 +21,7 @@ def request(**over):
            "kandev_api": {"host": "kandev.example.ts.net", "port": 443},
            "egress_allow": ["pypi.org"],
            "env": [{"name": "NODE_ENV", "value": "development"}],
-           "secrets": [{"name": "NPM_TOKEN", "value": SECRET, "hosts": ["registry.npmjs.org"]}]}
+           "secrets": [{"name": "NPM_TOKEN", "value": PLANTED_NPM, "hosts": ["registry.npmjs.org"]}]}
     req.update(over)
     return json.dumps(req) + "\n"
 
@@ -53,9 +53,11 @@ class KandevTest(MsbctlTest):
             code, out, err = self.run_main("kandev", *argv, stdin=stdin if isinstance(stdin, bytes)
                                            else stdin.encode())
         try:
-            return code, json.loads(out)
+            doc = json.loads(out)
         except ValueError:
-            self.fail(f"stdout is not one JSON document: {out!r}\n{err}")
+            doc = None
+        self.assertIsNotNone(doc, f"stdout is not one JSON document: {out!r}\n{err}")
+        return code, doc
 
     def ok(self, *argv, stdin=""):
         code, doc = self.kandev(*argv, stdin=stdin)
@@ -148,9 +150,9 @@ class Provision(KandevTest):
         secret = [argv[i + 1] for i, a in enumerate(argv) if a == "--secret"]
         self.assertEqual(len(secret), 1)
         self.assertTrue(secret[0].startswith("NPM_TOKEN:passthrough=["))
-        self.assertEqual(create[0]["env"].get("NPM_TOKEN"), SECRET)
-        self.assert_not_in_argv(SECRET)
-        self.assert_nowhere_on_disk(SECRET)
+        self.assertEqual(create[0]["env"].get("NPM_TOKEN"), PLANTED_NPM)
+        self.assert_not_in_argv(PLANTED_NPM)
+        self.assert_nowhere_on_disk(PLANTED_NPM)
         # The only exec is the API pin in /etc/hosts: no bootstrap, no profile.
         execs = self.msb_calls("exec")
         self.assertEqual(len(execs), 1)
@@ -209,16 +211,16 @@ class Provision(KandevTest):
         self.provision(egress_allow=["anything.example", "10.0.0.5:22"])
 
     def test_private_registry_password_stays_in_one_environment(self):
-        self.provision(registry={"username": "bot", "password": PASSWORD})
+        self.provision(registry={"username": "bot", "password": PLANTED_REGISTRY})
         pull = self.msb_calls("pull")[0]
         self.assertEqual(pull["argv"], ["pull", IMAGE])
-        self.assertEqual(pull["env"]["MSBCTL_REGISTRY_PASSWORD"], PASSWORD)
+        self.assertEqual(pull["env"]["MSBCTL_REGISTRY_PASSWORD"], PLANTED_REGISTRY)
         auth = pull["msb_config"]["registries"]["hosts"]["ghcr.io"]["auth"]
         self.assertEqual(auth, {"username": "bot", "password_env": "MSBCTL_REGISTRY_PASSWORD"})
         self.assertFalse(os.path.exists(pull["env"]["MSB_CONFIG_PATH"]))
         self.assertNotIn("MSBCTL_REGISTRY_PASSWORD", self.msb_calls("create")[0]["env"])
-        self.assert_not_in_argv(PASSWORD)
-        self.assert_nowhere_on_disk(PASSWORD)
+        self.assert_not_in_argv(PLANTED_REGISTRY)
+        self.assert_nowhere_on_disk(PLANTED_REGISTRY)
 
     def test_registry_needs_a_registry_host(self):
         self.error("invalid_config", "provision", "e1", stdin=request(
@@ -253,7 +255,7 @@ class Lifecycle(KandevTest):
 
     def agentctl_input(self, blob=b"\x7fELF fake agentctl", **over):
         header = {"sha256": hashlib.sha256(blob).hexdigest(), "size": len(blob), "version": "0.97.0",
-                  "nonce": NONCE, "runtime_port": 8765, "args": ["-port=8765"],
+                  "nonce": PLANTED_NONCE, "runtime_port": 8765, "args": ["-port=8765"],
                   "env": {"AGENTCTL_LISTEN_HOST": "0.0.0.0"}}  # noqa: S104 — the guest's own listener
         header.update(over)
         return json.dumps(header).encode() + b"\n" + blob
@@ -267,10 +269,10 @@ class Lifecycle(KandevTest):
         self.assertEqual(rec["agentctl"]["sha256"], hashlib.sha256(blob).hexdigest())
         execs = self.msb_calls("exec")[1:]
         self.assertEqual(execs[0]["stdin"]["sha256"], hashlib.sha256(blob).hexdigest())
-        self.assertEqual(execs[1]["stdin"]["sha256"], hashlib.sha256(NONCE.encode() + b"\n").hexdigest())
+        self.assertEqual(execs[1]["stdin"]["sha256"], hashlib.sha256(PLANTED_NONCE.encode() + b"\n").hexdigest())
         self.assertIn("AGENTCTL_LISTEN_HOST=0.0.0.0", execs[1]["argv"])
-        self.assert_not_in_argv(NONCE)
-        self.assert_nowhere_on_disk(NONCE)
+        self.assert_not_in_argv(PLANTED_NONCE)
+        self.assert_nowhere_on_disk(PLANTED_NONCE)
         # The same binary again, still answering: nothing is written.
         self.ok("agentctl", "6f1c2b9e", stdin=self.agentctl_input(blob))
         self.assertEqual(len(self.msb_calls("exec")), 3)
@@ -314,15 +316,15 @@ class Lifecycle(KandevTest):
         self.error("invalid_config", "start", "6f1c2b9e", stdin="")
         wrong = json.dumps({"secrets": [{"name": "OTHER", "value": "v", "hosts": ["a.example"]}]})
         self.error("invalid_config", "start", "6f1c2b9e", stdin=wrong + "\n")
-        right = json.dumps({"secrets": [{"name": "NPM_TOKEN", "value": SECRET}]})
+        right = json.dumps({"secrets": [{"name": "NPM_TOKEN", "value": PLANTED_NPM}]})
         rec = self.ok("start", "6f1c2b9e", stdin=right + "\n")["record"]
         self.assertEqual((rec["state"], rec["generation"]), ("running", 2))
         start = self.msb_calls("start")[0]
-        self.assertEqual(start["env"]["NPM_TOKEN"], SECRET)
+        self.assertEqual(start["env"]["NPM_TOKEN"], PLANTED_NPM)
         # msb writes a fresh /etc/hosts on every boot, so the pin is re-applied.
         self.assertEqual(self.msb_calls("exec")[-1]["argv"][-1], "kandev.example.ts.net")
-        self.assert_not_in_argv(SECRET)
-        self.assert_nowhere_on_disk(SECRET)
+        self.assert_not_in_argv(PLANTED_NPM)
+        self.assert_nowhere_on_disk(PLANTED_NPM)
 
     def test_expiry_is_clamped(self):
         self.provision(expires_at="2090-01-01T00:00:00Z")
@@ -407,7 +409,7 @@ class OperatorSide(KandevTest):
         self.assertEqual(json.loads(out)["kandev"]["env"], "6f1c2b9e")
         code, out, err = self.run_main("show", "k-6f1c2b9e")
         self.assertEqual(code, 0, err)
-        self.assertNotIn(SECRET, out + err)
+        self.assertNotIn(PLANTED_NPM, out + err)
 
     def test_shell_only_while_running(self):
         self.provision()
