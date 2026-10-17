@@ -83,7 +83,10 @@ REFUSED = [
     "msbctl policy web update",
     "msbctl host authorize 'ssh-ed25519 AAAA'",
     "msbctl host autostart install",
+    "msbctl host kandev install",
     "msbctl host serve",
+    "msbctl host serve --kandev",
+    "msbctl host authorize 'ssh-ed25519 AAAA' --kandev",
     "msbctl allow web evil.example",
     "msbctl mount web /etc",
     "msbctl port web 8080",
@@ -97,13 +100,40 @@ REFUSED = [
 ]
 
 
+# The Kandev plugin's key: `host serve --kandev`. Each kandev verb is allowed
+# there and refused under the everyday key; every operator verb is refused there.
+KANDEV_ALLOWED = [
+    "msbctl --version",
+    "msbctl kandev health",
+    "msbctl kandev list",
+    "msbctl kandev provision 6f1c2b9e-aaaa",
+    "msbctl kandev agentctl 6f1c2b9e-aaaa",
+    "msbctl kandev inspect 6f1c2b9e-aaaa",
+    "msbctl kandev find --operation op-1",
+    "msbctl kandev start 6f1c2b9e-aaaa",
+    "msbctl kandev stop 6f1c2b9e-aaaa",
+    "msbctl kandev expiry 6f1c2b9e-aaaa --at 2026-10-17T15:00:00Z",
+    "msbctl kandev lease 6f1c2b9e-aaaa 8765",
+    "msbctl kandev destroy 6f1c2b9e-aaaa",
+    "msbctl kandev reap",
+]
+
+KANDEV_REFUSED = [
+    "msbctl ls", "msbctl status", "msbctl show web", "msbctl shell web",
+    "msbctl exec web -- true", "msbctl secret set web GH_TOKEN --stdin", "msbctl setup",
+    "msbctl allow web x.example", "msbctl add --repo acme/web -y", "msbctl edit web",
+    "msbctl rm web", "msbctl purge web -y", "msbctl start web", "msbctl host check",
+    "msbctl kandev bogus", "msbctl kandev", "/bin/sh -c ls", "",
+]
+
+
 class Exec(Exception):
     pass
 
 
 class HostServeTest(MsbctlTest):
 
-    def serve(self, command):
+    def serve(self, command, kandev=False):
         os.environ["SSH_ORIGINAL_COMMAND"] = command
         seen = {}
 
@@ -115,7 +145,7 @@ class HostServeTest(MsbctlTest):
 
         with mock.patch.object(self.m.os, "execv", fake_execv):
             try:
-                code, out, err = self.run_main("host", "serve")
+                code, out, err = self.run_main("host", "serve", *(["--kandev"] if kandev else []))
             except Exec:
                 return 0, seen, ""
         return code, seen, err
@@ -140,6 +170,25 @@ class HostServeTest(MsbctlTest):
                 self.assertNotIn("argv", seen)
                 self.assertIn("msbctl host serve: refused:", err)
 
+    def test_kandev_key_runs_kandev_verbs_only(self):
+        for command in KANDEV_ALLOWED:
+            with self.subTest(command=command):
+                code, seen, err = self.serve(command, kandev=True)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(seen["restricted"], "1")
+        for command in KANDEV_REFUSED:
+            with self.subTest(command=command):
+                code, seen, err = self.serve(command, kandev=True)
+                self.assertEqual(code, 126, err)
+                self.assertNotIn("argv", seen)
+
+    def test_everyday_key_runs_no_kandev_verb(self):
+        for command in KANDEV_ALLOWED[1:]:
+            with self.subTest(command=command):
+                code, seen, err = self.serve(command)
+                self.assertEqual(code, 126, err)
+                self.assertIn("Kandev plugin's key", err)
+
     def test_no_forced_command(self):
         os.environ.pop("SSH_ORIGINAL_COMMAND", None)
         code, _, err = self.run_main("host", "serve")
@@ -151,6 +200,8 @@ class HostServeTest(MsbctlTest):
         code, _, err = self.run_main("host", "authorize", "ssh-ed25519 AAAA")
         self.assertNotEqual(code, 0)
         code, _, err = self.run_main("host", "autostart", "install")
+        self.assertNotEqual(code, 0)
+        code, _, err = self.run_main("host", "kandev", "install")
         self.assertNotEqual(code, 0)
 
 
@@ -177,6 +228,16 @@ class AuthorizeTest(MsbctlTest):
         self.assertNotEqual(code, 0)
         self.assertIn("already", err)
         self.assertEqual(len(self.authorized()), 1)
+
+    def test_kandev_line(self):
+        with mock.patch.object(self.m.shutil, "which", lambda name: "/home/x/.local/bin/msbctl"):
+            code, out, err = self.run_main("host", "authorize", KEY, "--kandev")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.authorized(), [
+            'restrict,command="/home/x/.local/bin/msbctl host serve --kandev" ' + KEY])
+        code, _, err = self.run_main("host", "authorize", KEY, "--kandev", "--admin", "--replace")
+        self.assertNotEqual(code, 0)
+        self.assertIn("two different keys", err)
 
     def test_admin_plain_key_asks(self):
         code, _, _ = self.run_main("host", "authorize", KEY, "--admin", stdin="n\n")

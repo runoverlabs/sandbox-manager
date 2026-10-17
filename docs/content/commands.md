@@ -386,10 +386,11 @@ the same way the installer does. In a git checkout it tells you to `git pull`.
 ### `msbctl host`
 
 ```text
-msbctl host serve
-msbctl host authorize "PUBLIC KEY LINE" [--admin] [--replace]
+msbctl host serve [--kandev]
+msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
+msbctl host kandev install
 ```
 
 For running this machine as a [remote host](remote-hosts.md). `serve` is the
@@ -401,6 +402,26 @@ adds a key to `~/.ssh/authorized_keys` with that forced command, or with
 `--replace`, which rewrites its line. `check` reports the host's hygiene, as heuristics.
 `autostart install` writes and enables a systemd user unit that runs `msbctl
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
+`--kandev` is the [Kandev plugin's key](kandev.md#the-plugin-key): its line
+runs `host serve --kandev`, which admits `msbctl kandev` verbs and nothing
+else, while the everyday key runs none of them. `kandev install` writes and
+enables the [reaper](kandev.md#the-reaper)'s systemd user timer.
+
+### `msbctl kandev`
+
+```text
+msbctl kandev health | list | reap
+msbctl kandev provision|agentctl|inspect|start|stop|destroy ENV
+msbctl kandev find --operation OP
+msbctl kandev expiry ENV --at TIME
+msbctl kandev lease ENV PORT
+```
+
+What the Kandev plugin runs over ssh to keep [Kandev's sandboxes](kandev.md)
+on this host. Each prints one JSON document on stdout and exits 0, or 3 with
+`{"error": {"code", "message"}}`; secrets, the agentctl binary and its nonce
+come on stdin. Off until `[kandev] enabled = true`. [Every verb](kandev.md#the-verbs)
+is described on the Kandev hosts page.
 
 ### `msbctl remote`
 

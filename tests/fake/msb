@@ -7,10 +7,14 @@ refuses anything it does not know so that an unexpected call fails loudly.
                        only these, so a test asks for exactly what it checks
     FAKE_MSB_STATE     JSON {name: "running"|"stopped", "_volumes": {...}}
     FAKE_MSB_EXEC_OUT  printed by `exec`, which otherwise prints nothing
+    FAKE_MSB_READ_STDIN  if set, `exec` reads its stdin and logs its sha256 and
+                       length as "stdin" (never the bytes: they may be a secret)
+    FAKE_MSB_FAIL      a verb (`create`, `pull`, …) that fails with exit 1
 
 `ls` prints the text table msbctl's msb_table() parses (a header, then
 `name image state created`); keep scripts/screenshots/bin/msb on the same shape.
 """
+import hashlib
 import json
 import os
 import re
@@ -33,9 +37,14 @@ def save(state):
         json.dump(state, fh)
 
 
-def record(argv):
+def record(argv, stdin=None):
     keys = [k for k in os.environ.get("FAKE_MSB_ENV_KEYS", "").split(",") if k]
     line = {"argv": argv, "env": {k: os.environ[k] for k in keys if k in os.environ}}
+    if stdin is not None:
+        line["stdin"] = {"sha256": hashlib.sha256(stdin).hexdigest(), "size": len(stdin)}
+    if "MSB_CONFIG_PATH" in os.environ and os.path.isfile(os.environ["MSB_CONFIG_PATH"]):
+        with open(os.environ["MSB_CONFIG_PATH"], encoding="utf-8") as fh:
+            line["msb_config"] = json.load(fh)
     with open(os.environ["FAKE_MSB_LOG"], "a", encoding="utf-8") as fh:
         fh.write(json.dumps(line) + "\n")
 
@@ -63,20 +72,45 @@ def create(argv, state):
                 vols[vol] = {"kind": "disk", "capacity_bytes": size(found.group(1)) if found else 0,
                              "used_bytes": 0}
     state[name] = "running"
+    labels = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
+    if labels:
+        state.setdefault("_labels", {})[name] = labels
+    state.setdefault("_created", {})[name] = os.environ.get(
+        "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
+
+
+def ls(argv, state):
+    wanted = [argv[i + 1] for i, a in enumerate(argv) if a == "--label"]
+    names = [n for n in state if not n.startswith("_")
+             and all(w in state.get("_labels", {}).get(n, []) for w in wanted)]
+    if "-q" in argv:
+        for name in names:
+            print(name)
+    elif "--format" in argv:
+        print(json.dumps([{"name": n, "status": state[n].capitalize(), "image": "base",
+                           "created_at": state.get("_created", {}).get(n, "")} for n in names]))
+    else:
+        print("NAME  IMAGE  STATUS  CREATED")
+        for name in names:
+            print(f"{name}  base  {state[name]}  2026-10-01")
 
 
 def main():
     argv = sys.argv[1:]
-    record(argv)
+    stdin = None
+    if argv[:1] == ["exec"] and os.environ.get("FAKE_MSB_READ_STDIN"):
+        stdin = sys.stdin.buffer.read()
+    record(argv, stdin)
+    if argv[:1] == [os.environ.get("FAKE_MSB_FAIL")]:
+        sys.exit(f"fake msb: {argv[0]} fails on purpose")
     state = load()
     verb = argv[:1]
     if argv == ["--version"]:
         print("msb 0.7.7")
     elif verb == ["ls"]:
-        print("NAME  IMAGE  STATUS  CREATED")
-        for name, st in state.items():
-            if not name.startswith("_"):
-                print(f"{name}  base  {st}  2026-10-01")
+        ls(argv, state)
+    elif verb == ["pull"]:
+        pass
     elif verb == ["create"]:
         create(argv, state)
     elif verb in (["start"], ["stop"]):
@@ -88,6 +122,7 @@ def main():
         name = next(a for a in argv[1:] if not a.startswith("-"))
         if state.pop(name, None) is None:
             sys.exit(f"fake msb: no sandbox {name}")
+        state.get("_labels", {}).pop(name, None)
     elif verb == ["exec"]:
         sys.stdout.write(os.environ.get("FAKE_MSB_EXEC_OUT", ""))
     elif verb == ["modify"]:

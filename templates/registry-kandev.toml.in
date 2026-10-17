@@ -1,0 +1,44 @@
+# {{NAME}} — a Kandev sandbox, written by `msbctl kandev provision` on {{DATE}}.
+#
+# WRITTEN AND OWNED BY msbctl's kandev verbs. Do not edit it: Kandev decides
+# everything here through its executor profile, and `msbctl kandev destroy` (or
+# the reaper, at expiry) removes it. Your own verbs may list, show and shell
+# into it while it runs, and refuse everything else.
+#
+# This file is the inventory: it is written BEFORE `msb create`, so a crash
+# halfway is something `msbctl kandev reap` can find and clean up. It holds
+# the NAMES and hosts of secret bindings, never a value: Kandev re-sends the
+# values on every create and start, and they exist on this machine only in the
+# environment of the one `msb` process that uses them.
+
+source       = "kandev"
+name         = "{{NAME}}"
+kandev_env   = {{ENV}}
+operation_id = {{OPERATION}}
+input_digest = {{DIGEST}}
+# creating | running | stopped | absent (the VM is gone; the entry waits for
+# destroy or expiry).
+state        = "creating"
+image        = {{IMAGE}}
+cpus         = {{CPUS}}
+memory       = "{{MEMORY}}"
+root_disk    = "{{DISK}}"
+created_at     = "{{CREATED}}"
+expires_at     = "{{EXPIRES}}"
+max_expires_at = "{{EXPIRES}}"
+# Bumped on every start; Kandev drops idle connections when it changes.
+generation   = 0
+autostart    = false
+ssh_keys     = []
+
+# 127.0.0.1:<host port>:<guest port>, from [kandev] port_pool.
+{{PORTS}}
+
+# [kandev] rule_groups at provision time, then the request's own egress and the
+# Kandev API host, pinned to the address it resolved to here and written into
+# the guest's /etc/hosts, so DNS rebind protection stays on.
+kandev_api    = {{API}}
+kandev_api_ip = {{API_IP}}
+{{RULE_GROUPS}}
+{{EXTRA_RULES}}
+{{SECRET_BINDS}}

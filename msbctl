@@ -60,6 +60,7 @@ import argparse
 import base64
 import contextlib
 import datetime as dt
+import fcntl
 import hashlib
 import io
 import ipaddress
@@ -79,6 +80,7 @@ import sys
 import tempfile
 import termios
 import time
+import traceback
 import tty
 import urllib.error
 import urllib.parse
@@ -458,12 +460,18 @@ class Sandbox:
         # host folder at all — the code is cloned from GitHub into a disk volume
         # inside the sandbox, and the project layer is the repo's own .msb/ as
         # fetched at a recorded commit (policy_dir(), never mounted).
+        # "kandev": a sandbox Kandev owns, written and removed by `msbctl
+        # kandev` (see that section). No project and no policy layer: the
+        # entry is the whole definition, and the project is an empty dir.
         self.source = self.entry.get("source", "folder")
-        if self.source not in ("folder", "repo"):
-            die(f"{name}.toml: source is {self.source!r}, expected \"folder\" or \"repo\"")
+        if self.source not in ("folder", "repo", "kandev"):
+            die(f"{name}.toml: source is {self.source!r}, expected \"folder\", \"repo\" or \"kandev\"")
         self.is_repo = self.source == "repo"
+        self.is_kandev = self.source == "kandev"
         self.repo = self.entry.get("repo", "")
-        if self.is_repo:
+        if self.is_kandev:
+            self.project = os.path.join(STATE_DIR, "kandev", name)
+        elif self.is_repo:
             if not self.repo:
                 die(f"{name}.toml has `source = \"repo\"` but no `repo`")
             self.project = policy_dir(name)
@@ -554,6 +562,8 @@ class Sandbox:
     @property
     def location(self):
         """Where the code is, for display: a host folder, or the repo."""
+        if self.is_kandev:
+            return f"kandev:{self.entry.get('kandev_env', '?')}"
         if not self.is_repo:
             return tilde(self.project)
         ref = self.entry.get("ref") or self.repo_meta.get("branch") or "(default branch)"
@@ -2241,6 +2251,12 @@ def ensure_running(box, table=None):
     effect of asking for a shell.
     """
     state = state_of(box.name, table)
+    if box.is_kandev:
+        # Kandev starts its own, with secrets only its requests carry; and none
+        # of the per-boot plumbing below is for its sandboxes (see kandev).
+        if state != "running":
+            die(f"{box.name} is a Kandev sandbox and is {state}: only Kandev starts it")
+        return
     if state == "absent":
         die(f"no sandbox named {box.name} — run: msbctl rebuild {box.name}")
     if state != "running":
@@ -2726,6 +2742,8 @@ def refuse_before_create(box):
     """Everything that stops a create, checked BEFORE anything is removed: a
     rebuild or rename that tore the VM down first and then refused would leave
     nothing where a running sandbox was."""
+    if box.is_kandev:
+        die(f"{box.name} is a Kandev sandbox: only `msbctl kandev provision` creates one")
     ensure_repo_policy(box)
     refuse_conf_problems(box)
     refuse_reserved_bindings(box)
@@ -2964,6 +2982,8 @@ def name_problem(name, renaming=None):
         return "name must be lowercase letters, digits and dashes"
     if name == renaming:
         return f"it is already called {name}"
+    if name.startswith("k-"):
+        return "names starting with k- are kept for Kandev's sandboxes"
     if os.path.exists(registry_path_for(name)):
         return f"{name} is already registered ({tilde(registry_path_for(name))})"
     # A renamed sandbox still owns volumes under its old name; a second sandbox
@@ -5953,6 +5973,10 @@ def version_lines(box, info):
 def show_data(box, table=None):
     """`show --json`: what one sandbox resolves to. Says whether each secret is
     STORED, never what it is: no value is ever put in here."""
+    if box.is_kandev:
+        record = kandev_record(box.name, box.entry, table)["record"]
+        return {"name": box.name, "source": "kandev", "state": record["state"],
+                "location": box.location, "kandev": record}
     own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
     shared = read_env_file(GLOBAL_ENV)
     secrets = []
@@ -5995,6 +6019,20 @@ def cmd_show(args, config):
     info = read_json(VERSIONS_CACHE).get(box.name, {})
 
     say(f"{box.name}  [{state_of(box.name, table)}]")
+    if box.is_kandev:
+        rec = kandev_record(box.name, box.entry, table)["record"]
+        note(f"source     Kandev, environment {rec['env']} (Kandev owns it)")
+        note(f"image      {rec['image']}")
+        note(f"resources  {box.entry.get('cpus')} cpu, {box.entry.get('memory')}, "
+             f"{box.entry.get('root_disk')} disk")
+        note(f"expires    {rec['expires_at']}  (created {rec['created_at']})")
+        note("ports      " + ", ".join(f"{g} <- 127.0.0.1:{h}" for g, h in rec["ports"].items()))
+        note(f"secrets    {', '.join(secret_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
+             "  (values only ever in Kandev's requests)")
+        say("Egress")
+        for rule in box.net_rules():
+            note(f"  {rule}")
+        return
     if box.is_repo:
         meta = box.repo_meta
         note(f"source     {box.location}, cloned inside the sandbox ({box.workspace_volume})")
@@ -6264,6 +6302,8 @@ def probe_installed(name, table):
 
 def refresh_versions(names, config, cache):
     say("Probing versions")
+    # Kandev's sandboxes run Kandev's image and are not msbctl's to probe.
+    names = [n for n in names if read_toml(registry_path_for(n)).get("source") != "kandev"]
     table = msb_table()
     token = None
     if config.get("version_check", {}).get("use_global_token", True):
@@ -7654,11 +7694,28 @@ def _msb_flags_problem(flags):
     return None
 
 
-def restricted_problem(argv):
+def restricted_problem(argv, kandev=False):
     """None if `msbctl <argv>` may run under `host serve`, else the reason.
-    Each refusal says what it would let a compromised laptop do."""
+    Each refusal says what it would let a compromised laptop do.
+
+    The two keys are disjoint. The Kandev plugin's key (`--kandev`) runs
+    `kandev` verbs only. Those DO set egress and secret bindings, which the
+    everyday key may never do: a Kandev profile is the policy for its own
+    sandboxes, and they can reach nothing else (see kandev). The everyday key
+    runs no `kandev` verb, since one could create a sandbox with any egress."""
     if argv in (["--version"], ["-V"]):
         return None
+    if kandev:
+        if not argv or argv[0] != "kandev":
+            return "this key runs `msbctl kandev` verbs only"
+        try:
+            with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+                build_parser().parse_args(argv)
+        except SystemExit:
+            return "the command line does not parse"
+        return None
+    if argv and argv[0] == "kandev":
+        return "kandev verbs are for the Kandev plugin's key (`host authorize --kandev`)"
     try:
         split, flags = split_cli(argv)
     except (ValueError, IndexError):
@@ -7733,8 +7790,10 @@ def restricted_problem(argv):
     return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
 
 
-def host_serve():
-    """The forced command: validate SSH_ORIGINAL_COMMAND and run it, restricted."""
+def host_serve(kandev=False):
+    """The forced command: validate SSH_ORIGINAL_COMMAND and run it, restricted.
+    `kandev`: the Kandev plugin's key, which runs `kandev` verbs and nothing
+    else — and the everyday key runs no `kandev` verb (restricted_problem())."""
     def refuse(reason):
         print(f"msbctl host serve: refused: {reason}", file=sys.stderr)
         sys.exit(HOST_EXIT_REFUSED)
@@ -7754,7 +7813,7 @@ def host_serve():
     if not argv or not REMOTE_PROGRAM.fullmatch(argv[0]):
         refuse("only msbctl commands")
     argv = argv[1:]
-    problem = restricted_problem(argv)
+    problem = restricted_problem(argv, kandev=kandev)
     if problem:
         refuse(problem)
     os.environ["MSB_RESTRICTED"] = "1"
@@ -7791,6 +7850,8 @@ def host_authorize(args):
     if present and not args.replace:
         die(f"that key is already in {tilde(path)}:\n  {present[0]}\n"
             "--replace rewrites that line; or edit the file by hand")
+    if args.admin and args.kandev:
+        die("--admin and --kandev are two different keys")
     if args.admin:
         if not ktype.startswith("sk-"):
             warn("a plain key as the admin key: if the laptop's ssh-agent holds it, the")
@@ -7806,7 +7867,9 @@ def host_authorize(args):
         if not me:
             me = os.path.realpath(__file__)
             warn(f"msbctl is not on PATH; the line names {me}, which an upgrade may move")
-        line = f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}'.rstrip()
+        # The Kandev plugin never needs a terminal, so its line has no pty.
+        line = (f'restrict,command="{me} host serve --kandev" {ktype} {blob} {comment}' if args.kandev
+                else f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}').rstrip()
     if present:
         # Every line naming the key goes, so none of them still grants what the
         # new one does not; written whole and renamed, so a failure halfway
@@ -7824,7 +7887,9 @@ def host_authorize(args):
     os.chmod(path, 0o600)
     note(f"{'replaced in' if present else 'added to'} {tilde(path)}:")
     note(f"  {line}")
-    if not args.admin:
+    if args.kandev:
+        note("this key can run `msbctl kandev` verbs, and nothing else")
+    elif not args.admin:
         note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
 
 
@@ -7987,17 +8052,1014 @@ WantedBy=default.target
 
 
 def cmd_host(args, config):
-    """host serve|authorize|check|autostart — running this machine as a remote."""
+    """host serve|authorize|check|autostart|kandev — running this machine as a remote."""
     if args.action == "serve":
-        host_serve()
+        host_serve(kandev=args.kandev)
     elif restricted() and args.action != "check":
         die(f"host {args.action} is for the host itself")
+    elif args.kandev and args.action not in ("authorize", "serve"):
+        die("--kandev goes with host authorize or host serve")
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
         host_check(args)
     elif args.action == "autostart":
         host_autostart(args)
+    elif args.action == "kandev":
+        host_kandev(args)
+
+
+# ----------------------------------------------------------------- kandev
+#
+# This machine as a sandbox host for Kandev. The Kandev plugin drives it the
+# way a laptop drives a remote: `ssh host msbctl kandev <verb> …`, through
+# `host serve --kandev`, which admits these verbs and nothing else. There is
+# no daemon: each verb runs, prints ONE JSON document on stdout, and exits.
+#
+# Three rules shape everything below:
+#
+#   Kandev's sandboxes are a world of their own. They are found only through
+#   registry entries with `source = "kandev"` (and the msb label for orphans),
+#   by Kandev environment id. No kandev verb reaches one of the operator's
+#   sandboxes, whatever it is called, and the operator's verbs may only look
+#   at, shell into and list Kandev's (kandev_guard()).
+#
+#   No secret value goes into argv, a file, stdout or a log. Profile secrets,
+#   registry passwords and agentctl's bootstrap nonce arrive on stdin and go
+#   into the environment of one `msb` process, or the stdin of one `msb exec`.
+#
+#   None of msbctl's credential plumbing. Kandev delivers agent and git
+#   credentials itself, through agentctl; msbctl's bootstrap, CLAUDE.md seed,
+#   git identity, git_push rewrites, ssh-agent filter, Claude token and
+#   GH_TOKEN binding would fight it, so a kandev entry gets none of them.
+
+KANDEV_PROTOCOL = 1
+# agentctl's control port (fixed by Kandev) and the instance-port range it is
+# told to use: the only guest ports Kandev ever leases. Two spares, because
+# agentctl skips a port that is still bound after a restart.
+KANDEV_GUEST_PORTS = (8765, 41001, 41002, 41003)
+KANDEV_ENV = re.compile(r"[A-Za-z0-9_-]{1,128}")
+# Short enough for msb's hostname (64 bytes) and its runtime socket paths.
+KANDEV_NAME_MAX = 40
+KANDEV_ERROR_CODES = ("invalid_config", "denied", "unsupported", "not_found", "expired",
+                      "conflict", "unavailable", "rate_limited", "cleanup_pending")
+KANDEV_EXIT_ERROR = 3
+KANDEV_HEADER_MAX = 64 * 1024
+KANDEV_AGENTCTL_MAX = 512 * 1024 * 1024
+KANDEV_LEASE_SECONDS = 600
+KANDEV_STUCK_CREATE = 15 * 60       # past Kandev's own 10-minute provision deadline
+KANDEV_ORPHAN_AGE = 3600
+KANDEV_AGENTCTL_WAIT = 30
+KANDEV_OWNER_LABEL = "msbctl.owner=kandev"
+KANDEV_LOCK = os.path.join(STATE_DIR, "kandev.lock")
+GUEST_AGENTCTL = "/opt/kandev/agentctl"
+KANDEV_REAP_UNIT = "msb-kandev-reap"
+# Names a Kandev secret or env var may not take, beyond is_reserved_var().
+# Credentials Kandev itself delivers, agentctl's own settings, and anything
+# that would change how msb (or the dynamic loader) behaves: secret values are
+# put in the environment of the `msb` process.
+KANDEV_RESERVED_NAMES = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH",
+                         "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "TERM", "LANG"}
+KANDEV_RESERVED_PREFIXES = ("AGENTCTL_", "MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
+ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
+HOSTNAME = re.compile(r"(\*\.)?([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9-]{2,63}")
+
+
+class KandevError(Exception):
+    """A failure with one of Kandev's provider error codes. `message` is for
+    the host's own logs: the plugin never forwards it."""
+
+    def __init__(self, code, message, retry_after=None):
+        super().__init__(message)
+        if code not in KANDEV_ERROR_CODES:
+            raise ValueError(f"not a Kandev error code: {code}")
+        self.code, self.message, self.retry_after = code, message, retry_after
+
+
+def _kandev_try(fn, *args):
+    """fn(*args), with msbctl's die() turned into invalid_config."""
+    try:
+        return fn(*args)
+    except SystemExit as exc:
+        raise KandevError("invalid_config", str(exc.code).replace("msbctl: ", "", 1)) from None
+
+
+def utc_now():
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(when):
+    return when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def parse_iso(text, what="a timestamp"):
+    if not isinstance(text, str):
+        raise KandevError("invalid_config", f"{what} is not an RFC 3339 string")
+    try:
+        when = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        raise KandevError("invalid_config", f"{what} {text!r} is not RFC 3339") from None
+    if when.tzinfo is None:
+        raise KandevError("invalid_config", f"{what} {text!r} has no time zone")
+    return when.astimezone(dt.timezone.utc)
+
+
+def kandev_settings(config):
+    """[kandev], checked. Every problem is invalid_config, naming the key."""
+    raw = config.get("kandev", {})
+
+    def bad(key, why):
+        raise KandevError("invalid_config", f"[kandev] {key}: {why} (`msbctl config` shows where it is set)")
+
+    out = {"enabled": raw.get("enabled", False)}
+    if not isinstance(out["enabled"], bool):
+        bad("enabled", "true or false")
+    for key in ("max_sandboxes", "max_cpus"):
+        value = raw.get(key, 0)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            bad(key, "a whole number, 0 or more")
+        out[key] = value
+    memory = str(raw.get("max_memory", "0M"))
+    if not re.fullmatch(r"\d+[MGT]", memory.upper()):
+        bad("max_memory", f"{memory!r} is not a size like 96G")
+    out["max_memory_mib"] = size_bytes(memory) // MIB
+    pool = re.fullmatch(r"(\d+)-(\d+)", str(raw.get("port_pool", "")))
+    if not pool or not 1024 <= int(pool.group(1)) <= int(pool.group(2)) <= 65535 \
+            or int(pool.group(2)) - int(pool.group(1)) + 1 < len(KANDEV_GUEST_PORTS):
+        bad("port_pool", "a range like 20000-29999, within 1024-65535, of at least 4 ports")
+    out["port_pool"] = (int(pool.group(1)), int(pool.group(2)))
+    base = str(raw.get("base_url", "")).rstrip("/")
+    if base:
+        parts = urllib.parse.urlsplit(base)
+        if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+                or parts.path or parts.query or parts.fragment):
+            bad("base_url", "https://host[:port] with no path, query or credentials — Kandev "
+                "refuses any other lease URL")
+    out["base_url"] = base
+    out["serve"] = raw.get("serve", "tailscale")
+    if out["serve"] not in ("tailscale", "none"):
+        bad("serve", '"tailscale" or "none"')
+    groups = raw.get("rule_groups", [])
+    known = config.get("rules", {})
+    if not isinstance(groups, list) or any(g not in known for g in groups):
+        bad("rule_groups", f"a list of rule groups; known: {', '.join(sorted(known))}")
+    out["rule_groups"] = [g for g in groups if g != "base"]
+    extra = raw.get("allow_extra", [])
+    if not isinstance(extra, list) or any(
+            not isinstance(p, str) or not (p == "*" or HOSTNAME.fullmatch(p)) for p in extra):
+        bad("allow_extra", 'a list of hostname patterns ("pypi.org", "*.example.com") or ["*"]')
+    out["allow_extra"] = extra
+    return out
+
+
+def kandev_name(env):
+    """The msb sandbox name for a Kandev environment id. `k-<env>` when that
+    is already a valid, short sandbox name (no lowercasing, so two ids that
+    differ only in case cannot meet), else `k-` and 24 hex digits of its hash."""
+    name = f"k-{env}"
+    if SANDBOX_NAME.fullmatch(name) and len(name) <= KANDEV_NAME_MAX:
+        return name
+    return "k-" + hashlib.sha256(env.encode()).hexdigest()[:24]
+
+
+def kandev_check_env(env):
+    if not isinstance(env, str) or not KANDEV_ENV.fullmatch(env):
+        raise KandevError("invalid_config", "an environment id is 1-128 of A-Z a-z 0-9 _ -")
+    return env
+
+
+def kandev_entries():
+    """[(name, entry)] for every Kandev entry, and nothing else."""
+    found = []
+    for name in registered():
+        try:
+            entry = read_toml(registry_path_for(name))
+        except SystemExit:
+            continue
+        if entry.get("source") == "kandev":
+            found.append((name, entry))
+    return found
+
+
+def kandev_lookup(env):
+    """(name, entry) of the Kandev entry for `env`, or None. A file under that
+    name that is not Kandev's — an operator sandbox called k-something — is
+    reported as absent here, never touched."""
+    name = kandev_name(kandev_check_env(env))
+    entry = read_toml(registry_path_for(name)) if os.path.exists(registry_path_for(name)) else {}
+    if entry.get("source") == "kandev" and entry.get("kandev_env") == env:
+        return name, entry
+    return None
+
+
+def kandev_need(env):
+    found = kandev_lookup(env)
+    if not found:
+        raise KandevError("not_found", "no kandev entry for that environment")
+    return found
+
+
+@contextlib.contextmanager
+def kandev_lock():
+    """Host-wide, for everything that allocates capacity or ports or removes
+    what the reaper also removes."""
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(KANDEV_LOCK, "a", encoding="utf-8") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
+def kandev_set(name, **values):
+    """Rewrite single keys of a Kandev entry in place."""
+    for key, value in values.items():
+        set_toml_key(registry_path_for(name), key, value)
+
+
+def host_platform():
+    """`linux-amd64` / `linux-arm64`: a guest runs this machine's architecture."""
+    machine = os.uname().machine
+    arch = {"x86_64": "amd64", "amd64": "amd64", "aarch64": "arm64", "arm64": "arm64"}.get(machine, machine)
+    return f"linux-{arch}"
+
+
+def kandev_ports(entry):
+    """{guest port: host port} from the entry's `ports` specs."""
+    out = {}
+    for spec in entry.get("ports", []):
+        _, host, guest, _ = parse_port_spec(spec)[1:]
+        out[int(guest)] = int(host)
+    return out
+
+
+def kandev_probe(host_port, timeout=1.0):
+    """Whether something answers HTTP on the published port. A bare connect
+    proves nothing — msb's host listener accepts whether or not the guest
+    does — so it waits for the first byte of a reply."""
+    try:
+        with socket.create_connection(("127.0.0.1", host_port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            sock.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            return bool(sock.recv(1))
+    except OSError:
+        return False
+
+
+def kandev_state(name, entry, table):
+    vm = state_of(name, table)
+    if entry.get("state") == "creating":
+        return "creating"
+    if vm == "absent":
+        return "absent"
+    return "running" if vm == "running" else "stopped"
+
+
+def kandev_record(name, entry, table=None, live=False):
+    """The document provision, inspect, find, start, stop and expiry return.
+    Names, ports and timestamps only: no value of any kind of secret."""
+    table = msb_table() if table is None else table
+    state = kandev_state(name, entry, table)
+    ports = kandev_ports(entry)
+    running = bool(entry.get("agentctl_running", False))
+    if live:
+        running = state == "running" and KANDEV_GUEST_PORTS[0] in ports \
+            and kandev_probe(ports[KANDEV_GUEST_PORTS[0]])
+    return {"record": {
+        "env": entry.get("kandev_env", ""), "name": name,
+        "operation_id": entry.get("operation_id", ""), "input_digest": entry.get("input_digest", ""),
+        "state": state, "platform": host_platform(), "image": entry.get("image", ""),
+        "created_at": entry.get("created_at", ""), "expires_at": entry.get("expires_at", ""),
+        "max_expires_at": entry.get("max_expires_at", ""),
+        "generation": int(entry.get("generation", 0)),
+        "ports": {str(g): h for g, h in sorted(ports.items())},
+        "agentctl": {"running": running, "sha256": entry.get("agentctl_sha256", "")},
+    }}
+
+
+def kandev_usage(table):
+    """(sandboxes, cpus, memory MiB) used by Kandev entries that are not absent."""
+    count = cpus = mem = 0
+    for name, entry in kandev_entries():
+        if kandev_state(name, entry, table) == "absent":
+            continue
+        count += 1
+        cpus += int(entry.get("cpus", 0))
+        mem += size_bytes(entry.get("memory", "0M")) // MIB
+    return count, cpus, mem
+
+
+def kandev_read_header(allow_empty=False):
+    """The one JSON header line on stdin (binary-safe: agentctl's bytes follow)."""
+    line = sys.stdin.buffer.readline(KANDEV_HEADER_MAX + 1)
+    if not line and allow_empty:
+        return {}
+    if len(line) > KANDEV_HEADER_MAX or not line.endswith(b"\n"):
+        raise KandevError("invalid_config", "stdin must start with one JSON line of at most 64 KiB")
+    try:
+        header = json.loads(line)
+    except ValueError:
+        raise KandevError("invalid_config", "the stdin header is not JSON") from None
+    if not isinstance(header, dict):
+        raise KandevError("invalid_config", "the stdin header is not a JSON object")
+    return header
+
+
+def kandev_name_problem(name):
+    if not isinstance(name, str) or not ENV_NAME.fullmatch(name):
+        return f"{name!r} is not a variable name (A-Z, 0-9, _)"
+    if is_reserved_var(name) or name in KANDEV_RESERVED_NAMES \
+            or name.startswith(KANDEV_RESERVED_PREFIXES):
+        return f"{name} is reserved"
+    return None
+
+
+def kandev_secrets(raw, field="secrets"):
+    """[(name, value, [hosts])] from a request, checked."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise KandevError("invalid_config", f"{field} must be a list")
+    out, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise KandevError("invalid_config", f"each of {field} is an object")
+        name, value, hosts = item.get("name"), item.get("value"), item.get("hosts")
+        problem = kandev_name_problem(name)
+        if problem:
+            raise KandevError("invalid_config", f"secret {problem}")
+        if name in seen:
+            raise KandevError("invalid_config", f"secret {name} is given twice")
+        seen.add(name)
+        if not isinstance(value, str) or not value or len(value) > 8192 or "\0" in value:
+            raise KandevError("invalid_config", f"secret {name}: a value of 1 to 8192 characters")
+        if hosts is not None and (not isinstance(hosts, list) or not hosts or any(
+                not isinstance(h, str) or not HOSTNAME.fullmatch(h) for h in hosts)):
+            raise KandevError("invalid_config", f"secret {name}: hosts is a list of hostnames")
+        out.append((name, value, hosts or []))
+    return out
+
+
+def kandev_registry(raw, image):
+    """(registry host, username, password) for a private pull, or None."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or not all(isinstance(raw.get(k), str) and raw.get(k)
+                                            for k in ("username", "password")):
+        raise KandevError("invalid_config", "registry needs a username and a password")
+    if len(raw["password"]) > 8192 or "\n" in raw["username"]:
+        raise KandevError("invalid_config", "registry credentials are too long or malformed")
+    first = image.split("/", 1)[0]
+    if "/" not in image or not ("." in first or ":" in first or first == "localhost"):
+        raise KandevError("invalid_config", "a private image must name its registry "
+                          "(ghcr.io/…, registry.example.com/…)")
+    return first, raw["username"], raw["password"]
+
+
+def msb_config_file():
+    """Where msb reads its own config.json (MSB_CONFIG_PATH, else MSB_HOME)."""
+    if os.environ.get("MSB_CONFIG_PATH"):
+        return os.environ["MSB_CONFIG_PATH"]
+    return os.path.join(os.environ.get("MSB_HOME", os.path.join(HOME, ".microsandbox")), "config.json")
+
+
+def kandev_pull(image, registry):
+    """`msb pull`, with private-registry credentials if there are any.
+
+    msb takes registry credentials from its OS keyring (`msb registry login`,
+    which stores them) or from `registries.hosts.<host>.auth` in its config
+    file, whose `password_env` names an environment variable. So the password
+    goes into the environment of this one `msb pull`, and msb is pointed with
+    MSB_CONFIG_PATH at a throwaway copy of its config that adds the username
+    and the variable's NAME. Nothing secret is written; the copy is deleted.
+    The create that follows uses `--pull never`, so the credential is never
+    part of a sandbox's own configuration."""
+    env = {}
+    tmpdir = None
+    try:
+        if registry:
+            host, user, password = registry
+            current = {}
+            try:
+                with open(msb_config_file(), encoding="utf-8") as fh:
+                    current = json.load(fh)
+            except (OSError, ValueError):
+                pass
+            hosts = current.setdefault("registries", {}).setdefault("hosts", {})
+            hosts.setdefault(host, {})["auth"] = {"username": user,
+                                                  "password_env": "MSBCTL_REGISTRY_PASSWORD"}
+            tmpdir = tempfile.mkdtemp(prefix="msbctl-pull-")
+            path = os.path.join(tmpdir, "config.json")
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(current, fh)
+            env = {"MSB_CONFIG_PATH": path, "MSBCTL_REGISTRY_PASSWORD": password}
+        proc = run(["msb", "pull", image], env=env, check=False, quiet=True)
+    finally:
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+    if proc.returncode != 0:
+        raise KandevError("unavailable", f"msb pull {image} failed")
+
+
+def kandev_egress(raw, settings):
+    """Net rules for a request's `egress_allow`, each allowed by allow_extra."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(t, str) for t in raw):
+        raise KandevError("invalid_config", "egress_allow must be a list of strings")
+    rules = []
+    patterns = settings["allow_extra"]
+    for target in raw:
+        if "@" in target:
+            raise KandevError("invalid_config", f"{target!r}: give a host or host:port, not a rule")
+        rule = _kandev_try(parse_allow_target, target)
+        host = _split_rule_target(target)[0].lower()
+        if "*" not in patterns and not any(
+                host == p or (p.startswith("*.") and host.endswith(p[1:])) for p in patterns):
+            raise KandevError("invalid_config", f"{host} is not allowed by [kandev] allow_extra")
+        rules.append(rule)
+    return rules
+
+
+def kandev_api(raw):
+    """(host, address, port, rule) for the Kandev API. The host is resolved
+    HERE and the rule names that one address, so the guest needs no DNS answer
+    for it: a MagicDNS name resolves to 100.x, which msb's DNS rebind protection
+    would otherwise drop, and turning that protection off for the whole VM is
+    the alternative this avoids. The name goes in the guest's /etc/hosts."""
+    if not isinstance(raw, dict) or not isinstance(raw.get("host"), str):
+        raise KandevError("invalid_config", "kandev_api needs a host")
+    host, port = raw["host"].strip().lower(), raw.get("port", 443)
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        raise KandevError("invalid_config", "kandev_api.port is 1-65535")
+    try:
+        addr = str(ipaddress.ip_address(host))
+    except ValueError:
+        if not HOSTNAME.fullmatch(host) or host.startswith("*."):
+            raise KandevError("invalid_config", f"kandev_api.host {host!r} is not a hostname") from None
+        try:
+            infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        except OSError:
+            raise KandevError("unavailable", f"cannot resolve {host} on this host") from None
+        addr = infos[0][4][0]
+    target = f"[{addr}]" if ":" in addr else addr
+    return host, addr, port, f"allow@{target}:tcp:{port}"
+
+
+def kandev_pin_api(name, entry):
+    """Put the Kandev API's name in the guest's /etc/hosts, at the address its
+    egress rule names. On every boot: msb writes a fresh /etc/hosts each time
+    a sandbox starts, so a line added once is gone after a restart."""
+    host, addr = entry.get("kandev_api", ""), entry.get("kandev_api_ip", "")
+    if not host or host == addr:
+        return
+    proc = run(["msb", "exec", name, "--no-tty", "--", "sh", "-c",
+                'grep -qs " $2$" /etc/hosts || printf "%s %s\\n" "$1" "$2" >> /etc/hosts',
+                "_", addr, host], check=False, quiet=True)
+    if proc.returncode != 0:
+        raise KandevError("unavailable", "could not write the Kandev API host into the guest")
+
+
+def kandev_alloc_ports(settings):
+    """Four free host ports from the pool: not named by any registry entry (any
+    source, so the operator's own published ports are avoided too) and free to
+    bind right now. Under kandev_lock()."""
+    used = set()
+    for name in registered():
+        try:
+            specs = read_toml(registry_path_for(name)).get("ports", [])
+        except SystemExit:
+            continue
+        for spec in specs:
+            try:
+                used.add(int(parse_port_spec(spec)[2]))
+            except (SystemExit, ValueError):
+                continue
+    got = []
+    low, high = settings["port_pool"]
+    for port in range(low, high + 1):
+        if port in used:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        got.append(port)
+        if len(got) == len(KANDEV_GUEST_PORTS):
+            return got
+    raise KandevError("rate_limited", "no free host ports left in [kandev] port_pool", 30)
+
+
+def kandev_serve(settings, name, ports, on):
+    """Map (or unmap) each published port under base_url. A failure to remove
+    one is fatal to the destroy: a stale path would later route to whichever
+    sandbox gets the same host port."""
+    if settings["serve"] != "tailscale":
+        return
+    if not shutil.which("tailscale"):
+        raise KandevError("unavailable", "tailscale is not on PATH ([kandev] serve)")
+    for guest, host in sorted(ports.items()):
+        path = f"/vm/{name}/p/{guest}"
+        argv = (["tailscale", "serve", "--bg", "--https=443", f"--set-path={path}",
+                 f"http://127.0.0.1:{host}"] if on else
+                ["tailscale", "serve", "--https=443", f"--set-path={path}", "off"])
+        proc = run(argv, check=False, capture=True)
+        if proc.returncode != 0 and on:
+            raise KandevError("unavailable", f"tailscale serve {path} failed")
+        if proc.returncode != 0 and not on and "not found" not in (proc.stderr or "").lower():
+            raise KandevError("unavailable", f"tailscale serve {path} off failed")
+
+
+def kandev_serve_ok(settings):
+    if settings["serve"] != "tailscale":
+        return {"ok": True, "mode": "none"}
+    if not shutil.which("tailscale"):
+        return {"ok": False, "mode": "tailscale", "reason": "tailscale is not on PATH"}
+    proc = run(["tailscale", "status", "--json"], check=False, capture=True)
+    try:
+        status = json.loads(proc.stdout or "{}")
+    except ValueError:
+        status = {}
+    running = status.get("BackendState") == "Running"
+    named = bool((status.get("Self") or {}).get("DNSName"))
+    return {"ok": running and named, "mode": "tailscale",
+            **({} if running and named else {"reason": "tailscale is not running with a DNS name"})}
+
+
+def kandev_labelled(fmt_json=False):
+    """Names (or rows) of every VM carrying the Kandev owner label."""
+    argv = ["msb", "ls", "--label", KANDEV_OWNER_LABEL] + (["--format", "json"] if fmt_json else ["-q"])
+    proc = run(argv, check=False, capture=True)
+    if proc.returncode != 0:
+        raise KandevError("unavailable", "msb ls --label failed")
+    if fmt_json:
+        try:
+            return json.loads(proc.stdout or "[]")
+        except ValueError:
+            raise KandevError("unavailable", "msb ls returned no JSON") from None
+    return [n.strip() for n in proc.stdout.splitlines() if n.strip()]
+
+
+# ------------------------------------------------------------- the verbs
+
+def kandev_health(args, config, settings):
+    table = msb_table()
+    count, cpus, mem = kandev_usage(table)
+    return {
+        "protocol": KANDEV_PROTOCOL, "msbctl_version": version_string(),
+        "msb_version": local_msb_version() or "",
+        "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK), "enabled": settings["enabled"],
+        "platform": host_platform(), "base_url": settings["base_url"],
+        "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
+                     "max_cpus": settings["max_cpus"], "cpus": cpus,
+                     "max_memory_mib": settings["max_memory_mib"], "memory_mib": mem},
+        "serve": kandev_serve_ok(settings),
+    }
+
+
+def kandev_list(args, config, settings):
+    table = msb_table()
+    return {"sandboxes": [
+        {"env": e.get("kandev_env", ""), "name": n, "state": kandev_state(n, e, table),
+         "created_at": e.get("created_at", ""), "expires_at": e.get("expires_at", "")}
+        for n, e in kandev_entries()]}
+
+
+def _int_field(req, key, low, high, default=None):
+    value = req.get(key, default)
+    if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+        raise KandevError("invalid_config", f"{key} is a whole number, {low}-{high}")
+    return value
+
+
+def kandev_provision(args, config, settings):
+    env = kandev_check_env(args.env)
+    req = kandev_read_header()
+    op, digest = req.get("operation_id"), req.get("input_digest")
+    if not all(isinstance(v, str) and v and len(v) <= 256 for v in (op, digest)):
+        raise KandevError("invalid_config", "operation_id and input_digest are required")
+    name = kandev_name(env)
+
+    def existing():
+        found = kandev_lookup(env)
+        if found:
+            if found[1].get("operation_id") == op and found[1].get("input_digest") == digest:
+                return kandev_record(*found)
+            raise KandevError("conflict", "this environment was provisioned by another operation "
+                              "or with different input")
+        if os.path.exists(registry_path_for(name)):
+            raise KandevError("conflict", f"{name} is a sandbox that is not Kandev's")
+        for _other, entry in kandev_entries():
+            if entry.get("operation_id") == op:
+                raise KandevError("conflict", "that operation_id belongs to another environment")
+        return None
+
+    # Idempotency first, before anything is checked or allocated.
+    again = existing()
+    if again:
+        return again
+
+    image = req.get("image")
+    if image_problem(image) or "@sha256:" not in str(image):
+        raise KandevError("invalid_config", "image must be a digest-pinned OCI reference")
+    cpus = _int_field(req, "cpus", 1, 64)
+    mem = _int_field(req, "memory_mib", 256, 1024 * 1024)
+    disk = _int_field(req, "disk_gib", 1, 4096, 20)
+    expires = parse_iso(req.get("expires_at"), "expires_at")
+    if expires <= utc_now():
+        raise KandevError("invalid_config", "expires_at is in the past")
+    secrets = kandev_secrets(req.get("secrets"))
+    if any(not hosts for _, _, hosts in secrets):
+        raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
+    guest_env = req.get("env") or []
+    if not isinstance(guest_env, list):
+        raise KandevError("invalid_config", "env must be a list")
+    env_pairs = []
+    for item in guest_env:
+        if not isinstance(item, dict) or not isinstance(item.get("value"), str):
+            raise KandevError("invalid_config", "each env item is {name, value}")
+        problem = kandev_name_problem(item.get("name"))
+        if problem or any(item["name"] == s[0] for s in secrets):
+            raise KandevError("invalid_config", f"env {problem or item['name'] + ' is also a secret'}")
+        if "\n" in item["value"] or "\0" in item["value"] or len(item["value"]) > 4096:
+            raise KandevError("invalid_config", f"env {item['name']}: one line of at most 4096 characters")
+        env_pairs.append((item["name"], item["value"]))
+    egress = kandev_egress(req.get("egress_allow"), settings)
+    api_host, api_addr, api_port, api_rule = kandev_api(req.get("kandev_api"))
+    registry = kandev_registry(req.get("registry"), image)
+
+    with kandev_lock():
+        table = msb_table()
+        again = existing()
+        if again:
+            return again
+        count, used_cpus, used_mem = kandev_usage(table)
+        if (count + 1 > settings["max_sandboxes"] or used_cpus + cpus > settings["max_cpus"]
+                or used_mem + mem > settings["max_memory_mib"]):
+            raise KandevError("rate_limited", "this host is at its [kandev] limits", 30)
+        host_ports = kandev_alloc_ports(settings)
+        ports = [f"127.0.0.1:{h}:{g}" for h, g in zip(host_ports, KANDEV_GUEST_PORTS, strict=True)]
+        binds = [f"{n}@{','.join(h)}" for n, _, h in secrets]
+        now = utc_now()
+        os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
+        # The entry FIRST: a crash between here and the end leaves something
+        # `reap` finds, never a VM nobody knows about.
+        with open(registry_path_for(name), "w", encoding="utf-8") as fh:
+            fh.write(render(
+                "registry-kandev.toml.in", NAME=name, DATE=now.date().isoformat(),
+                ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
+                IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
+                CREATED=iso(now), EXPIRES=iso(expires),
+                PORTS=format_list("ports", ports, ""), API=toml_literal(api_host),
+                API_IP=toml_literal(api_addr),
+                RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
+                EXTRA_RULES=f"extra_rules = {toml_literal(egress + [api_rule])}",
+                SECRET_BINDS=f"secret_binds = {toml_literal(binds)}"))
+
+    box = Sandbox(name, config)
+    rules = _kandev_try(box.net_rules)
+    kandev_pull(image, registry)
+    seconds = int((expires - utc_now()).total_seconds()) + 300
+    argv = ["msb", "create", "--name", name, "--pull", "never",
+            "--cpus", str(cpus), "--memory", f"{mem}M", "--root-disk", f"{disk}G",
+            "--net-default-egress", "deny"]
+    for rule in rules:
+        argv += ["--net-rule", rule]
+    # As every msbctl sandbox: hostname rules and secret substitution both
+    # need the interceptor. Ports bind 127.0.0.1 only; base_url is the way in.
+    argv += ["--tls-intercept"]
+    for spec in ports:
+        argv += ["--port", spec]
+    for key, value in env_pairs:
+        argv += ["--env", f"{key}={value}"]
+    for spec in binds:
+        argv += ["--secret", with_transcript_passthrough(spec)]
+    if binds:
+        argv += ["--secret-violation-action", "block-and-log"]
+    argv += ["--label", KANDEV_OWNER_LABEL, "--label", f"kandev.env={env}",
+             "--max-duration", f"{seconds}s", image]
+    proc = run(argv, env={n: v for n, v, _ in secrets}, check=False, quiet=True)
+    if proc.returncode != 0:
+        raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
+    entry = read_toml(registry_path_for(name))
+    kandev_pin_api(name, entry)
+    kandev_serve(settings, name, kandev_ports(entry), True)
+    kandev_set(name, state="running", generation=1, agentctl_running=False)
+    return kandev_record(name, read_toml(registry_path_for(name)))
+
+
+def kandev_agentctl(args, config, settings):
+    name, entry = kandev_need(args.env)
+    header = kandev_read_header()
+    sha, size = header.get("sha256"), header.get("size")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
+        raise KandevError("invalid_config", "sha256 is 64 lowercase hex digits")
+    if not isinstance(size, int) or isinstance(size, bool) or not 0 < size <= KANDEV_AGENTCTL_MAX:
+        raise KandevError("invalid_config", "size is 1 byte to 512 MiB")
+    nonce = header.get("nonce")
+    if not isinstance(nonce, str) or not nonce or len(nonce) > 4096 or re.search(r"[\0\n\r]", nonce):
+        raise KandevError("invalid_config", "nonce is one line")
+    ports = kandev_ports(entry)
+    runtime = header.get("runtime_port", KANDEV_GUEST_PORTS[0])
+    if runtime not in ports:
+        raise KandevError("invalid_config", "runtime_port is not one of this sandbox's ports")
+    extra_args = header.get("args", [f"-port={runtime}"])
+    if not isinstance(extra_args, list) or any(
+            not isinstance(a, str) or len(a) > 4096 or "\0" in a for a in extra_args):
+        raise KandevError("invalid_config", "args is a list of strings")
+    agent_env = header.get("env", {})
+    if not isinstance(agent_env, dict) or any(
+            not re.fullmatch(r"AGENTCTL_[A-Z0-9_]+", k) or k == "AGENTCTL_BOOTSTRAP_NONCE"
+            or not isinstance(v, str) or re.search(r"[\0\n]", v) for k, v in agent_env.items()):
+        raise KandevError("invalid_config", "env keys are AGENTCTL_*, values one line")
+    # Exactly `size` bytes, then the digest, before anything reaches the guest.
+    blob, digest = bytearray(), hashlib.sha256()
+    while len(blob) < size:
+        chunk = sys.stdin.buffer.read(min(1 << 20, size - len(blob)))
+        if not chunk:
+            raise KandevError("invalid_config", "stdin ended before `size` bytes")
+        blob += chunk
+        digest.update(chunk)
+    if digest.hexdigest() != sha:
+        raise KandevError("invalid_config", "the binary does not match its sha256")
+    if state_of(name) != "running":
+        raise KandevError("unavailable", "the sandbox is not running")
+    if entry.get("agentctl_sha256") == sha and kandev_probe(ports[runtime]):
+        kandev_set(name, agentctl_running=True)
+        return kandev_record(name, read_toml(registry_path_for(name)))
+    parent = GUEST_AGENTCTL.rsplit("/", 1)[0]
+    write = subprocess.run(
+        ["msb", "exec", name, "--no-tty", "--", "sh", "-c",
+         f"mkdir -p {parent} && cat > {GUEST_AGENTCTL}.new && chmod 0755 {GUEST_AGENTCTL}.new "
+         f"&& mv -f {GUEST_AGENTCTL}.new {GUEST_AGENTCTL}"],
+        input=bytes(blob), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if write.returncode != 0:
+        raise KandevError("unavailable", "could not write agentctl into the guest")
+    # The nonce is the first line of this exec's stdin and nowhere else; the
+    # rest of the environment is not secret. setsid, so agentctl outlives the
+    # exec and the ssh session that ran msbctl (spike 16).
+    start = ("read -r n; "
+             "[ -f /run/agentctl.pid ] && kill \"$(cat /run/agentctl.pid)\" 2>/dev/null; "
+             "AGENTCTL_BOOTSTRAP_NONCE=\"$n\" setsid \"$0\" \"$@\" </dev/null "
+             ">/var/log/agentctl.log 2>&1 & echo $! > /run/agentctl.pid")
+    flags = []
+    for key, value in sorted(agent_env.items()):
+        flags += ["-e", f"{key}={value}"]
+    launch = subprocess.run(["msb", "exec", name, "--no-tty", *flags, "--", "sh", "-c", start,
+                             GUEST_AGENTCTL, *extra_args],
+                            input=(nonce + "\n").encode(), stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    if launch.returncode != 0:
+        raise KandevError("unavailable", "could not start agentctl")
+    kandev_set(name, agentctl_sha256=sha, agentctl_version=str(header.get("version", ""))[:64],
+               agentctl_running=False)
+    deadline = time.monotonic() + KANDEV_AGENTCTL_WAIT
+    while time.monotonic() < deadline:
+        if kandev_probe(ports[runtime]):
+            kandev_set(name, agentctl_running=True)
+            return kandev_record(name, read_toml(registry_path_for(name)))
+        time.sleep(0.5)
+    raise KandevError("unavailable", "agentctl did not answer on its control port")
+
+
+def kandev_inspect(args, config, settings):
+    return kandev_record(*kandev_need(args.env), live=True)
+
+
+def kandev_find(args, config, settings):
+    if not isinstance(args.operation, str) or not args.operation:
+        raise KandevError("invalid_config", "find needs --operation")
+    for name, entry in kandev_entries():
+        if entry.get("operation_id") == args.operation:
+            return kandev_record(name, entry)
+    raise KandevError("not_found", "no kandev entry for that operation")
+
+
+def kandev_start(args, config, settings):
+    name, entry = kandev_need(args.env)
+    req = kandev_read_header(allow_empty=True)
+    if state_of(name) == "running":
+        return kandev_record(name, entry)
+    if state_of(name) == "absent":
+        raise KandevError("not_found", "the sandbox's VM is gone")
+    given = {n: v for n, v, _ in kandev_secrets(req.get("secrets"))}
+    bound = [secret_var(spec) for spec in entry.get("secret_binds", [])]
+    if sorted(given) != sorted(bound):
+        # Never a half-bound start: a missing value would reach the guest's
+        # requests as the literal placeholder.
+        raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
+    proc = run(["msb", "start", name], env=given, check=False, quiet=True)
+    if proc.returncode != 0:
+        raise KandevError("unavailable", "msb start failed")
+    kandev_pin_api(name, entry)
+    kandev_set(name, state="running", generation=int(entry.get("generation", 0)) + 1,
+               agentctl_running=False)
+    return kandev_record(name, read_toml(registry_path_for(name)))
+
+
+def kandev_stop(args, config, settings):
+    name, entry = kandev_need(args.env)
+    if state_of(name) == "running":
+        if run(["msb", "stop", name], check=False, quiet=True).returncode != 0:
+            raise KandevError("unavailable", "msb stop failed")
+    if entry.get("state") != "absent":
+        kandev_set(name, state="stopped", agentctl_running=False)
+    return kandev_record(name, read_toml(registry_path_for(name)))
+
+
+def kandev_expiry(args, config, settings):
+    name, entry = kandev_need(args.env)
+    when = parse_iso(args.at, "--at")
+    ceiling = parse_iso(entry.get("max_expires_at"), "max_expires_at")
+    kandev_set(name, expires_at=iso(min(when, ceiling)))
+    return kandev_record(name, read_toml(registry_path_for(name)))
+
+
+def kandev_lease(args, config, settings):
+    name, entry = kandev_need(args.env)
+    try:
+        port = int(args.port)
+    except (TypeError, ValueError):
+        raise KandevError("invalid_config", "lease needs a guest port") from None
+    if port not in kandev_ports(entry):
+        raise KandevError("not_found", "that port is not one of this sandbox's")
+    if not settings["base_url"]:
+        raise KandevError("unavailable", "[kandev] base_url is not set")
+    if kandev_state(name, entry, msb_table()) != "running":
+        raise KandevError("unavailable", "the sandbox is not running")
+    return {"lease": {"base_url": f"{settings['base_url']}/vm/{name}/p/{port}",
+                      "expires_at": iso(utc_now() + dt.timedelta(seconds=KANDEV_LEASE_SECONDS)),
+                      "generation": str(int(entry.get("generation", 0)))}}
+
+
+def kandev_remove(name, entry, settings, labelled):
+    """Serve mappings, then the VM, then the entry: each step only once the one
+    before it worked, so a failure leaves the entry for a retry or the reaper.
+    A VM under this name that does not carry the Kandev label is not Kandev's
+    and is never removed."""
+    kandev_serve(settings, name, kandev_ports(entry), False)
+    if state_of(name) != "absent":
+        if name not in labelled:
+            raise KandevError("conflict", f"{name} exists without the Kandev label — left alone")
+        if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode != 0:
+            raise KandevError("unavailable", "msb rm failed — the entry is kept for a retry")
+    os.remove(registry_path_for(name))
+
+
+def kandev_destroy(args, config, settings):
+    env = kandev_check_env(args.env)
+    with kandev_lock():
+        found = kandev_lookup(env)
+        if found:
+            kandev_remove(*found, settings, set(kandev_labelled()))
+    return {"destroyed": True}
+
+
+def kandev_reap(args, config, settings):
+    """One pass: expiry, stuck creates, gone VMs, orphans. Exits; the systemd
+    timer from `host kandev install` runs it every minute."""
+    out = {"destroyed": [], "marked_absent": [], "orphans_removed": [], "errors": []}
+    with kandev_lock():
+        table = msb_table()
+        rows = kandev_labelled(fmt_json=True)
+        labelled = {r.get("name") for r in rows}
+        now = utc_now()
+        for name, entry in kandev_entries():
+            try:
+                state = kandev_state(name, entry, table)
+                expired = parse_iso(entry.get("expires_at"), "expires_at") <= now
+                stuck = state == "creating" and (
+                    now - parse_iso(entry.get("created_at"), "created_at")).total_seconds() > KANDEV_STUCK_CREATE
+                if expired or stuck:
+                    kandev_remove(name, entry, settings, labelled)
+                    out["destroyed"].append(name)
+                elif state == "absent" and entry.get("state") != "absent":
+                    kandev_set(name, state="absent", agentctl_running=False)
+                    out["marked_absent"].append(name)
+            except KandevError:
+                out["errors"].append(name)
+        # Listed before this pass removed anything: what it just destroyed is
+        # not an orphan.
+        known = set(registered()) | set(out["destroyed"])
+        for row in rows:
+            name = row.get("name")
+            if not name or name in known:
+                continue
+            try:
+                created = re.sub(r"\.\d+", "", str(row.get("created_at", "")))
+                age = (now - parse_iso(created, "created_at")).total_seconds()
+            except KandevError:
+                continue
+            if age > KANDEV_ORPHAN_AGE:
+                if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode == 0:
+                    out["orphans_removed"].append(name)
+                else:
+                    out["errors"].append(name)
+    return out
+
+
+KANDEV_VERBS = {
+    "health": kandev_health, "list": kandev_list, "provision": kandev_provision,
+    "agentctl": kandev_agentctl, "inspect": kandev_inspect, "find": kandev_find,
+    "start": kandev_start, "stop": kandev_stop, "expiry": kandev_expiry,
+    "lease": kandev_lease, "destroy": kandev_destroy, "reap": kandev_reap,
+}
+# The verbs that name an environment.
+KANDEV_ENV_VERBS = ("provision", "agentctl", "inspect", "start", "stop", "expiry", "lease", "destroy")
+
+
+def cmd_kandev(args, config):
+    """`msbctl kandev <verb>`: one JSON document on stdout; exit 0, or 3 with
+    {"error": {"code", "message"}}. Everything else goes to stderr."""
+    code, data = 0, None
+    with contextlib.redirect_stdout(sys.stderr):
+        try:
+            settings = kandev_settings(config)
+            if args.verb != "health" and not settings["enabled"]:
+                raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
+            if args.verb in KANDEV_ENV_VERBS and not args.env:
+                raise KandevError("invalid_config", f"kandev {args.verb} needs an environment id")
+            data = KANDEV_VERBS[args.verb](args, config, settings)
+        except KandevError as exc:
+            code, data = KANDEV_EXIT_ERROR, {"error": {"code": exc.code, "message": exc.message}}
+            if exc.retry_after is not None:
+                data["error"]["retry_after_seconds"] = int(exc.retry_after)
+        except SystemExit as exc:
+            code = KANDEV_EXIT_ERROR
+            data = {"error": {"code": "unavailable",
+                              "message": str(exc.code or "").replace("msbctl: ", "", 1)[:300]}}
+        except Exception:                       # the contract is JSON, always
+            traceback.print_exc()
+            code, data = KANDEV_EXIT_ERROR, {"error": {"code": "unavailable",
+                                                       "message": "internal error (see stderr)"}}
+    print_json(data)
+    sys.exit(code)
+
+
+def kandev_guard(args):
+    """Die if the operator's verb in `args` would act on a Kandev sandbox.
+
+    The operator may look at one and shell into it while it runs. Starting one
+    would boot it without its secrets, which exist only in Kandev's requests,
+    and everything else would change what Kandev owns."""
+    if args.func in (cmd_ls, cmd_status, cmd_show, cmd_shell, cmd_exec, cmd_kandev):
+        return
+    names = [getattr(args, "name", None)] + list(getattr(args, "names", None) or [])
+    for name in names:
+        if not name or split_remote(name) or not SANDBOX_NAME.fullmatch(str(name)):
+            continue
+        path = registry_path_for(name)
+        if os.path.exists(path) and read_toml(path).get("source") == "kandev":
+            die(f"{name} is a Kandev sandbox: Kandev owns it. You can ls, show, and shell or exec "
+                f"into it while it runs; `msbctl kandev destroy {read_toml(path).get('kandev_env', '…')}` "
+                "removes it.")
+
+
+def host_kandev(args):
+    """`host kandev install`: the reaper as a systemd user timer. Not a daemon:
+    every minute it runs `msbctl kandev reap` once, which exits."""
+    if args.arg != "install":
+        die("host kandev: the only action is `install`")
+    me = shutil.which("msbctl") or os.path.realpath(__file__)
+    os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
+    path_env = f"{os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"
+    service = os.path.join(SYSTEMD_USER_DIR, f"{KANDEV_REAP_UNIT}.service")
+    timer = os.path.join(SYSTEMD_USER_DIR, f"{KANDEV_REAP_UNIT}.timer")
+    with open(service, "w", encoding="utf-8") as fh:
+        fh.write(f"""# Written by `msbctl host kandev install`. One pass of the Kandev reaper:
+# destroys Kandev sandboxes past their expiry, cleans up stuck creates and
+# orphans. Run by {KANDEV_REAP_UNIT}.timer; it exits after each pass.
+[Unit]
+Description=msb-manager: reap expired Kandev sandboxes
+
+[Service]
+Type=oneshot
+Environment=PATH={path_env}
+ExecStart={me} kandev reap
+""")
+    with open(timer, "w", encoding="utf-8") as fh:
+        fh.write("""# Written by `msbctl host kandev install`.
+[Unit]
+Description=msb-manager: reap expired Kandev sandboxes every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+
+[Install]
+WantedBy=timers.target
+""")
+    note(f"wrote {tilde(service)} and {tilde(timer)}")
+    if shutil.which("systemctl"):
+        run(["systemctl", "--user", "daemon-reload"], check=False)
+        run(["systemctl", "--user", "enable", "--now", f"{KANDEV_REAP_UNIT}.timer"], check=False)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
+    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
+        note("a user timer runs with nobody logged in only with lingering on; once, as root:")
+        note(f"  loginctl enable-linger {user}")
 
 
 # ----------------------------------------------------------- remotes (laptop)
@@ -9009,8 +10071,9 @@ def preflight(args):
     if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
         return
     # `host check` reports a missing msb or /dev/kvm itself; the other host
-    # verbs need neither (serve re-runs msbctl, which checks then).
-    if args.func in (cmd_host, cmd_remote):
+    # verbs need neither (serve re-runs msbctl, which checks then). `kandev`
+    # answers in JSON whatever happens, and `kandev health` reports both.
+    if args.func in (cmd_host, cmd_remote, cmd_kandev):
         return
     # A sandbox on a remote needs ssh here, not msb; nor does `ls` once there
     # are remotes (this machine's rows simply are not shown without msb).
@@ -9247,16 +10310,28 @@ def build_parser():
                    help="remove the restriction: every host key")
     p.set_defaults(func=cmd_keys)
 
-    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart")
-    p.add_argument("action", choices=["serve", "authorize", "check", "autostart"])
+    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
+    p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
     p.add_argument("arg", nargs="?", metavar="KEY|install",
-                   help="authorize: one public key line, quoted; autostart: install")
+                   help="authorize: one public key line, quoted; autostart, kandev: install")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
+    p.add_argument("--kandev", action="store_true",
+                   help="authorize, serve: the Kandev plugin's key, which runs `msbctl kandev` verbs only")
     p.add_argument("--replace", action="store_true",
                    help="authorize: rewrite the key's existing line instead of refusing")
     p.add_argument("--json", action="store_true", help="check: one JSON document")
     p.set_defaults(func=cmd_host)
+
+    p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",
+                       description="Verbs the Kandev plugin runs over ssh. Each prints one JSON "
+                       "document; secrets, the agentctl binary and its nonce come on stdin.")
+    p.add_argument("verb", choices=list(KANDEV_VERBS))
+    p.add_argument("env", nargs="?", metavar="ENV", help="the Kandev environment id")
+    p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
+    p.add_argument("--operation", metavar="OP", help="find: the Kandev operation id")
+    p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")
+    p.set_defaults(func=cmd_kandev)
 
     p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, setup, ls, test, rm")
     p.add_argument("action", choices=["add", "setup", "ls", "test", "rm"])
@@ -9343,6 +10418,7 @@ def main():
             if hasattr(args, "names"):
                 args.names = [n if split_remote(n) else resolve_here(n) for n in args.names or [None]]
         if not hasattr(args, "names"):
+            kandev_guard(args)
             args.func(args, config)
             if BOOTSTRAP_FAILURES:
                 sys.exit(f"msbctl: bootstrap failed for {', '.join(BOOTSTRAP_FAILURES)} — see above")
@@ -9357,6 +10433,7 @@ def main():
                     if split_remote(name):
                         run_remote_verb(args, config, raw_argv, name)
                     else:
+                        kandev_guard(args)
                         args.func(args, config)
                 except SystemExit as exc:
                     if exc.code:

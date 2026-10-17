@@ -62,10 +62,12 @@ class MsbctlTest(TestCase):
             "FAKE_MSB_LOG": os.path.join(self.tmp, "msb.log"),
             "FAKE_MSB_STATE": os.path.join(self.tmp, "msb.json"),
             "FAKE_MSB_ENV_KEYS": ",".join(self.env_keys),
+            "FAKE_TAILSCALE_LOG": os.path.join(self.tmp, "tailscale.log"),
             "PATH": FAKE_BIN + os.pathsep + os.environ.get("PATH", ""),
         })
         for var in ("SSH_AUTH_SOCK", "GH_TOKEN", "MSB_RESTRICTED", "SSH_ORIGINAL_COMMAND",
-                    "CLAUDE_CODE_OAUTH_TOKEN", "FAKE_MSB_EXEC_OUT"):
+                    "CLAUDE_CODE_OAUTH_TOKEN", "FAKE_MSB_EXEC_OUT", "FAKE_MSB_READ_STDIN",
+                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH"):
             os.environ.pop(var, None)
         self.m = self.load_msbctl()
 
@@ -100,7 +102,8 @@ class MsbctlTest(TestCase):
         that are only offered on one; the answers still come from `stdin`."""
         out = tempfile.TemporaryFile("w+", encoding="utf-8")
         err = tempfile.TemporaryFile("w+", encoding="utf-8")
-        fake_in = io.StringIO(stdin)
+        # Bytes for a verb that reads binary stdin (`kandev agentctl`).
+        fake_in = io.TextIOWrapper(io.BytesIO(stdin)) if isinstance(stdin, bytes) else io.StringIO(stdin)
         if tty:
             fake_in.isatty = out.isatty = lambda: True
         code = 0
