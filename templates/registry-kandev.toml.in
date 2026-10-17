@@ -41,4 +41,4 @@ kandev_api    = {{API}}
 kandev_api_ip = {{API_IP}}
 {{RULE_GROUPS}}
 {{EXTRA_RULES}}
-{{SECRET_BINDS}}
+{{BINDINGS}}

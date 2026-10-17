@@ -8375,7 +8375,7 @@ def kandev_name_problem(name):
     return None
 
 
-def kandev_secrets(raw, field="secrets"):
+def kandev_bound_values(raw, field="secrets"):
     """({name: value}, [(name, [hosts])]) from a request, checked. Two
     structures on purpose: what is written to the entry is built from the
     second alone, which never held a value."""
@@ -8674,7 +8674,7 @@ def kandev_provision(args, config, settings):
     expires = parse_iso(req.get("expires_at"), "expires_at")
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
-    values, bindings = kandev_secrets(req.get("secrets"))
+    values, bindings = kandev_bound_values(req.get("secrets"))
     if any(not hosts for _, hosts in bindings):
         raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
     guest_env = req.get("env") or []
@@ -8720,7 +8720,7 @@ def kandev_provision(args, config, settings):
                 API_IP=toml_literal(api_addr),
                 RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
                 EXTRA_RULES=f"extra_rules = {toml_literal(egress + [api_rule])}",
-                SECRET_BINDS=f"secret_binds = {toml_literal(binds)}"))
+                BINDINGS=f"secret_binds = {toml_literal(binds)}"))
 
     box = Sandbox(name, config)
     rules = _kandev_try(box.net_rules)
@@ -8848,7 +8848,7 @@ def kandev_start(args, config, settings):
         return kandev_record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
-    given, _ = kandev_secrets(req.get("secrets"))
+    given, _ = kandev_bound_values(req.get("secrets"))
     bound = [secret_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):
         # Never a half-bound start: a missing value would reach the guest's
