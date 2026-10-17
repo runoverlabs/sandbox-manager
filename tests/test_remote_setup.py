@@ -21,7 +21,8 @@ def probe(**over):
     return "".join(f"{k}={v}\n" for k, v in values.items())
 
 
-class RemoteSetupTest(MsbctlTest):
+class RemoteBase(MsbctlTest):
+    """A configured remote and an ssh that answers by command; no tests."""
 
     def setUp(self):
         super().setUp()
@@ -53,6 +54,9 @@ class RemoteSetupTest(MsbctlTest):
 
     def commands(self, calls):
         return [c[-1] for c in calls]
+
+
+class RemoteSetupTest(RemoteBase):
 
     def test_installs_what_is_missing_when_asked(self):
         CHECK["msbctl"] = self.mine
@@ -258,6 +262,100 @@ class RemoteSetupTest(MsbctlTest):
             code, out, err = self.run_main(stdin=f"{keys.index('remotes') + 1}\n3\nq\n")
         self.assertEqual(code, 0, err)
         self.assertIn("msb@sbx-01.example", out)
+
+
+class ShareSettingsTest(RemoteBase):
+
+    TOKEN = "sk-ant-oat01-planted-value"
+
+    def setUp(self):
+        super().setUp()
+        cfg = self.m.CONFIG_FILE
+        self.m.set_toml_key(cfg, "name", "Ada", table="identities.personal")
+        self.m.set_toml_key(cfg, "email", "ada@example.com", table="identities.personal")
+        self.m.set_toml_key(cfg, "signing_key", KEY, table="identities.personal")
+        self.m.set_toml_key(cfg, "identity", "personal", table="defaults")
+        self.m.set_env_file_value(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", self.TOKEN)
+
+    def run_setup(self, stdin, answer=None):
+        real = subprocess.run
+        calls = []
+
+        def fake(argv, *a, **kw):
+            if not argv or argv[0] != "ssh":
+                return real(argv, *a, **kw)
+            calls.append((argv, kw.get("input")))
+            cmd = argv[-1]
+            if "linger=" in cmd:
+                return subprocess.CompletedProcess(argv, 0, probe(msbctl=f"msbctl {self.mine}"), "")
+            if "host check --json" in cmd:
+                return subprocess.CompletedProcess(argv, 0, json.dumps(CHECK), "")
+            if answer and "msbctl setup" in cmd:
+                return answer(argv, kw)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with mock.patch.object(self.m.subprocess, "run", fake):
+            code, out, err = self.run_main("remote", "setup", "sbx-01", stdin=stdin)
+        return code, out, err, calls
+
+    def test_copies_identities_and_sends_the_token_on_stdin(self):
+        # identities: accept; tokens: accept; key: not now.
+        code, out, err, calls = self.run_setup("\n\n\n")
+        self.assertEqual(code, 0, err)
+        setups = [(argv[-1], given) for argv, given in calls if "msbctl setup" in argv[-1]]
+        self.assertEqual(len(setups), 2, setups)
+        ident, token = setups
+        for part in ("--identity personal", "--git-name Ada", "--git-email ada@example.com", "--default"):
+            self.assertIn(part, ident[0])
+        self.assertNotIn("signing", ident[0])
+        self.assertIn("signing keys stay here", out)
+        self.assertIn("--claude-token main --stdin --default", token[0])
+        self.assertEqual(token[1], self.TOKEN + "\n")
+        for argv, _ in calls:
+            self.assertNotIn(self.TOKEN, " ".join(argv))
+        self.assertNotIn(self.TOKEN, out + err)
+
+    def test_nothing_is_sent_when_deselected(self):
+        # identities: untick 1; tokens: untick 1; key: not now.
+        code, _, err, calls = self.run_setup("1\n\n1\n\n\n")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(any("msbctl setup" in argv[-1] for argv, _ in calls))
+
+    def test_an_old_host_takes_the_token_without_default(self):
+        def old(argv, kw):
+            if "--default" in argv[-1] or "--identity" in argv[-1]:
+                return subprocess.CompletedProcess(
+                    argv, 2, "", "msbctl: error: unrecognized arguments: --default")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        code, out, err, calls = self.run_setup("\n\n\n", answer=old)
+        self.assertEqual(code, 0, err)
+        self.assertIn("too old to take identities", err)
+        sent = [given for argv, given in calls if "--claude-token main --stdin" in argv[-1]
+                and "--default" not in argv[-1]]
+        self.assertEqual(sent, [self.TOKEN + "\n"])
+
+
+class HostSetupFlagsTest(MsbctlTest):
+
+    def test_identity_without_a_menu(self):
+        code, _, err = self.run_main("setup", "--identity", "work", "--git-name", "Ada L",
+                                     "--git-email", "ada@example.com", "--default")
+        self.assertEqual(code, 0, err)
+        cfg = self.m.load_config()
+        self.assertEqual(cfg["identities"]["work"], {"name": "Ada L", "email": "ada@example.com"})
+        self.assertEqual(cfg["defaults"]["identity"], "work")
+
+    def test_identity_needs_both(self):
+        code, _, err = self.run_main("setup", "--identity", "work", "--git-name", "Ada")
+        self.assertNotEqual(code, 0)
+        code, _, err = self.run_main("setup", "--default")
+        self.assertNotEqual(code, 0)
+
+    def test_token_default(self):
+        code, _, err = self.run_main("setup", "--claude-token", "work", "--stdin", "--default",
+                                     stdin="sk-ant-oat01-x\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.m.load_config()["defaults"]["claude_token"], "work")
+        self.assertIn("work", self.m.claude_tokens())
 
 
 class AuthorizeReplaceTest(MsbctlTest):

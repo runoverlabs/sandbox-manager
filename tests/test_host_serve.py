@@ -49,6 +49,10 @@ ALLOWED = [
 
 REFUSED = [
     "msbctl;rm -rf ~",
+    # The host's own settings, not a credential: remote setup copies these
+    # before the key is restricted.
+    "msbctl setup --identity work --git-name A --git-email a@example.com",
+    "msbctl setup --claude-token main --stdin --default",
     "/bin/sh -c ls",
     "/home/msb/.local/bin/msbctl-evil ls",
     "./msbctl ls",

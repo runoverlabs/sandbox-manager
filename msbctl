@@ -4811,14 +4811,45 @@ def store_claude_token(args):
     value = read_secret_input(f"the Claude token {name!r}", args.stdin)
     set_env_file_value(GLOBAL_ENV, claude_token_var(name), value)
     note(f"Claude token {name!r} stored in {tilde(GLOBAL_ENV)} (0600); read at each sandbox's next start")
+    if args.default:
+        ensure_local_config()
+        set_toml_key(CONFIG_FILE, "claude_token", name, table="defaults")
+        note(f"{name!r} is now the default Claude token for new sandboxes")
+
+
+def store_identity(args):
+    """setup --identity KEY --git-name N --git-email E [--default]: what the
+    identities menu writes, with no menu — how `remote setup` copies a
+    laptop's identities to a host. No signing key: that needs an ssh-agent,
+    and a host's sandboxes are given none."""
+    key = args.identity
+    if not NAME_SLUG.fullmatch(key):
+        die(f"{key!r}: an identity's name is lowercase letters, digits and dashes, starting with a letter")
+    if not args.git_name or "@" not in (args.git_email or ""):
+        die("--identity needs --git-name and --git-email")
+    if any(c in (args.git_name + args.git_email) for c in "\n\r\0"):
+        die("a name or email cannot contain a line break")
+    ensure_local_config()
+    table = f"identities.{key}"
+    set_toml_key(CONFIG_FILE, "name", args.git_name, table=table)
+    set_toml_key(CONFIG_FILE, "email", args.git_email, table=table)
+    note(f"identity {key}: {args.git_name} <{args.git_email}>")
+    if args.default:
+        set_toml_key(CONFIG_FILE, "identity", key, table="defaults")
+        note(f"{key} is now the default identity for new sandboxes")
 
 
 def cmd_setup(args, config):
     if getattr(args, "claude_token", None):
         store_claude_token(args)
         return
+    if getattr(args, "identity", None):
+        store_identity(args)
+        return
     if getattr(args, "stdin", False):
         die("--stdin is for `msbctl setup --claude-token NAME --stdin`")
+    if getattr(args, "default", False) or getattr(args, "git_name", None) or getattr(args, "git_email", None):
+        die("--default, --git-name and --git-email go with --identity (or --claude-token)")
     ensure_local_config()
     welcome = getattr(args, "welcome", False)
     if welcome:
@@ -7485,8 +7516,10 @@ def restricted_problem(argv):
     if func is cmd_setup:
         # The menu edits identities, egress groups and defaults. Storing a
         # Claude token is how one reaches the host at all.
-        return None if args.claude_token and args.stdin and not args.welcome else \
-            "setup: only --claude-token NAME --stdin"
+        # Identities and defaults are the host's configuration, not a credential.
+        only_token = (args.claude_token and args.stdin and not args.welcome and not args.default
+                      and not args.identity and not args.git_name and not args.git_email)
+        return None if only_token else "setup: only --claude-token NAME --stdin"
     if func is cmd_add:
         # A folder `add` mounts a host path of the caller's choosing.
         return None if args.repo else "add: only --repo (a folder add mounts a host path)"
@@ -8240,9 +8273,71 @@ def remote_setup(name, config):
                 else:
                     note(f"lingering needs root, once, on {name}:  loginctl enable-linger {probe.get('user', '')}")
 
+    remote_share_settings(name, dest, load_config())
     remote_restrict_key(name, dest)
     say(f"Testing {name}")
     remote_test(name, load_config())
+
+
+def remote_share_settings(name, dest, config):
+    """Offer to copy this machine's git identities and Claude tokens to the
+    host, so its sandboxes can commit and log in. Before the key is restricted:
+    `host serve` lets a Claude token through and nothing else here."""
+    idents = {k: v for k, v in (config.get("identities") or {}).items()
+              if isinstance(v, dict) and v.get("name") and v.get("email")}
+    tokens = claude_tokens()
+    if not idents and not tokens:
+        return
+    say(f"Settings for {name}'s sandboxes")
+    note("A sandbox there commits as an identity and logs Claude in with a token, both")
+    note(f"taken from {name}'s own settings, which start empty. Copy yours over?")
+    note("Over ssh, the token on stdin: never in a command line or a file on the way.")
+
+    def failed(proc, what):
+        if proc.returncode and "unrecognized arguments" in (proc.stderr or ""):
+            warn(f"msbctl on {name} is too old to take {what} this way: "
+                 f"`ssh -t {dest} msbctl setup` sets them by hand")
+            return True
+        if proc.returncode:
+            warn(f"{what} on {name}: {_short_reason(proc)}")
+            return True
+        return False
+
+    if idents:
+        default = config.get("defaults", {}).get("identity", "")
+        labels = {f"{k:<12} {v['name']} <{v['email']}>"
+                  + ("  (default)" if k == default else ""): k for k, v in sorted(idents.items())}
+        chosen = toggle_list("git identities to copy", list(labels), list(labels))
+        if any(idents[labels[c]].get("signing_key") for c in chosen):
+            note("(signing keys stay here: a sandbox there gets no ssh-agent to sign with)")
+        for label in chosen:
+            key = labels[label]
+            proc = remote_sh(dest, 'msbctl setup "$@"', "--identity", key,
+                             "--git-name", idents[key]["name"], "--git-email", idents[key]["email"],
+                             *(["--default"] if key == default else []), capture=True)
+            if failed(proc, "identities"):
+                break
+            note(f"copied identity {key}")
+    if tokens:
+        default = default_claude_token(config)
+        labels = {f"{k}" + ("  (default)" if k == default else ""): k for k in tokens}
+        preselect = [lab for lab, k in labels.items() if k == default]
+        chosen = toggle_list("Claude tokens to send", list(labels), preselect)
+        for label in chosen:
+            key = labels[label]
+            make_default = ["--default"] if key == default else []
+            proc = remote_sh(dest, 'msbctl setup "$@"', "--claude-token", key, "--stdin",
+                             *make_default, capture=True, stdin=tokens[key] + "\n")
+            if make_default and proc.returncode and "unrecognized arguments" in (proc.stderr or ""):
+                # 0.3.0 takes the token but not --default.
+                proc = remote_sh(dest, 'msbctl setup "$@"', "--claude-token", key, "--stdin",
+                                 capture=True, stdin=tokens[key] + "\n")
+                if not proc.returncode and key != CLAUDE_TOKEN_MAIN:
+                    warn(f"msbctl on {name} is too old to make {key!r} its default: a sandbox "
+                         f"there uses it only if named (`claude_token = \"{key}\"`)")
+            if failed(proc, "Claude tokens"):
+                break
+            note(f"sent Claude token {key}")
 
 
 def remote_restrict_key(name, dest):
@@ -8935,6 +9030,12 @@ def build_parser():
     p.add_argument("--claude-token", metavar="NAME",
                    help="no menu: store a Claude token under this name (main is the default)")
     p.add_argument("--stdin", action="store_true", help="with --claude-token: read it from stdin")
+    p.add_argument("--identity", metavar="KEY",
+                   help="no menu: add or change a git identity (with --git-name and --git-email)")
+    p.add_argument("--git-name", metavar="NAME", help="with --identity: the name commits carry")
+    p.add_argument("--git-email", metavar="EMAIL", help="with --identity: the email commits carry")
+    p.add_argument("--default", action="store_true",
+                   help="with --identity or --claude-token: also make it the default for new sandboxes")
     p.set_defaults(func=cmd_setup)
 
     p = sub.add_parser("edit", help="edit an existing sandbox, one wizard section at a time")

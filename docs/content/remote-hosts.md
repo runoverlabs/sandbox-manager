@@ -91,6 +91,10 @@ It looks at the host and asks before each step:
 - add the user to the `kvm` group if it can't open `/dev/kvm` (with `sudo -n`,
   if that works without a password);
 - install autostart, and turn lingering on the same way;
+- copy your git identities (without signing keys: a sandbox there has no
+  ssh-agent to sign with) and send the Claude tokens you pick, over ssh's stdin.
+  Your defaults stay the defaults there. A host starts with neither, and
+  without them its sandboxes can't commit or log Claude in;
 - restrict one of your keys to `msbctl host serve`. The default is *not now*.
   If the key you pick is the one you log in with, it warns that you lose its
   shell, so keep another way in first: a password, the console, or an admin
