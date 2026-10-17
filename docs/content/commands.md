@@ -368,14 +368,18 @@ recorded so a rebuild reproduces them. Run `msbctl ls --refresh` first for
 
 ```text
 msbctl setup [--welcome]
-msbctl setup --claude-token NAME [--stdin]
+msbctl setup --claude-token NAME [--stdin] [--default]
+msbctl setup --identity KEY --git-name NAME --git-email EMAIL [--default]
 ```
 
 Your machine-level settings as a menu: git identities, Claude login, your
 network, new-sandbox defaults, or the config file itself. `--welcome` runs the
 first-time walk-through. `--claude-token NAME` skips the menu and stores one
 Claude token under that name (`main` is the default one), from a hidden prompt
-or `--stdin`.
+or `--stdin`. `--identity` adds or changes a git identity the same way, without
+a signing key. `--default` also makes either one the default for new sandboxes.
+These are how `msbctl remote setup` copies your settings to a host; through a
+restricted key, only `--claude-token NAME --stdin` is allowed.
 
 ### `msbctl self-update`
 
@@ -422,7 +426,8 @@ The other machines this one drives; the menu's **remote hosts** does the same.
 `setup`; otherwise it prints the `msbctl host authorize` line to run there and
 tests the connection. `setup` looks at the host over ssh and offers, one
 question each, what's missing: msb and msbctl, both at this machine's versions,
-the kvm group, autostart, and last restricting this machine's key to
+the kvm group, autostart, copying your git identities and sending Claude
+tokens (on stdin), and last restricting this machine's key to
 `host serve` (it warns first when that key is the one with a shell there). Then
 it tests. `test` runs
 the host's `host check` and warns about an unrestricted key or a version
