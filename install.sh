@@ -329,6 +329,5 @@ cat <<EOF
    Remove:    $TOOLDIR/install.sh --uninstall
 
    The desktop entry is "Sandboxes". It starts the autostart set and opens the
-   picker; nothing in it attaches by default — Enter opens $EDITOR_BIN on the
-   project and you shell in from there.
+   picker: Enter edits a sandbox, t opens a shell in it.
 EOF
