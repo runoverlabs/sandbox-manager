@@ -86,10 +86,10 @@ what's out of date inside it, and binds a key to each action:
 
 | Key | Action |
 | --- | --- |
-| `enter` | open the editor on the project (`msbctl code`) |
+| `enter` (or `e`) | edit, one wizard section at a time (`msbctl edit`) |
+| `c` | open the editor on the project (`msbctl code`) |
 | `t` | shell |
 | `s` / `x` | start / stop |
-| `e` | edit, one wizard section at a time |
 | `u` | update claude, gh and apt packages |
 | `l` | reclaim memory |
 | `f` | refresh version info |

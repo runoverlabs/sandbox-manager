@@ -14,6 +14,9 @@ release notes.
 - `msbctl host authorize --replace` rewrites a key's existing line, so a key that already has a shell can be restricted.
 - `msbctl remote setup` offers to copy your git identities and Claude tokens to the host; `msbctl setup --identity KEY --git-name … --git-email …` and `--default` set them without the menu.
 
+### Changed
+- In the picker, Enter now edits the sandbox (`msbctl edit`); the editor on its project moved to `c`.
+
 ### Fixed
 - Bare `msbctl` → "register a new project" crashed with `AttributeError: 'Namespace' object has no attribute 'repo'`, and "refresh version info" likewise.
 
