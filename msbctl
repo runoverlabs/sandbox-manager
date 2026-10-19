@@ -8347,11 +8347,77 @@ def kandev_settings(config):
         bad("rule_groups", f"a list of rule groups; known: {', '.join(sorted(known))}")
     out["rule_groups"] = [g for g in groups if g != "base"]
     extra = raw.get("allow_extra", [])
-    if not isinstance(extra, list) or any(
-            not isinstance(p, str) or not (p == "*" or HOSTNAME.fullmatch(p)) for p in extra):
-        bad("allow_extra", 'a list of hostname patterns ("pypi.org", "*.example.com") or ["*"]')
+    entries = [kandev_allow_entry(p) if isinstance(p, str) else None
+               for p in (extra if isinstance(extra, list) else [None])]
+    if None in entries:
+        bad("allow_extra", 'a list of "*", hostname patterns ("pypi.org", "*.example.com"), '
+            'addresses ("192.168.2.6"), address:port ("192.168.2.6:8788", "[fd00::1]:22") '
+            'and CIDRs ("192.168.2.0/24")')
+    for entry, text in zip(entries, extra, strict=True):
+        if entry[0] == "net" and entry[1].prefixlen < KANDEV_CIDR_MIN[entry[1].version]:
+            bad("allow_extra", f"{text} is wider than /{KANDEV_CIDR_MIN[entry[1].version]}")
     out["allow_extra"] = extra
+    out["allow_extra_entries"] = entries
     return out
+
+
+# The widest CIDR [kandev] allow_extra may name, per IP version, as the
+# plugin's own range limits: past this it is "*" by another name.
+KANDEV_CIDR_MIN = {4: 8, 6: 32}
+
+
+def kandev_allow_entry(text):
+    """One [kandev] allow_extra entry, parsed, or None if it is not one:
+    ("any",) for "*"; ("host", pattern) for a hostname or *.suffix, any port;
+    ("net", network, port or None) for an address (a /32 or /128), an
+    address:port, or a CIDR (any port). Addresses are tried first: "10.0.0.10"
+    also has the shape of a hostname."""
+    text = text.strip()
+    if text == "*":
+        return ("any",)
+    body, port = text, None
+    found = (re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})", text)
+             or re.fullmatch(r"([0-9.]+):(\d{1,5})", text))
+    if found:
+        body, port = found.group(1), int(found.group(2))
+        if not 1 <= port <= 65535:
+            return None
+    elif text.startswith("[") and text.endswith("]"):
+        body = text[1:-1]
+    try:
+        # strict: "192.168.2.6/24" is a typo for one of two things, not a guess.
+        net = ipaddress.ip_network(body, strict=True)
+    except ValueError:
+        return ("host", text.lower()) if port is None and HOSTNAME.fullmatch(text.lower()) else None
+    if port is not None and "/" in body:
+        return None                     # a CIDR is any port; a port goes with one address
+    return ("net", net, port)
+
+
+def kandev_target_allowed(target, entries):
+    """Whether a request's egress target (host, host:port or host:proto:port,
+    already checked by parse_allow_target()) is admitted by allow_extra. A
+    hostname pattern matches the host part on any port and never an address;
+    an address or CIDR matches an address (or narrower CIDR) inside it, on any
+    port, and an address:port only that one port, never a range or `any`."""
+    fields = _split_rule_target(target.strip())
+    host = fields[0].lower()
+    ports = "443" if len(fields) == 1 else fields[-1]
+    try:
+        net = ipaddress.ip_network(host.strip("[]"), strict=False)
+    except ValueError:
+        net = None
+    for entry in entries:
+        if entry[0] == "any":
+            return True
+        if entry[0] == "host" and net is None and (
+                host == entry[1] or (entry[1].startswith("*.") and host.endswith(entry[1][1:]))):
+            return True
+        if entry[0] == "net" and net is not None and net.version == entry[1].version \
+                and net.subnet_of(entry[1]) \
+                and (entry[2] is None or (ports.isdigit() and int(ports) == entry[2])):
+            return True
+    return False
 
 
 def kandev_name(env):
@@ -8625,15 +8691,12 @@ def kandev_egress(raw, settings):
     if not isinstance(raw, list) or any(not isinstance(t, str) for t in raw):
         raise KandevError("invalid_config", "egress_allow must be a list of strings")
     rules = []
-    patterns = settings["allow_extra"]
     for target in raw:
         if "@" in target:
             raise KandevError("invalid_config", f"{target!r}: give a host or host:port, not a rule")
         rule = _kandev_try(parse_allow_target, target)
-        host = _split_rule_target(target)[0].lower()
-        if "*" not in patterns and not any(
-                host == p or (p.startswith("*.") and host.endswith(p[1:])) for p in patterns):
-            raise KandevError("invalid_config", f"{host} is not allowed by [kandev] allow_extra")
+        if not kandev_target_allowed(target, settings["allow_extra_entries"]):
+            raise KandevError("invalid_config", f"{target} is not allowed by [kandev] allow_extra")
         rules.append(rule)
     return rules
 
@@ -9098,6 +9161,10 @@ def kandev_health(args, config, settings):
                      "max_memory_mib": settings["max_memory_mib"], "memory_mib": mem},
         "serve": kandev_serve_ok(settings, tls),
         "tls": tls[0],
+        # The operator's own policy, not a secret: the plugin's Test checks its
+        # default egress against it, since one refused entry refuses a whole
+        # provision and would make every profile fail on this host.
+        "egress": {"allow_extra": list(settings["allow_extra"])},
     }
 
 

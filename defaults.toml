@@ -258,9 +258,15 @@ proxy_port_pool = "30000-39999"
 # host is added per sandbox from the request, pinned to the address it resolves
 # to here, so DNS rebind protection stays on.
 rule_groups   = ["github", "npm", "python", "claude"]
-# What a profile's extra egress may add, as hostname patterns ("pypi.org",
-# "*.example.com"). Empty allows nothing extra, as everywhere else in this file;
-# ["*"] trusts whatever the Kandev server's profiles ask for.
+# What a profile's extra egress may add. Each entry is one of:
+#   "pypi.org", "*.example.com"   a hostname pattern: that host, any port
+#   "192.168.2.6"                 an address, any port
+#   "192.168.2.6:8788"            an address and one port ("[fd00::1]:22" for IPv6)
+#   "192.168.2.0/24"              a CIDR, any port; no wider than /8 (IPv6: /32)
+# A hostname pattern never matches an address. Empty allows nothing extra, as
+# everywhere else in this file; ["*"] trusts whatever the Kandev server's
+# profiles ask for. `kandev health` reports this list, so the plugin can tell
+# before any launch whether its default egress would be refused here.
 allow_extra   = []
 
 # ---------------------------------------------------------------------------

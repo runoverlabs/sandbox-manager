@@ -318,6 +318,72 @@ class Provision(KandevTest):
         self.assertEqual(len(off), 4)
 
 
+class AllowExtra(KandevTest):
+    """[kandev] allow_extra admits addresses, address:port and CIDRs (F21)."""
+
+    def admits(self, allow_extra, target, env="e1"):
+        self.fresh()
+        self.configure(allow_extra=json.dumps(allow_extra))
+        code, doc = self.kandev("provision", env, stdin=request(egress_allow=[target]))
+        if code == 0:
+            return True
+        self.assertEqual(doc["error"]["code"], "invalid_config", doc)
+        self.assertIn("allow_extra", doc["error"]["message"])
+        return False
+
+    def test_the_accept_cases(self):
+        self.assertTrue(self.admits(["192.168.2.6:8788"], "192.168.2.6:8788"))
+        self.assertFalse(self.admits(["192.168.2.6:8788"], "192.168.2.6:8789"))
+        self.assertTrue(self.admits(["192.168.2.0/24"], "192.168.2.6:8788"))
+        self.assertTrue(self.admits(["192.168.2.0/24"], "192.168.2.6"))
+        self.assertFalse(self.admits(["pypi.org"], "192.168.2.6:8788"))
+        argv = self.msb_calls("create")
+        self.assertEqual(argv, [])                     # the last case created nothing
+
+    def test_matching(self):
+        cases = [
+            (["192.168.2.6"], "192.168.2.6:22", True),             # an address: any port
+            (["192.168.2.6"], "192.168.2.7:22", False),
+            (["192.168.2.6:8788"], "192.168.2.6:tcp:8000-9000", False),   # a range is not the port
+            (["192.168.2.6:8788"], "192.168.2.6:udp:8788", True),
+            (["192.168.2.0/24"], "192.168.3.6", False),
+            (["192.168.0.0/16"], "192.168.2.0/24:22", True),       # a narrower CIDR inside
+            (["192.168.2.0/24"], "192.168.0.0/16:22", False),
+            (["10.0.0.10"], "10.0.0.10:22", True),                 # an address, though hostname-shaped
+            (["[fd00::1]:22"], "[fd00::1]:22", True),
+            (["[fd00::1]:22"], "[fd00::1]:23", False),
+            (["fd00::/48"], "[fd00::5]:8080", True),
+            (["192.168.2.0/24"], "[fd00::5]:8080", False),
+            (["*.example.com"], "192.168.2.6:443", False),         # a hostname never matches an address
+            (["*.example.com"], "api.example.com:8443", True),     # and matches a host on any port
+            (["pypi.org", "192.168.2.6:8788"], "pypi.org", True),
+            (["*"], "anything.example:22", True),
+        ]
+        for allow, target, want in cases:
+            with self.subTest(allow=allow, target=target):
+                settings = self.m.kandev_settings({"kandev": {"port_pool": "20000-29999",
+                                                              "allow_extra": allow}})
+                self.assertEqual(self.m.kandev_target_allowed(target, settings["allow_extra_entries"]), want)
+
+    def test_config_errors(self):
+        for bad in (["10.0.0.0/4"], ["fd00::/16"], ["192.168.2.6/24"], ["192.168.2.0/24:22"],
+                    ["192.168.2.6:70000"], ["pypi.org:443"], ["not a host"], "pypi.org"):
+            with self.subTest(bad=bad):
+                self.fresh()
+                self.configure(allow_extra=json.dumps(bad))
+                self.assertIn("allow_extra", self.error("invalid_config", "health")["message"])
+        for good in (["10.0.0.0/8"], ["fd00::/32"], ["[fd00::1]"]):
+            with self.subTest(good=good):
+                self.fresh()
+                self.configure(allow_extra=json.dumps(good))
+                self.ok("health")
+
+    def test_health_reports_the_list(self):
+        loaded = ["pypi.org", "*.pythonhosted.org", "192.168.2.6:8788", "192.168.2.0/24"]
+        self.configure(allow_extra=json.dumps(loaded))
+        self.assertEqual(self.ok("health")["egress"], {"allow_extra": loaded})
+
+
 class Lifecycle(KandevTest):
 
     def agentctl_input(self, blob=b"\x7fELF fake agentctl", **over):

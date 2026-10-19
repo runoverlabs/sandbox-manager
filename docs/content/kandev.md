@@ -77,7 +77,7 @@ installs it with [`kandev tls install`](#the-tls-proxy). `health` reports
 | `proxy_listen` | `""` | the address the proxy's ports bind: this host's tailnet or LAN IP. Required for `"proxy"` |
 | `proxy_port_pool` | `"30000-39999"` | the proxy's public TLS ports, four per sandbox. Must not overlap `port_pool` |
 | `rule_groups` | `["github", "npm", "python", "claude"]` | egress every Kandev sandbox gets, after `base` |
-| `allow_extra` | `[]` | hostname patterns a profile's extra egress may add. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
+| `allow_extra` | `[]` | what a profile's extra egress may add: hostname patterns (`"pypi.org"`, `"*.example.com"`, any port), addresses (`"192.168.2.6"`, any port), `address:port` (`"192.168.2.6:8788"`, `"[fd00::1]:22"`) and CIDRs (`"192.168.2.0/24"`, any port, no wider than /8 or IPv6 /32). A hostname pattern never matches an address. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
 
 Nothing in a request can raise these limits or remove a base rule. Profiles add
 egress only within `allow_extra`.
@@ -159,7 +159,7 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
