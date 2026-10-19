@@ -177,13 +177,14 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |
 | `lease ENV PORT` | – | `base_url`, `expires_at` and `generation` for one guest port, plus `headers` with its token through the proxy |
 | `tls install` | a JSON line: `cert_pem` (the leaf, then its issuer), `key_pem` | checks and stores the proxy's certificate, and prints `{"tls": …}` as `health` does |
+| `restart-proxy` | – | restarts the proxy's service if it runs another release than this msbctl, else does nothing: `{"proxy": {"state", "version"}}`, `state` being `restarted`, `current` or `not_running`; a restart that fails is `unavailable` |
 
 The record `provision`, `start` and `expiry` return, and `ls`/`show` give as `kandev`,
 has the env and name, the operation and input digest, `state` (`creating`,
@@ -260,15 +261,27 @@ The line `host authorize --kandev` writes is
 runs `msbctl kandev …`, `ls`, `show`, `stop` and `purge -y` with `--json` on
 one named sandbox, `self-update --json`, and `msbctl --version`. Nothing else,
 and none of `host`: the reaper, the proxy and `host kandev configure` are this
-host's own.
+host's own. Your laptop's everyday key is refused every `kandev` verb, since
+one could create a sandbox with any egress.
 
-`self-update --json` is the plugin's Update: it installs the latest release
-(get.sh's output goes to stderr) and prints `{"msbctl_version": "0.5.2",
-"updated": true}`, the version now installed. `--version X` is allowed only
+`self-update --json` is the plugin's Update. It installs the latest release
+(get.sh's output goes to stderr) and prints `{"msbctl_version": "0.6.1",
+"updated": true, "proxy": {"state": "restarted", "version": "0.6.1"}}`, with
+the version now installed. `--version X` (`0.6.1` or `v0.6.1`) is allowed only
 when X is not older than the running version, as for the everyday key, since a
 downgrade could weaken `host serve` itself. A git checkout answers
-`unsupported`, and a host with Kandev off `denied`. Your laptop's everyday key is
-refused every `kandev` verb, since one could create a sandbox with any egress.
+`unsupported`, and a host with Kandev off `denied`.
+
+systemd keeps the old proxy process, and its old code, until the service is
+restarted, so an update restarts it whenever it runs another release than the
+one just installed. That cuts its open connections; Kandev reconnects, and the
+leases it holds stay valid. `proxy.state` is `restarted`, `current`,
+`not_running` or `failed` (with a `reason`; the update itself still
+succeeded). An update from 0.6.0 or older runs the old release's code, which
+never restarts the proxy: there, `health.serve.version` (the proxy's own
+release, `""` before 0.6.1) differs from `msbctl_version`, and
+`kandev restart-proxy` finishes the job, at a moment when no session needs
+the proxy.
 
 The Kandev key does set egress and secret bindings, which the everyday key may
 never do. A Kandev profile is the policy for its own sandboxes, and the Kandev

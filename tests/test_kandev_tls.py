@@ -157,8 +157,9 @@ class Health(TlsTest):
         self.assertEqual((doc["ok"], doc["running"]), (False, False))
         self.assertIn("not running", doc["reason"])
         with self.lock_held():
+            # A lock with nothing in it: a proxy from before it said its release.
             self.assertEqual(self.serve_doc(), {"ok": True, "mode": "proxy", "listen": "127.0.0.1",
-                                                "running": True})
+                                                "running": True, "version": ""})
 
     def test_proxy_listen_unset(self):
         self.install()
@@ -378,6 +379,12 @@ class Proxy(TlsTest):
         tls, line = self.request(port, lease, extra)
         tls.close()
         self.assertTrue(line.startswith("HTTP/1.1 401"), line)
+
+    def test_health_reports_which_release_the_proxy_is(self):
+        serve = self.ok("health")["serve"]
+        self.assertTrue(serve["running"])
+        self.assertEqual(serve["version"], self.m.version_string())
+        self.assertEqual(self.m.kandev_restart_proxy(self.m.version_string())["state"], "current")
 
     def test_a_lease_reaches_its_port_and_splices_both_ways(self):
         port, token = self.lease("e1", 8765)

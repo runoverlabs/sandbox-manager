@@ -2,8 +2,10 @@
 configure` (F23) and `self-update --json` under the plugin's key (F24)."""
 
 import os
+import subprocess
 from unittest import main, mock
 
+from tests.harness import MsbctlTest
 from tests.test_kandev import KandevTest
 
 MEMINFO = "MemTotal:       65536000 kB\nMemFree:  1000 kB\nMemAvailable:   52224000 kB\n"
@@ -149,6 +151,7 @@ FAKE_GET = """\
 #!/bin/sh
 # A stand-in for the packaged get.sh: switches `current` to the release asked
 # for (default 0.5.2), as the real one does through install.sh.
+echo "$@" > "$(dirname "$0")/get.args"
 version=0.5.2
 [ "$1" = --version ] && version="${2#v}"
 [ -n "$FAKE_GET_FAIL" ] && exit 1
@@ -177,13 +180,36 @@ class SelfUpdate(KandevTest):
             patch.start()
             self.addCleanup(patch.stop)
 
+    def get_args(self):
+        with open(os.path.join(self.here, "get.args"), encoding="utf-8") as fh:
+            return fh.read().split()
+
     def test_the_plugin_key_updates(self):
-        self.assertEqual(self.jok("self-update", "--json"), {"msbctl_version": "0.5.2", "updated": True})
+        self.assertEqual(self.jok("self-update", "--json"),
+                         {"msbctl_version": "0.5.2", "updated": True, "proxy": {"state": "not_running"}})
 
     def test_forward_only(self):
-        self.assertEqual(self.jok("self-update", "--version", "v0.6.0", "--json"),
-                         {"msbctl_version": "0.6.0", "updated": True})
+        self.assertEqual(self.jok("self-update", "--version", "v0.6.0", "--json")["msbctl_version"], "0.6.0")
         self.assertEqual(self.jok("self-update", "--version", "0.5.1", "--json")["updated"], False)
+
+    def test_a_bare_version_is_its_tag(self):
+        self.jok("self-update", "--version", "0.6.0", "--json")
+        self.assertEqual(self.get_args(), ["--version", "v0.6.0"])
+
+    def test_the_proxy_is_restarted_onto_the_new_release(self):
+        with mock.patch.object(self.m, "kandev_restart_proxy",
+                               lambda v: {"state": "restarted", "version": v}):
+            doc = self.jok("self-update", "--json")
+        self.assertEqual(doc["proxy"], {"state": "restarted", "version": "0.5.2"})
+
+    def test_without_json_it_installs_and_restarts(self):
+        seen = []
+        with mock.patch.object(self.m, "kandev_restart_proxy",
+                               lambda v: seen.append(v) or {"state": "restarted", "version": v}):
+            code, out, err = self.run_main("self-update")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(seen, ["0.5.2"])
+        self.assertIn("restarted the Kandev proxy", out)
 
     def test_never_down(self):
         self.jerror("denied", "self-update", "--version", "0.4.0", "--json")
@@ -201,6 +227,68 @@ class SelfUpdate(KandevTest):
     def test_disabled(self):
         self.configure(enabled=False)
         self.jerror("denied", "self-update", "--json")
+
+
+class RestartProxy(KandevTest):
+
+    def restart(self, versions, installed="0.6.1", code=0):
+        """kandev_restart_proxy() with the proxy reporting `versions` in turn
+        (None: not running) and systemctl answering `code`."""
+        calls, seen = [], iter(versions)
+        last = [None]
+
+        def version():
+            last[0] = next(seen, last[0])
+            return last[0]
+
+        proc = mock.Mock(returncode=code, stderr="Unit not found.")
+        with mock.patch.object(self.m, "kandev_proxy_version", version), \
+                mock.patch.object(self.m, "run", lambda argv, **kw: calls.append(argv) or proc), \
+                mock.patch.object(self.m.shutil, "which", lambda name: f"/usr/bin/{name}"), \
+                mock.patch.object(self.m.time, "sleep", lambda s: None):
+            return self.m.kandev_restart_proxy(installed, wait=0.5), calls
+
+    def test_an_old_proxy_is_restarted(self):
+        result, calls = self.restart(["0.6.0", "0.6.0", "0.6.1"])
+        self.assertEqual(result, {"state": "restarted", "version": "0.6.1"})
+        self.assertEqual(calls, [["systemctl", "--user", "try-restart", "msb-kandev-proxy.service"]])
+
+    def test_one_from_before_0_6_1_says_nothing_and_is_restarted(self):
+        self.assertEqual(self.restart(["", "0.6.1"])[0]["state"], "restarted")
+
+    def test_a_current_or_stopped_proxy_is_left_alone(self):
+        for versions, state in ((["0.6.1"], "current"), ([None], "not_running")):
+            with self.subTest(state=state):
+                result, calls = self.restart(versions)
+                self.assertEqual((result["state"], calls), (state, []))
+
+    def test_failures_say_why(self):
+        result, _ = self.restart(["0.6.0"], code=5)
+        self.assertEqual(result["state"], "failed")
+        self.assertIn("Unit not found", result["reason"])
+        # A unit that runs a pinned old path comes back as the old release.
+        result, _ = self.restart(["0.6.0", "0.6.0"])
+        self.assertIn("host kandev install", result["reason"])
+
+    def test_the_verb(self):
+        with mock.patch.object(self.m, "kandev_restart_proxy",
+                               lambda v: {"state": "restarted", "version": v}):
+            self.assertEqual(self.ok("restart-proxy")["proxy"]["state"], "restarted")
+        with mock.patch.object(self.m, "kandev_restart_proxy",
+                               lambda v: {"state": "failed", "version": "0.6.0", "reason": "why"}):
+            self.assertEqual(self.error("unavailable", "restart-proxy")["message"], "why")
+
+
+class GetSh(MsbctlTest):
+
+    def test_a_bare_version_is_its_tag(self):
+        get = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "get.sh")
+        for given in ("0.6.0", "v0.6.0"):
+            with self.subTest(given=given):
+                out = subprocess.run(["sh", get, "--version", given, "--print-version"],
+                                     env={**os.environ, "MSB_MANAGER_BASE_URL": "file:///nowhere"},
+                                     capture_output=True, text=True, check=True).stdout
+                self.assertEqual(out.strip(), "v0.6.0")
 
 
 if __name__ == "__main__":

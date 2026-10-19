@@ -5050,24 +5050,35 @@ def cmd_self_update(args, config):
             raise KandevError("denied", problem)
         if problem:
             die(problem)
-    argv = ["sh", get] + (["--version", args.version] if args.version else [])
-    if args.json:
-        before = version_string()
-        # get.sh never reads stdin, and its progress is not the document.
-        if subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=2).returncode:
+    # Releases are tagged vX.Y.Z; a bare 0.6.0 means the same one.
+    version = f"v{args.version}" if args.version and args.version[:1].isdigit() else args.version
+    argv = ["sh", get] + (["--version", version] if version else [])
+    before = version_string()
+    if not args.json:
+        note(f"installed: {before}")
+        sys.stdout.flush()
+    # get.sh never reads stdin; with --json, its progress is not the document.
+    if subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=2 if args.json else None).returncode:
+        if args.json:
             raise KandevError("unavailable", "the update failed (get.sh's output is on stderr)")
-        # The release get.sh just switched `current` to: this process is still
-        # the old one, and its own VERSION never changes.
-        try:
-            with open(os.path.join(os.path.dirname(os.path.dirname(HERE)), "current", "VERSION"),
-                      encoding="utf-8") as fh:
-                after = fh.read().strip()
-        except OSError:
+        die("the update failed (see above)")
+    # The release get.sh just switched `current` to: this process is still
+    # the old one, and its own VERSION never changes.
+    try:
+        with open(os.path.join(os.path.dirname(os.path.dirname(HERE)), "current", "VERSION"),
+                  encoding="utf-8") as fh:
+            after = fh.read().strip()
+    except OSError:
+        if args.json:
             raise KandevError("unavailable", "get.sh finished, but no installed VERSION was found") from None
-        return {"msbctl_version": after, "updated": after != before}
-    note(f"installed: {version_string()}")
-    sys.stdout.flush()              # exec replaces the process; buffered output would be lost
-    os.execvp("sh", argv)
+        die("get.sh finished, but no installed VERSION was found")
+    proxy = kandev_restart_proxy(after)
+    if args.json:
+        return {"msbctl_version": after, "updated": after != before, "proxy": proxy}
+    if proxy["state"] == "restarted":
+        note(f"restarted the Kandev proxy, which ran {before}")
+    elif proxy["state"] == "failed":
+        warn(f"the Kandev proxy still runs the old release: {proxy['reason']}")
     return None
 
 
@@ -8903,17 +8914,56 @@ def kandev_serve(mode, name, ports, on, strict=True):
 
 def kandev_proxy_running():
     """Whether `msbctl host kandev proxy` runs: it holds KANDEV_PROXY_LOCK for life."""
+    return kandev_proxy_version() is not None
+
+
+def kandev_proxy_version():
+    """The release the running proxy is (it writes version_string() into the
+    lock it holds), "" for one older than 0.6.1, which writes nothing, or
+    None when no proxy runs."""
     try:
         fh = open(KANDEV_PROXY_LOCK, encoding="utf-8")
     except OSError:
-        return False
+        return None
     with fh:
         try:
             fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
         except OSError:
-            return True
+            return fh.read(200).strip()
         fcntl.flock(fh, fcntl.LOCK_UN)
-        return False
+        return None
+
+
+def kandev_restart_proxy(installed, wait=10.0):
+    """Restart the proxy's service if it runs another release than `installed`,
+    so an update reaches it: systemd keeps the old process, and its old code,
+    until then. Its open connections are cut; Kandev reconnects, with leases
+    that still hold. Returns {"state", "version"}: state is "current",
+    "not_running", "restarted" or "failed" (with "reason")."""
+    before = kandev_proxy_version()
+    if before is None:
+        return {"state": "not_running"}
+    if before == installed:
+        return {"state": "current", "version": before}
+    if not shutil.which("systemctl"):
+        return {"state": "failed", "version": before, "reason": "no systemctl to restart it with"}
+    proc = run(["systemctl", "--user", "try-restart", f"{KANDEV_PROXY_UNIT}.service"],
+               check=False, capture=True)
+    if proc.returncode:
+        return {"state": "failed", "version": before,
+                "reason": f"systemctl --user try-restart {KANDEV_PROXY_UNIT}.service failed: "
+                f"{(proc.stderr or '').strip()[:200]}"}
+    deadline = time.monotonic() + wait
+    now = kandev_proxy_version()
+    while now != installed and time.monotonic() < deadline:
+        time.sleep(0.2)
+        now = kandev_proxy_version()
+    if now == installed:
+        return {"state": "restarted", "version": now}
+    return {"state": "failed", "version": now or "",
+            "reason": f"after a restart the proxy runs {now or 'nothing'}, not {installed}: on the host, "
+            f"`systemctl --user restart {KANDEV_PROXY_UNIT}.service`, or `msbctl host kandev install` "
+            "if its unit runs an old path"}
 
 
 def kandev_serve_ok(settings, tls):
@@ -8930,8 +8980,12 @@ def kandev_serve_ok(settings, tls):
             (tls[0]["installed"] and tls[1], tls[1]),
             (not running, "the proxy is not running (`msbctl host kandev install` sets it up)"),
         ) if bad]
+        # The proxy's own release: one behind msbctl_version missed a restart
+        # after an update (`kandev restart-proxy`).
+        version = kandev_proxy_version() if running else None
         return {"ok": not reasons, "mode": "proxy", "listen": settings["proxy_listen"],
-                "running": running, **({"reason": reasons[0]} if reasons else {})}
+                "running": running, **({"version": version} if version is not None else {}),
+                **({"reason": reasons[0]} if reasons else {})}
     if not shutil.which("tailscale"):
         return {"ok": False, "mode": "tailscale", "reason": "tailscale is not on PATH"}
     proc = run(["tailscale", "status", "--json"], check=False, capture=True)
@@ -9247,6 +9301,16 @@ def kandev_host_facts():
         with open(PROC_UPTIME, encoding="utf-8") as fh:
             facts["uptime_seconds"] = int(float(fh.read().split()[0]))
     return facts
+
+
+def kandev_restart_proxy_verb(args, config, settings):
+    """`kandev restart-proxy`: finish an update the old release could not, by
+    restarting the proxy if it runs another release than this one. A no-op
+    when it is current, so it never cuts connections for nothing."""
+    proxy = kandev_restart_proxy(version_string())
+    if proxy["state"] == "failed":
+        raise KandevError("unavailable", proxy["reason"])
+    return {"proxy": proxy}
 
 
 def kandev_health(args, config, settings):
@@ -9839,6 +9903,10 @@ def kandev_proxy(stop=None):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         die("another `msbctl host kandev proxy` is already running on this host")
+    # Who holds it: how health and an update tell this release from the next.
+    lock.truncate(0)
+    lock.write(version_string() + "\n")
+    lock.flush()
     sel = selectors.DefaultSelector()
     listeners, slots = {}, threading.BoundedSemaphore(KANDEV_PROXY_MAX_CONNS)
     ctx, stamp, said, next_scan = None, None, "", 0.0
@@ -9911,6 +9979,7 @@ def kandev_proxy(stop=None):
 KANDEV_VERBS = {
     "health": kandev_health, "provision": kandev_provision, "agentctl": kandev_agentctl,
     "start": kandev_start, "expiry": kandev_expiry, "lease": kandev_lease, "tls": kandev_tls,
+    "restart-proxy": kandev_restart_proxy_verb,
 }
 # The verbs that name an environment.
 KANDEV_ENV_VERBS = ("provision", "agentctl", "start", "expiry", "lease")

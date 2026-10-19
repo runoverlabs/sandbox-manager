@@ -114,6 +114,7 @@ KANDEV_VERBS = [
     "msbctl kandev expiry 6f1c2b9e-aaaa --at 2026-10-17T15:00:00Z",
     "msbctl kandev lease 6f1c2b9e-aaaa 8765",
     "msbctl kandev tls install",
+    "msbctl kandev restart-proxy",
 ]
 
 KANDEV_ALLOWED = ["msbctl --version", *KANDEV_VERBS,

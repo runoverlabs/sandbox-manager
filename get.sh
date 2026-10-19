@@ -57,7 +57,7 @@ msb-manager installer
   curl -fsSL https://github.com/OWNER/msb-manager/releases/latest/download/get.sh | sh
   curl -fsSL .../get.sh | sh -s -- --version v0.2.0
 
-  --version VERSION   install this release (e.g. v0.2.0) instead of the latest
+  --version VERSION   install this release (v0.2.0, or 0.2.0) instead of the latest
   --print-version     resolve the version to install, print it, and stop
   -h, --help          this text
 
@@ -85,6 +85,11 @@ while [ "$_n" -gt 0 ]; do
         *) set -- "$@" "$_arg" ;;
     esac
 done
+
+# Releases are tagged vX.Y.Z; a bare 0.6.0 names the same one.
+case "$VERSION" in
+    [0-9]*) VERSION="v$VERSION" ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Version resolution

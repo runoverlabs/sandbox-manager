@@ -391,7 +391,10 @@ msbctl self-update [--version vX.Y.Z] [--json]
 
 Upgrade a packaged install to the latest release, or a given one, verifying it
 the same way the installer does. In a git checkout it tells you to `git pull`.
-`--json` prints `{"msbctl_version", "updated"}` once it is installed, with the
+`--version 0.6.1` and `--version v0.6.1` name the same release. After a
+successful install it restarts the Kandev proxy's service if that is running
+an older release, which cuts its open connections. `--json` prints
+`{"msbctl_version", "updated", "proxy"}` once it is installed, with the
 installer's output on stderr. Under `host serve`, either key, `--version` may
 not name a release older than the running one.
 
@@ -439,6 +442,7 @@ msbctl kandev provision|agentctl|start ENV
 msbctl kandev expiry ENV --at TIME
 msbctl kandev lease ENV PORT
 msbctl kandev tls install
+msbctl kandev restart-proxy
 ```
 
 What the Kandev plugin runs over ssh to keep [Kandev's sandboxes](kandev.md)
