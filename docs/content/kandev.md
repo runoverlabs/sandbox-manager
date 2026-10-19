@@ -10,8 +10,9 @@ environment. Its microsandbox plugin puts every session in a microVM on a
 sandbox host: an ordinary msb-manager install, usually also a
 [remote host](remote-hosts.md). The plugin drives the host the way your laptop
 does, over ssh, through a forced command that admits the `msbctl kandev` verbs
-and nothing else. There is no daemon on the host, and no port or token scheme
-of its own.
+and nothing else. The only thing listening on the host is a small TLS proxy
+that carries Kandev's connections to a sandbox's ports, each one checked for a
+short-lived lease token.
 
 Kandev's sandboxes are kept apart from yours:
 
@@ -39,23 +40,27 @@ Kandev's sandboxes are kept apart from yours:
 
    ```toml title="~/.config/msb/config.toml"
    [kandev]
-   enabled     = true
-   base_url    = "https://sbx-01.tailnet.ts.net"
-   allow_extra = ["pypi.org", "*.pythonhosted.org"]
+   enabled      = true
+   base_url     = "https://sbx-01.tailnet.example"
+   proxy_listen = "100.64.0.7"
+   allow_extra  = ["pypi.org", "*.pythonhosted.org"]
    ```
 
-   Every key is described in `defaults.toml` and [below](#the-kandev-section).
-3. Let your user run `tailscale serve` (once, as root):
-   `sudo tailscale set --operator=$USER`.
-4. Authorize the plugin's public key, which the plugin's Sandbox Hosts page
+   `base_url` names this host as the Kandev server will reach it, and
+   `proxy_listen` is its address on that network (a tailnet or LAN IP). Every
+   key is described in `defaults.toml` and [below](#the-kandev-section).
+3. Authorize the plugin's public key, which the plugin's Sandbox Hosts page
    shows: `msbctl host authorize 'ssh-ed25519 AAAA… kandev' --kandev`.
-5. Install the reaper: `msbctl host kandev install`. Lingering has to be on
-   for it to run with nobody logged in; the command says so if it isn't.
-6. In your tailnet's ACL, let only the Kandev server reach sandbox hosts on
-   :443.
+4. Install the reaper and the TLS proxy: `msbctl host kandev install`.
+   Lingering has to be on for them to run with nobody logged in; the command
+   says so if it isn't.
+5. Let only the Kandev server reach `proxy_listen` on `proxy_port_pool`
+   (30000–39999), with your tailnet's ACL or a firewall.
 
-Then add the host on the plugin's Sandbox Hosts page; its test runs
-`msbctl kandev health`.
+Then add the host on the plugin's Sandbox Hosts page. Its test runs
+`msbctl kandev health`, and the plugin then issues the host a certificate and
+installs it with [`kandev tls install`](#the-tls-proxy). `health` reports
+`serve.ok` once the proxy runs with it.
 
 ## The `[kandev]` section
 
@@ -66,8 +71,10 @@ Then add the host on the plugin's Sandbox Hosts page; its test runs
 | `max_cpus` | `32` | summed over them |
 | `max_memory` | `"96G"` | summed over them |
 | `port_pool` | `"20000-29999"` | host ports published on 127.0.0.1, four per sandbox |
-| `base_url` | `""` | the HTTPS address Kandev reaches this host's sandboxes at |
-| `serve` | `"tailscale"` | what serves `base_url`: `tailscale serve`, or `"none"` to route it yourself |
+| `base_url` | `""` | the HTTPS address Kandev reaches this host's sandboxes at. With `serve = "proxy"`, only its host name counts, and the certificate must name it |
+| `serve` | `"proxy"` | what serves `base_url`: the [TLS proxy](#the-tls-proxy), `"tailscale"` for `tailscale serve`, or `"none"` to route it yourself. A change applies to new sandboxes |
+| `proxy_listen` | `""` | the address the proxy's ports bind: this host's tailnet or LAN IP. Required for `"proxy"` |
+| `proxy_port_pool` | `"30000-39999"` | the proxy's public TLS ports, four per sandbox. Must not overlap `port_pool` |
 | `rule_groups` | `["github", "npm", "python", "claude"]` | egress every Kandev sandbox gets, after `base` |
 | `allow_extra` | `[]` | hostname patterns a profile's extra egress may add. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
 
@@ -81,11 +88,19 @@ Each sandbox publishes four guest ports on 127.0.0.1: agentctl's control port
 and the embedded editor travel inside those through agentctl's own proxy, so no
 other port is ever needed.
 
+With `serve = "proxy"`, the default, each of the four also gets a public TLS
+port on `proxy_listen`, and a lease is `https://<base_url's host>:<that port>`
+with a token in its `Authorization` header, valid for 10 minutes (see
+[the TLS proxy](#the-tls-proxy)). Kandev talks to this host directly, and needs
+no Tailscale: headscale, WireGuard or a LAN work as well.
+
 With `serve = "tailscale"`, each one is mapped under `base_url` with `tailscale
-serve --set-path=/vm/<name>/p/<port>`, using the node's own certificate. A
-lease is that URL with a 10-minute expiry. There is no bearer token: reaching
-:443 takes the tailnet ACL, and reaching agentctl takes Kandev's own token
-from its nonce handshake.
+serve --set-path=/vm/<name>/p/<port>`, using the node's own certificate. Only
+Tailscale's hosted control plane issues those: on headscale, `health` reports
+`serve.ok = false`. Grant your user serve rights once, as root: `sudo tailscale
+set --operator=$USER`. A lease is that URL with a 10-minute expiry, and has no
+token: reaching :443 takes the tailnet ACL, and reaching agentctl takes Kandev's
+own token from its nonce handshake.
 
 The guest reaches Kandev's API through one rule naming the address the API host
 resolved to **on the host**, and that name is written into the guest's
@@ -114,7 +129,7 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), versions, KVM, capacity used and free, whether `tailscale serve` works |
+| `health` | – | protocol (1), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
 | `list` | – | every Kandev sandbox: env, name, state, created, expires |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
@@ -123,15 +138,55 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
 | `stop ENV` | – | stops it, keeping its disk |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |
-| `lease ENV PORT` | – | `base_url`, `expires_at` and `generation` for one guest port |
+| `lease ENV PORT` | – | `base_url`, `expires_at` and `generation` for one guest port, plus `headers` with its token through the proxy |
 | `destroy ENV` | – | removes the serve mappings, the VM and the entry. Always succeeds when there's nothing left |
 | `reap` | – | one pass of the reaper, below |
+| `tls install` | a JSON line: `cert_pem` (the leaf, then its issuer), `key_pem` | checks and stores the proxy's certificate, and prints `{"tls": …}` as `health` does |
 
 The record `provision`, `inspect`, `find`, `start`, `stop` and `expiry` return
 has the env and name, the operation and input digest, `state` (`creating`,
 `running`, `stopped`, or `absent` when the VM is gone), platform, image,
 timestamps, `generation`, the port map and agentctl's state. It never holds a
 secret.
+
+## The TLS proxy
+
+`msbctl kandev proxy` is the one long-running piece, a systemd user service
+written by `host kandev install`. With `serve = "proxy"` it listens on
+`proxy_listen`, one TLS port per published guest port. For each connection it
+completes the handshake, reads the first request head (16 KiB, 10 s at most)
+and checks its `Authorization: Bearer` token. A token for another sandbox,
+another port or an earlier generation gets a fixed `401` and the connection
+closes. A valid one is spliced to that port's `127.0.0.1` port, and from then
+on bytes pass both ways untouched until either side closes, so WebSockets and
+streaming need nothing special. There is no path routing: one port per lease
+means a connection can only ever reach one VM port.
+
+- **The certificate** comes from the Kandev plugin, which acts as a small
+  certificate authority: a root name-constrained to your hosts' domain,
+  trusted on the Kandev server only. `kandev tls install` takes the pair on
+  stdin and checks it whole before writing anything: the key matches the leaf,
+  the leaf is valid now and names `base_url`'s host, and the certificate after
+  it issued it. The pair is stored in `~/.config/msb/kandev/tls/` (the key
+  0600), and the proxy picks a new one up without a restart. Until one is
+  installed it listens on nothing, and `health` says why. `health.tls` gives
+  `not_after`, which drives the plugin's renewal, and `issuer_sha256`, the
+  SHA-256 of the issuing certificate, so the plugin can tell a certificate from
+  an old root.
+- **Tokens** are `v1.<expiry>.<HMAC-SHA256>` over the sandbox's name, the guest
+  port, the generation and the expiry, keyed by 32 random bytes in
+  `~/.local/state/msb/kandev/lease.key`. `lease` and the proxy share nothing
+  else, so a proxy restart invalidates no lease. A token is accepted until its
+  expiry plus 30 s of clock skew. `kandev start` bumps the generation, which
+  retires every earlier token.
+- **What it follows:** the Kandev entries. It looks every 2 seconds, so a new
+  sandbox's ports open within that. A destroyed sandbox's ports close, and
+  their open connections are cut. It also re-reads the entry on every
+  connection, so a destroyed sandbox refuses at once, and a new generation's
+  token works as soon as `start` returns.
+- **What it logs:** the sandbox, the guest port and the outcome, one line per
+  connection, in the service's journal. Never a token, a request head or
+  anything that passes through.
 
 ## The reaper
 
@@ -150,7 +205,8 @@ It never touches a sandbox that lacks either the `kandev` source or the label.
 
 The line `host authorize --kandev` writes is
 `restrict,command="…/msbctl host serve --kandev" <key>`, with no `pty`. That key
-runs `msbctl kandev …` and `msbctl --version`, nothing else. Your laptop's
+runs `msbctl kandev …` and `msbctl --version`, nothing else, and not
+`kandev proxy`, which is this host's own service. Your laptop's
 everyday key is refused every kandev verb, since one could create a sandbox with
 any egress.
 

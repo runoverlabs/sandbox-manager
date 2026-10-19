@@ -67,7 +67,7 @@ class MsbctlTest(TestCase):
         })
         for var in ("SSH_AUTH_SOCK", "GH_TOKEN", "MSB_RESTRICTED", "SSH_ORIGINAL_COMMAND",
                     "CLAUDE_CODE_OAUTH_TOKEN", "FAKE_MSB_EXEC_OUT", "FAKE_MSB_READ_STDIN",
-                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH"):
+                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH", "FAKE_TAILSCALE_NO_CERTS"):
             os.environ.pop(var, None)
         self.m = self.load_msbctl()
 

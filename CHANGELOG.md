@@ -10,6 +10,8 @@ release notes.
 
 ### Added
 - Kandev sandbox hosts: `msbctl kandev …` lets the Kandev plugin run one microVM per session here over ssh (`host authorize --kandev`, `host kandev install`); off until `[kandev] enabled = true`, see the "Kandev hosts" page.
+- Kandev hosts serve sandboxes through their own TLS proxy (`[kandev] serve = "proxy"`, the new default; set `proxy_listen`): the plugin installs a certificate with `kandev tls install`, leases carry a short-lived token, and `health` reports `tls`. Re-run `msbctl host kandev install` to get the proxy's service, or set `serve = "tailscale"` to keep `tailscale serve`.
+- Kandev `health` reports `serve.ok = false` in `tailscale` mode when the tailnet issues no certificates (headscale).
 - The `go` egress group allows `vuln.go.dev`, for `govulncheck`; existing sandboxes need a rebuild.
 - Remote hosts from the menu: bare `msbctl` → **remote hosts** adds, sets up, tests and removes them, and `msbctl remote setup NAME` installs what a host is missing (msb and msbctl at this machine's versions, autostart) and restricts your key there, asking before each step.
 - With remotes configured, `msbctl add` asks where the new sandbox should run, and the menu's sidebar lists every remote's sandboxes too.

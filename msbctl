@@ -58,10 +58,13 @@ tomllib, so there is no TOML serializer here to rot. The one exception is the
 
 import argparse
 import base64
+import binascii
 import contextlib
 import datetime as dt
+import errno
 import fcntl
 import hashlib
+import hmac
 import io
 import ipaddress
 import json
@@ -69,16 +72,19 @@ import os
 import pydoc
 import re
 import select
+import selectors
 import shlex
 import shutil
 import signal
 import socket
 import socketserver
+import ssl
 import struct
 import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import traceback
 import tty
@@ -7710,10 +7716,11 @@ def restricted_problem(argv, kandev=False):
             return "this key runs `msbctl kandev` verbs only"
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                build_parser().parse_args(argv)
+                args = build_parser().parse_args(argv)
         except SystemExit:
             return "the command line does not parse"
-        return None
+        # A listener on the host's address that outlives the ssh session.
+        return "kandev proxy is the host's own service" if args.verb == "proxy" else None
     if argv and argv[0] == "kandev":
         return "kandev verbs are for the Kandev plugin's key (`host authorize --kandev`)"
     try:
@@ -8114,6 +8121,25 @@ KANDEV_OWNER_LABEL = "msbctl.owner=kandev"
 KANDEV_LOCK = os.path.join(STATE_DIR, "kandev.lock")
 GUEST_AGENTCTL = "/opt/kandev/agentctl"
 KANDEV_REAP_UNIT = "msb-kandev-reap"
+KANDEV_PROXY_UNIT = "msb-kandev-proxy"
+KANDEV_SERVE_MODES = ("proxy", "tailscale", "none")
+# The proxy's certificate: leaf then its issuer in cert.pem, key.pem 0600.
+# Written only by `kandev tls install`; the plugin owns the CA and renewal.
+KANDEV_TLS_DIR = os.path.join(CONFIG_DIR, "kandev", "tls")
+KANDEV_TLS_CERT = os.path.join(KANDEV_TLS_DIR, "cert.pem")
+KANDEV_TLS_KEY = os.path.join(KANDEV_TLS_DIR, "key.pem")
+# Beside the per-sandbox dirs (STATE_DIR/kandev/k-…), which a dot never names.
+KANDEV_LEASE_KEY = os.path.join(STATE_DIR, "kandev", "lease.key")
+# Held by the running proxy: one proxy per host, and how `health` knows it runs.
+KANDEV_PROXY_LOCK = os.path.join(STATE_DIR, "kandev", "proxy.lock")
+KANDEV_HEAD_MAX = 16 * 1024
+KANDEV_HEAD_WAIT = 10
+KANDEV_TOKEN_SKEW = 30
+KANDEV_PROXY_SCAN = 2               # seconds: a destroyed sandbox's port refuses within this
+KANDEV_PROXY_MAX_CONNS = 512
+KANDEV_UNAUTHORIZED = (b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n"
+                       b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+KANDEV_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 # Names a Kandev secret or env var may not take, beyond is_reserved_var().
 # Credentials Kandev itself delivers, agentctl's own settings, and anything
 # that would change how msb (or the dynamic loader) behaves: secret values are
@@ -8183,11 +8209,25 @@ def kandev_settings(config):
     if not re.fullmatch(r"\d+[MGT]", memory.upper()):
         bad("max_memory", f"{memory!r} is not a size like 96G")
     out["max_memory_mib"] = size_bytes(memory) // MIB
-    pool = re.fullmatch(r"(\d+)-(\d+)", str(raw.get("port_pool", "")))
-    if not pool or not 1024 <= int(pool.group(1)) <= int(pool.group(2)) <= 65535 \
-            or int(pool.group(2)) - int(pool.group(1)) + 1 < len(KANDEV_GUEST_PORTS):
-        bad("port_pool", "a range like 20000-29999, within 1024-65535, of at least 4 ports")
-    out["port_pool"] = (int(pool.group(1)), int(pool.group(2)))
+
+    def pool(key, default):
+        found = re.fullmatch(r"(\d+)-(\d+)", str(raw.get(key, default)))
+        if not found or not 1024 <= int(found.group(1)) <= int(found.group(2)) <= 65535 \
+                or int(found.group(2)) - int(found.group(1)) + 1 < len(KANDEV_GUEST_PORTS):
+            bad(key, f"a range like {default}, within 1024-65535, of at least 4 ports")
+        return int(found.group(1)), int(found.group(2))
+
+    out["port_pool"] = pool("port_pool", "20000-29999")
+    out["proxy_port_pool"] = pool("proxy_port_pool", "30000-39999")
+    if out["port_pool"][0] <= out["proxy_port_pool"][1] and out["proxy_port_pool"][0] <= out["port_pool"][1]:
+        bad("proxy_port_pool", "must not overlap port_pool")
+    listen = str(raw.get("proxy_listen", "")).strip()
+    if listen:
+        try:
+            listen = str(ipaddress.ip_address(listen))
+        except ValueError:
+            bad("proxy_listen", f"{listen!r} is not an IP address (the tailnet or LAN one to bind)")
+    out["proxy_listen"] = listen
     base = str(raw.get("base_url", "")).rstrip("/")
     if base:
         parts = urllib.parse.urlsplit(base)
@@ -8196,9 +8236,9 @@ def kandev_settings(config):
             bad("base_url", "https://host[:port] with no path, query or credentials — Kandev "
                 "refuses any other lease URL")
     out["base_url"] = base
-    out["serve"] = raw.get("serve", "tailscale")
-    if out["serve"] not in ("tailscale", "none"):
-        bad("serve", '"tailscale" or "none"')
+    out["serve"] = raw.get("serve", "proxy")
+    if out["serve"] not in KANDEV_SERVE_MODES:
+        bad("serve", '"proxy", "tailscale" or "none"')
     groups = raw.get("rule_groups", [])
     known = config.get("rules", {})
     if not isinstance(groups, list) or any(g not in known for g in groups):
@@ -8273,9 +8313,18 @@ def kandev_lock():
 
 
 def kandev_set(name, **values):
-    """Rewrite single keys of a Kandev entry in place."""
-    for key, value in values.items():
-        set_toml_key(registry_path_for(name), key, value)
+    """Rewrite single keys of a Kandev entry, atomically: the proxy reads the
+    entries while this runs, and a half-written one would close its ports."""
+    path = registry_path_for(name)
+    tmp = f"{path}.{os.getpid()}.new"
+    shutil.copyfile(path, tmp)
+    try:
+        for key, value in values.items():
+            set_toml_key(tmp, key, value)
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(tmp)
 
 
 def host_platform():
@@ -8525,21 +8574,30 @@ def kandev_pin_api(name, entry):
         raise KandevError("unavailable", "could not write the Kandev API host into the guest")
 
 
-def kandev_alloc_ports(settings):
-    """Four free host ports from the pool: not named by any registry entry (any
-    source, so the operator's own published ports are avoided too) and free to
-    bind right now. Under kandev_lock()."""
+def registry_host_ports():
+    """Every host port a registry entry publishes or proxies, of any source,
+    running or not: a stopped sandbox's ports are taken again when it starts."""
     used = set()
     for name in registered():
         try:
-            specs = read_toml(registry_path_for(name)).get("ports", [])
+            entry = read_toml(registry_path_for(name))
         except SystemExit:
             continue
-        for spec in specs:
+        for spec in entry.get("ports", []):
             try:
                 used.add(int(parse_port_spec(spec)[2]))
             except (SystemExit, ValueError):
                 continue
+        if entry.get("source") == "kandev":
+            used.update(kandev_proxy_ports(entry).values())
+    return used
+
+
+def kandev_alloc_ports(settings):
+    """Four free host ports from the pool: not named by any registry entry (any
+    source, so the operator's own published ports are avoided too) and free to
+    bind right now. Under kandev_lock()."""
+    used = registry_host_ports()
     got = []
     low, high = settings["port_pool"]
     for port in range(low, high + 1):
@@ -8556,14 +8614,62 @@ def kandev_alloc_ports(settings):
     raise KandevError("rate_limited", "no free host ports left in [kandev] port_pool", 30)
 
 
-def kandev_serve(settings, name, ports, on):
-    """Map (or unmap) each published port under base_url. A failure to remove
-    one is fatal to the destroy: a stale path would later route to whichever
-    sandbox gets the same host port."""
-    if settings["serve"] != "tailscale":
+def kandev_proxy_ports(entry):
+    """{guest port: public TLS port} from the entry's `proxy_ports` specs."""
+    out = {}
+    for spec in entry.get("proxy_ports", []):
+        found = re.fullmatch(r"(\d{1,5}):(\d{1,5})", str(spec))
+        if found:                       # anything else is no one's port
+            out[int(found.group(2))] = int(found.group(1))
+    return out
+
+
+def kandev_alloc_proxy_ports(settings):
+    """Four public TLS ports from proxy_port_pool: named by no Kandev entry and
+    not in use on proxy_listen. Under kandev_lock(). An address that is not up
+    yet (tailscale still starting) proves nothing either way, so only "in use"
+    rules a port out; the proxy binds it once the address exists."""
+    used = registry_host_ports()
+    listen = settings["proxy_listen"]
+    got = []
+    low, high = settings["proxy_port_pool"]
+    for port in range(low, high + 1):
+        if port in used:
+            continue
+        if listen:
+            family = socket.AF_INET6 if ":" in listen else socket.AF_INET
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
+                try:
+                    sock.bind((listen, port))
+                except OSError as exc:
+                    if exc.errno == errno.EADDRINUSE:
+                        continue
+        got.append(port)
+        if len(got) == len(KANDEV_GUEST_PORTS):
+            return got
+    raise KandevError("rate_limited", "no free ports left in [kandev] proxy_port_pool", 30)
+
+
+def kandev_entry_serve(entry):
+    """(mode, strict): how this entry's ports were served when it was made.
+    An entry from before msbctl recorded it got the tailscale mappings if
+    tailscale was there; removing those is then best effort."""
+    if entry.get("serve") in KANDEV_SERVE_MODES:
+        return entry["serve"], True
+    return ("tailscale" if shutil.which("tailscale") else "none"), False
+
+
+def kandev_serve(mode, name, ports, on, strict=True):
+    """Map (or unmap) each published port under base_url, for serve =
+    "tailscale"; the proxy needs nothing here, it reads the entries. A failure
+    to remove one is fatal to the destroy: a stale path would later route to
+    whichever sandbox gets the same host port."""
+    if mode != "tailscale":
         return
     if not shutil.which("tailscale"):
-        raise KandevError("unavailable", "tailscale is not on PATH ([kandev] serve)")
+        if strict:
+            raise KandevError("unavailable", "tailscale is not on PATH ([kandev] serve)")
+        return
     for guest, host in sorted(ports.items()):
         path = f"/vm/{name}/p/{guest}"
         argv = (["tailscale", "serve", "--bg", "--https=443", f"--set-path={path}",
@@ -8572,13 +8678,42 @@ def kandev_serve(settings, name, ports, on):
         proc = run(argv, check=False, capture=True)
         if proc.returncode != 0 and on:
             raise KandevError("unavailable", f"tailscale serve {path} failed")
-        if proc.returncode != 0 and not on and "not found" not in (proc.stderr or "").lower():
+        if proc.returncode != 0 and not on and strict \
+                and "not found" not in (proc.stderr or "").lower():
             raise KandevError("unavailable", f"tailscale serve {path} off failed")
 
 
-def kandev_serve_ok(settings):
-    if settings["serve"] != "tailscale":
+def kandev_proxy_running():
+    """Whether `msbctl kandev proxy` runs: it holds KANDEV_PROXY_LOCK for life."""
+    try:
+        fh = open(KANDEV_PROXY_LOCK, encoding="utf-8")
+    except OSError:
+        return False
+    with fh:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        return False
+
+
+def kandev_serve_ok(settings, tls):
+    """health's `serve`. `tls` is (document, problem) from kandev_tls_status()."""
+    mode = settings["serve"]
+    if mode == "none":
         return {"ok": True, "mode": "none"}
+    if mode == "proxy":
+        running = kandev_proxy_running()
+        reasons = [why for bad, why in (
+            (not settings["proxy_listen"], "[kandev] proxy_listen is not set"),
+            (not settings["base_url"], "[kandev] base_url is not set"),
+            (not tls[0]["installed"], "no certificate yet: the plugin installs one with `kandev tls install`"),
+            (tls[0]["installed"] and tls[1], tls[1]),
+            (not running, "the proxy is not running (`msbctl host kandev install` sets it up)"),
+        ) if bad]
+        return {"ok": not reasons, "mode": "proxy", "listen": settings["proxy_listen"],
+                "running": running, **({"reason": reasons[0]} if reasons else {})}
     if not shutil.which("tailscale"):
         return {"ok": False, "mode": "tailscale", "reason": "tailscale is not on PATH"}
     proc = run(["tailscale", "status", "--json"], check=False, capture=True)
@@ -8586,10 +8721,209 @@ def kandev_serve_ok(settings):
         status = json.loads(proc.stdout or "{}")
     except ValueError:
         status = {}
-    running = status.get("BackendState") == "Running"
-    named = bool((status.get("Self") or {}).get("DNSName"))
-    return {"ok": running and named, "mode": "tailscale",
-            **({} if running and named else {"reason": "tailscale is not running with a DNS name"})}
+    reason = None
+    if status.get("BackendState") != "Running" or not (status.get("Self") or {}).get("DNSName"):
+        reason = "tailscale is not running with a DNS name"
+    elif not status.get("CertDomains"):
+        # headscale, for one: a DNS name, but no certificates, so `tailscale
+        # serve --https` fails. serve = "proxy" is the way there.
+        reason = 'this tailnet issues no certificates (no CertDomains); use serve = "proxy"'
+    return {"ok": not reason, "mode": "tailscale", **({"reason": reason} if reason else {})}
+
+
+# ------------------------------------------------- certificate and tokens
+#
+# The Kandev plugin is a small certificate authority: it issues each host a
+# certificate under a root, name-constrained to the hosts' domain, that only
+# the Kandev server trusts. The host never makes a key (the stdlib cannot);
+# `kandev tls install` receives the pair on stdin, checks it and stores it, and
+# the proxy serves it. What msbctl must read from a certificate (validity,
+# names, issuer) it reads with the small DER walker below.
+
+def _der(buf, pos):
+    """(tag, content start, content end) of the DER element at `pos`."""
+    if pos + 2 > len(buf):
+        raise ValueError("truncated")
+    tag, length, pos = buf[pos], buf[pos + 1], pos + 2
+    if length & 0x80:
+        count = length & 0x7F
+        if not 1 <= count <= 4 or pos + count > len(buf):
+            raise ValueError("bad length")
+        length, pos = int.from_bytes(buf[pos:pos + count], "big"), pos + count
+    if pos + length > len(buf):
+        raise ValueError("truncated")
+    return tag, pos, pos + length
+
+
+def _der_children(buf, start, end):
+    """[(tag, start, end, whole start)] of a constructed element's content."""
+    out, pos = [], start
+    while pos < end:
+        tag, s, e = _der(buf, pos)
+        out.append((tag, s, e, pos))
+        pos = e
+    return out
+
+
+def _der_time(buf, tag, s, e):
+    text = buf[s:e].decode("ascii")
+    if tag == 0x17:                     # UTCTime, YYMMDDHHMMSSZ
+        year = int(text[:2])
+        text = f"{19 if year >= 50 else 20}{text}"
+    elif tag != 0x18:                   # GeneralizedTime, YYYYMMDDHHMMSSZ
+        raise ValueError("not a time")
+    return dt.datetime.strptime(text, "%Y%m%d%H%M%SZ").replace(tzinfo=dt.timezone.utc)
+
+
+OID_SAN = bytes.fromhex("551d11")       # 2.5.29.17 subjectAltName
+OID_CN = bytes.fromhex("550403")        # 2.5.4.3 commonName
+
+
+def cert_info(der):
+    """What msbctl needs of one DER certificate: validity, DNS and IP names,
+    the common name, and the issuer and subject Names as raw DER."""
+    _, s, e = _der(der, 0)
+    tbs_tag, ts, te = _der(der, s)
+    if tbs_tag != 0x30:
+        raise ValueError("not a certificate")
+    fields = _der_children(der, ts, te)
+    if fields and fields[0][0] == 0xA0:            # [0] version
+        fields = fields[1:]
+    _serial, _alg, issuer, validity, subject = fields[:5]
+    times = _der_children(der, validity[1], validity[2])
+    info = {"not_before": _der_time(der, *times[0][:3]), "not_after": _der_time(der, *times[1][:3]),
+            "issuer": der[issuer[3]:issuer[2]], "subject": der[subject[3]:subject[2]],
+            "dns": [], "ips": [], "cn": ""}
+    for rdn in _der_children(der, subject[1], subject[2]):
+        for _tag, a, b, _ in _der_children(der, rdn[1], rdn[2]):
+            oid, value = _der_children(der, a, b)[:2]
+            if der[oid[1]:oid[2]] == OID_CN:
+                info["cn"] = der[value[1]:value[2]].decode("utf-8", "replace")
+    for tag, a, b, _ in fields[6:]:
+        if tag != 0xA3:                             # [3] extensions
+            continue
+        for ext in _der_children(der, *_der_children(der, a, b)[0][1:3]):
+            parts = _der_children(der, ext[1], ext[2])
+            if der[parts[0][1]:parts[0][2]] != OID_SAN:
+                continue
+            value = parts[-1]                       # OCTET STRING holding GeneralNames
+            names = _der(der, value[1])
+            for ntag, na, nb, _ in _der_children(der, names[1], names[2]):
+                if ntag == 0x82:                    # dNSName
+                    info["dns"].append(der[na:nb].decode("ascii", "replace").lower())
+                elif ntag == 0x87:                  # iPAddress
+                    info["ips"].append(str(ipaddress.ip_address(der[na:nb])))
+    return info
+
+
+def pem_certificates(text):
+    """The DER of each CERTIFICATE block in `text`, in order."""
+    out = []
+    for body in re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S):
+        out.append(base64.b64decode("".join(body.split()), validate=True))
+    return out
+
+
+def cert_covers(info, host):
+    """Whether the leaf names `host`, as a Go client checks it: SANs only."""
+    try:
+        return str(ipaddress.ip_address(host)) in info["ips"]
+    except ValueError:
+        pass
+    host = host.lower().rstrip(".")
+    for name in info["dns"]:
+        if name == host or (name.startswith("*.") and "." in host
+                            and host.split(".", 1)[1] == name[2:]):
+            return True
+    return False
+
+
+def kandev_chain_problem(cert_pem, host, now=None):
+    """(None, (leaf info, issuer DER)) or (the problem, None) for a cert.pem."""
+    try:
+        chain = pem_certificates(cert_pem)
+        infos = [cert_info(der) for der in chain]
+    except (ValueError, IndexError, UnicodeDecodeError, binascii.Error):
+        return "cert_pem is not a PEM certificate chain", None
+    if len(chain) < 2:
+        return "cert_pem needs the leaf, then the certificate that issued it", None
+    leaf = infos[0]
+    if leaf["issuer"] != infos[1]["subject"]:
+        return "the second certificate did not issue the leaf", None
+    now = now or utc_now()
+    if not leaf["not_before"] <= now <= leaf["not_after"]:
+        return f"the certificate is valid {iso(leaf['not_before'])} to {iso(leaf['not_after'])}, not now", \
+            (leaf, chain[1])
+    if host and not cert_covers(leaf, host):
+        return f"the certificate does not name {host} (subjectAltName)", (leaf, chain[1])
+    return None, (leaf, chain[1])
+
+
+def kandev_tls_status(settings):
+    """(health's `tls` document, the problem with it or None)."""
+    try:
+        with open(KANDEV_TLS_CERT, encoding="utf-8") as fh:
+            text = fh.read()
+        installed = os.path.exists(KANDEV_TLS_KEY)
+    except (OSError, UnicodeDecodeError):
+        installed = False
+    if not installed:
+        return {"installed": False}, "no certificate installed"
+    host = urllib.parse.urlsplit(settings["base_url"]).hostname or ""
+    problem, found = kandev_chain_problem(text, host)
+    if not found:
+        return {"installed": True}, problem
+    leaf, issuer = found
+    return {"installed": True, "subject": (leaf["dns"] or leaf["ips"] or [leaf["cn"]])[0],
+            "not_after": iso(leaf["not_after"]),
+            "issuer_sha256": hashlib.sha256(issuer).hexdigest()}, problem
+
+
+def kandev_lease_key(create=True):
+    """The 32-byte HMAC key lease tokens are signed with, made on first use.
+    Shared by `lease` and the proxy through this file alone. None if absent
+    and not `create`."""
+    for _ in range(2):
+        try:
+            with open(KANDEV_LEASE_KEY, "rb") as fh:
+                key = fh.read()
+        except FileNotFoundError:
+            if not create:
+                return None
+            os.makedirs(os.path.dirname(KANDEV_LEASE_KEY), mode=0o700, exist_ok=True)
+            tmp = f"{KANDEV_LEASE_KEY}.{os.getpid()}"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(os.urandom(32))
+            try:
+                os.link(tmp, KANDEV_LEASE_KEY)      # never replaces one a racer wrote
+            except FileExistsError:
+                pass
+            os.unlink(tmp)
+            continue
+        if len(key) != 32:
+            raise KandevError("unavailable", f"{tilde(KANDEV_LEASE_KEY)} is not 32 bytes")
+        return key
+    raise KandevError("unavailable", "could not create the lease key")
+
+
+def kandev_token(key, name, guest, generation, expiry):
+    """v1.<expiry>.<base64url HMAC-SHA256(name|guest port|generation|expiry)>"""
+    msg = f"{name}|{int(guest)}|{int(generation)}|{int(expiry)}".encode()
+    mac = base64.urlsafe_b64encode(hmac.new(key, msg, hashlib.sha256).digest()).rstrip(b"=")
+    return f"v1.{int(expiry)}.{mac.decode()}"
+
+
+def kandev_token_ok(key, token, name, guest, generation, now=None):
+    """Whether `token` is a lease for this sandbox, guest port and generation,
+    not past its expiry by more than the allowed clock skew."""
+    found = re.fullmatch(r"v1\.(\d{1,12})\.[A-Za-z0-9_-]{43}", token or "")
+    if not key or not found:
+        return False
+    expiry = int(found.group(1))
+    if (time.time() if now is None else now) > expiry + KANDEV_TOKEN_SKEW:
+        return False
+    return hmac.compare_digest(kandev_token(key, name, guest, generation, expiry), token)
 
 
 def kandev_labelled(fmt_json=False):
@@ -8611,6 +8945,7 @@ def kandev_labelled(fmt_json=False):
 def kandev_health(args, config, settings):
     table = msb_table()
     count, cpus, mem = kandev_usage(table)
+    tls = kandev_tls_status(settings)
     return {
         "protocol": KANDEV_PROTOCOL, "msbctl_version": version_string(),
         "msb_version": local_msb_version() or "",
@@ -8619,7 +8954,8 @@ def kandev_health(args, config, settings):
         "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
                      "max_cpus": settings["max_cpus"], "cpus": cpus,
                      "max_memory_mib": settings["max_memory_mib"], "memory_mib": mem},
-        "serve": kandev_serve_ok(settings),
+        "serve": kandev_serve_ok(settings, tls),
+        "tls": tls[0],
     }
 
 
@@ -8705,6 +9041,10 @@ def kandev_provision(args, config, settings):
             raise KandevError("rate_limited", "this host is at its [kandev] limits", 30)
         host_ports = kandev_alloc_ports(settings)
         ports = [f"127.0.0.1:{h}:{g}" for h, g in zip(host_ports, KANDEV_GUEST_PORTS, strict=True)]
+        public = []
+        if settings["serve"] == "proxy":
+            public = [f"{p}:{g}" for p, g in zip(kandev_alloc_proxy_ports(settings), KANDEV_GUEST_PORTS,
+                                                 strict=True)]
         binds = [f"{n}@{','.join(h)}" for n, h in bindings]
         now = utc_now()
         os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
@@ -8716,7 +9056,8 @@ def kandev_provision(args, config, settings):
                 ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
                 IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
                 CREATED=iso(now), EXPIRES=iso(expires),
-                PORTS=format_list("ports", ports, ""), API=toml_literal(api_host),
+                PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
+                PROXY_PORTS=f"proxy_ports = {toml_literal(public)}", API=toml_literal(api_host),
                 API_IP=toml_literal(api_addr),
                 RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
                 EXTRA_RULES=f"extra_rules = {toml_literal(egress + [api_rule])}",
@@ -8749,7 +9090,7 @@ def kandev_provision(args, config, settings):
         raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
     entry = read_toml(registry_path_for(name))
     kandev_pin_api(name, entry)
-    kandev_serve(settings, name, kandev_ports(entry), True)
+    kandev_serve(settings["serve"], name, kandev_ports(entry), True)
     kandev_set(name, state="running", generation=1, agentctl_running=False)
     return kandev_record(name, read_toml(registry_path_for(name)))
 
@@ -8893,9 +9234,25 @@ def kandev_lease(args, config, settings):
         raise KandevError("unavailable", "[kandev] base_url is not set")
     if kandev_state(name, entry, msb_table()) != "running":
         raise KandevError("unavailable", "the sandbox is not running")
-    return {"lease": {"base_url": f"{settings['base_url']}/vm/{name}/p/{port}",
-                      "expires_at": iso(utc_now() + dt.timedelta(seconds=KANDEV_LEASE_SECONDS)),
-                      "generation": str(int(entry.get("generation", 0)))}}
+    expires = utc_now() + dt.timedelta(seconds=KANDEV_LEASE_SECONDS)
+    generation = int(entry.get("generation", 0))
+    if kandev_entry_serve(entry)[0] != "proxy":
+        return {"lease": {"base_url": f"{settings['base_url']}/vm/{name}/p/{port}",
+                          "expires_at": iso(expires), "generation": str(generation)}}
+    # Through the proxy: its own port per guest port, so no path, and a token
+    # it checks before a byte reaches the guest. This output is now
+    # secret-bearing: the plugin treats it so, and nothing here logs it.
+    public = kandev_proxy_ports(entry).get(port)
+    if not public:
+        raise KandevError("unavailable", "this sandbox has no proxy port for that guest port")
+    if not settings["proxy_listen"] or not os.path.exists(KANDEV_TLS_CERT):
+        raise KandevError("unavailable", "the proxy has no proxy_listen or no certificate yet")
+    host = urllib.parse.urlsplit(settings["base_url"]).hostname
+    host = f"[{host}]" if ":" in host else host
+    token = kandev_token(kandev_lease_key(), name, port, generation, int(expires.timestamp()))
+    return {"lease": {"base_url": f"https://{host}:{public}", "expires_at": iso(expires),
+                      "generation": str(generation),
+                      "headers": {"Authorization": f"Bearer {token}"}}}
 
 
 def kandev_remove(name, entry, settings, labelled):
@@ -8903,7 +9260,8 @@ def kandev_remove(name, entry, settings, labelled):
     before it worked, so a failure leaves the entry for a retry or the reaper.
     A VM under this name that does not carry the Kandev label is not Kandev's
     and is never removed."""
-    kandev_serve(settings, name, kandev_ports(entry), False)
+    mode, strict = kandev_entry_serve(entry)
+    kandev_serve(mode, name, kandev_ports(entry), False, strict=strict)
     if state_of(name) != "absent":
         if name not in labelled:
             raise KandevError("conflict", f"{name} exists without the Kandev label — left alone")
@@ -8964,11 +9322,304 @@ def kandev_reap(args, config, settings):
     return out
 
 
+def kandev_tls(args, config, settings):
+    """`kandev tls install`: the proxy's certificate and key, from stdin.
+    Checked whole before either file changes: the key matches the leaf, the
+    leaf is valid now and names base_url's host, its issuer follows it. The
+    key crosses ssh once, on stdin, and is never printed."""
+    if args.env != "install":
+        raise KandevError("invalid_config", "kandev tls: the only action is `install`")
+    req = kandev_read_header()
+    cert_pem, key_pem = req.get("cert_pem"), req.get("key_pem")
+    if not all(isinstance(v, str) and v for v in (cert_pem, key_pem)):
+        raise KandevError("invalid_config", "cert_pem and key_pem are required")
+    if "PRIVATE KEY-----" not in key_pem or "ENCRYPTED" in key_pem:
+        raise KandevError("invalid_config", "key_pem is not an unencrypted PEM private key")
+    host = urllib.parse.urlsplit(settings["base_url"]).hostname
+    if not host:
+        raise KandevError("invalid_config", "set [kandev] base_url first: the certificate must name its host")
+    problem, _ = kandev_chain_problem(cert_pem, host)
+    if problem:
+        raise KandevError("invalid_config", problem)
+    os.makedirs(KANDEV_TLS_DIR, mode=0o700, exist_ok=True)
+    temps = {}
+    try:
+        for path, text, mode in ((KANDEV_TLS_KEY, key_pem, 0o600), (KANDEV_TLS_CERT, cert_pem, 0o644)):
+            temps[path] = f"{path}.{os.getpid()}.new"
+            fd = os.open(temps[path], os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        try:
+            # A password callback, so an encrypted key fails rather than asks.
+            ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER).load_cert_chain(
+                temps[KANDEV_TLS_CERT], temps[KANDEV_TLS_KEY], password=lambda: b"")
+        except ssl.SSLError:
+            raise KandevError("invalid_config", "key_pem does not match the leaf certificate") from None
+        # The key first: the proxy reloads on a change, and a load that fails
+        # halfway keeps the pair it had.
+        for path in (KANDEV_TLS_KEY, KANDEV_TLS_CERT):
+            os.replace(temps.pop(path), path)
+    finally:
+        for tmp in temps.values():
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+    return {"tls": kandev_tls_status(settings)[0]}
+
+
+# ------------------------------------------------------------- the proxy
+#
+# `msbctl kandev proxy`, the long-running half of serve = "proxy" (a systemd
+# user service from `host kandev install`). One TLS listener per published
+# guest port, on proxy_listen:<public port>; a connection is spliced to that
+# port's 127.0.0.1:<host port> once its first request head carries a lease
+# token for this sandbox, guest port and generation. One port per lease means
+# a pooled connection can only ever reach one VM port, so there is no HTTP
+# parsing past that first head and no path routing: WebSockets and streaming
+# need nothing special. The kandev entries are the only source of truth; the
+# proxy rescans them every KANDEV_PROXY_SCAN seconds and re-reads the one
+# entry on each connection, so a destroyed sandbox refuses at once and a new
+# generation's token works the moment `start` has written it.
+#
+# Logged: the sandbox, the guest port and the outcome. Never a token, a
+# request head or a byte of what passes through.
+
+class _ProxyListener:
+    def __init__(self, sock, name, guest):
+        self.sock, self.name, self.guest = sock, name, guest
+        self.port = sock.getsockname()[1]
+        self.closed = False
+        self.conns = set()
+        self.lock = threading.Lock()
+
+    def close(self):
+        """Stop accepting and cut every connection it handed on."""
+        self.closed = True
+        self.sock.close()
+        with self.lock:
+            for conn in list(self.conns):
+                with contextlib.suppress(OSError):
+                    conn.shutdown(socket.SHUT_RDWR)
+
+
+def kandev_proxy_log(message):
+    print(f"msbctl kandev proxy: {message}", file=sys.stderr, flush=True)
+
+
+def kandev_proxy_wanted():
+    """({(address, public port): (name, guest port)}, why it is empty or None)."""
+    settings = kandev_settings(load_config())
+    if not settings["enabled"]:
+        return {}, "[kandev] enabled is false"
+    if settings["serve"] != "proxy":
+        return {}, f'[kandev] serve is "{settings["serve"]}"'
+    if not settings["proxy_listen"]:
+        return {}, "[kandev] proxy_listen is not set"
+    want = {}
+    for name, entry in kandev_entries():
+        if kandev_entry_serve(entry)[0] == "proxy":
+            for guest, public in kandev_proxy_ports(entry).items():
+                want[(settings["proxy_listen"], public)] = (name, guest)
+    return want, None
+
+
+def kandev_tls_context():
+    """A server context with the installed pair, or None."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    # HTTP/1.1 only: an h2 connection would carry many requests in frames the
+    # head check below cannot read.
+    ctx.set_alpn_protocols(["http/1.1"])
+    try:
+        ctx.load_cert_chain(KANDEV_TLS_CERT, KANDEV_TLS_KEY, password=lambda: b"")
+    except (OSError, ssl.SSLError):
+        return None
+    return ctx
+
+
+def _read_head(tls):
+    """The bytes read until the end of the first request head, or None."""
+    buf, deadline = b"", time.monotonic() + KANDEV_HEAD_WAIT
+    while b"\r\n\r\n" not in buf[:KANDEV_HEAD_MAX + 4]:
+        left = deadline - time.monotonic()
+        if left <= 0 or len(buf) > KANDEV_HEAD_MAX:
+            return None
+        tls.settimeout(left)
+        chunk = tls.recv(KANDEV_HEAD_MAX)
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _bearer(head):
+    """The one Authorization: Bearer token in a request head, or None."""
+    found = []
+    for line in head.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
+        key, _, value = line.partition(b":")
+        if key.strip().lower() == b"authorization":
+            found.append(value.strip())
+    if len(found) != 1 or not found[0][:7].lower() == b"bearer ":
+        return None
+    return found[0][7:].strip().decode("ascii", "replace")
+
+
+def _splice(listener, tls, backend):
+    """Both directions until the backend closes or the listener goes. The
+    client's EOF half-closes toward the guest; the guest's ends it all."""
+    tls.settimeout(120)
+    backend.settimeout(120)
+    client_open = True
+    while not listener.closed:
+        if client_open and tls.pending():
+            ready = [tls]
+        else:
+            ready = select.select([tls, backend] if client_open else [backend], [], [], 5)[0]
+        for sock in ready:
+            data = sock.recv(65536)
+            if sock is tls:
+                if data:
+                    backend.sendall(data)
+                else:
+                    client_open = False
+                    backend.shutdown(socket.SHUT_WR)
+            elif data:
+                tls.sendall(data)
+            else:
+                return
+
+
+def kandev_proxy_conn(raw, listener, ctx, slots):
+    """One connection: handshake, the head's token, then the splice."""
+    outcome, tls, backend = "closed", None, None
+    try:
+        raw.settimeout(KANDEV_HEAD_WAIT)
+        try:
+            tls = ctx.wrap_socket(raw, server_side=True)
+        except (OSError, ssl.SSLError):
+            outcome = "tls handshake failed"
+            return
+        with listener.lock:
+            listener.conns.add(tls)
+        head = _read_head(tls)
+        if head is None:
+            outcome = "no request head"
+            return
+        path = registry_path_for(listener.name)
+        try:
+            entry = read_toml(path) if os.path.exists(path) else {}
+        except SystemExit:
+            entry = {}
+        ok = (entry.get("source") == "kandev"
+              and kandev_proxy_ports(entry).get(listener.guest) == listener.port
+              and kandev_token_ok(kandev_lease_key(create=False), _bearer(head), listener.name,
+                                  listener.guest, int(entry.get("generation", 0))))
+        if not ok:
+            outcome = "unauthorized"
+            tls.sendall(KANDEV_UNAUTHORIZED)
+            return
+        try:
+            backend = socket.create_connection(("127.0.0.1", kandev_ports(entry)[listener.guest]), timeout=10)
+        except (OSError, KeyError):
+            outcome = "guest port unreachable"
+            tls.sendall(KANDEV_BAD_GATEWAY)
+            return
+        with listener.lock:
+            listener.conns.add(backend)
+        backend.sendall(head)
+        outcome = "forwarded"
+        _splice(listener, tls, backend)
+    except (OSError, ssl.SSLError, KandevError):
+        pass
+    finally:
+        for sock in (tls, backend, raw):
+            if sock is not None:
+                with listener.lock:
+                    listener.conns.discard(sock)
+                with contextlib.suppress(OSError):
+                    sock.close()
+        slots.release()
+        kandev_proxy_log(f"{listener.name} {listener.guest} {outcome}")
+
+
+def kandev_proxy(stop=None):
+    """The accept loop. Runs until killed (or `stop`, an Event, for tests)."""
+    os.makedirs(os.path.dirname(KANDEV_PROXY_LOCK), mode=0o700, exist_ok=True)
+    lock = open(KANDEV_PROXY_LOCK, "a", encoding="utf-8")    # held for the proxy's life
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        die("another `msbctl kandev proxy` is already running on this host")
+    sel = selectors.DefaultSelector()
+    listeners, slots = {}, threading.BoundedSemaphore(KANDEV_PROXY_MAX_CONNS)
+    ctx, stamp, said, next_scan = None, None, "", 0.0
+    try:
+        while not (stop and stop.is_set()):
+            if time.monotonic() >= next_scan:
+                next_scan = time.monotonic() + KANDEV_PROXY_SCAN
+                try:
+                    want, why = kandev_proxy_wanted()
+                except (KandevError, SystemExit) as exc:
+                    # A config being edited: keep what is open, say so once.
+                    want, why = {k: (v.name, v.guest) for k, v in listeners.items()}, \
+                        f"config: {getattr(exc, 'message', exc)}"
+                try:
+                    now = tuple(os.stat(p).st_mtime_ns for p in (KANDEV_TLS_CERT, KANDEV_TLS_KEY))
+                except OSError:
+                    now = None
+                if now != stamp:
+                    fresh = kandev_tls_context() if now else None
+                    if fresh or not now:
+                        ctx, stamp = fresh, now
+                        kandev_proxy_log("certificate loaded" if ctx else "no certificate")
+                if ctx is None:
+                    want, why = {}, why or "no certificate (`kandev tls install`)"
+                if why != said:
+                    kandev_proxy_log(f"listening on nothing: {why}" if why else "serving")
+                    said = why
+                for key in [k for k, v in listeners.items() if want.get(k) != (v.name, v.guest)]:
+                    sel.unregister(listeners[key].sock)
+                    listeners.pop(key).close()
+                for key, (name, guest) in want.items():
+                    if key in listeners:
+                        continue
+                    family = socket.AF_INET6 if ":" in key[0] else socket.AF_INET
+                    sock = socket.socket(family, socket.SOCK_STREAM)
+                    try:
+                        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        sock.bind(key)
+                        sock.listen(64)
+                    except OSError as exc:
+                        sock.close()
+                        kandev_proxy_log(f"{name} {guest} cannot listen on port {key[1]}: {exc.strerror}")
+                        continue
+                    sock.setblocking(False)
+                    listeners[key] = _ProxyListener(sock, name, guest)
+                    sel.register(sock, selectors.EVENT_READ, listeners[key])
+            for key, _ in sel.select(timeout=0.5):
+                listener = key.data
+                try:
+                    raw, _peer = listener.sock.accept()
+                except OSError:
+                    continue
+                if not slots.acquire(blocking=False):
+                    raw.close()
+                    continue
+                raw.setblocking(True)
+                threading.Thread(target=kandev_proxy_conn, args=(raw, listener, ctx, slots),
+                                 daemon=True).start()
+    finally:
+        for listener in listeners.values():
+            listener.close()
+        sel.close()
+        lock.close()
+
+
 KANDEV_VERBS = {
     "health": kandev_health, "list": kandev_list, "provision": kandev_provision,
     "agentctl": kandev_agentctl, "inspect": kandev_inspect, "find": kandev_find,
     "start": kandev_start, "stop": kandev_stop, "expiry": kandev_expiry,
     "lease": kandev_lease, "destroy": kandev_destroy, "reap": kandev_reap,
+    "tls": kandev_tls,
 }
 # The verbs that name an environment.
 KANDEV_ENV_VERBS = ("provision", "agentctl", "inspect", "start", "stop", "expiry", "lease", "destroy")
@@ -8977,6 +9628,14 @@ KANDEV_ENV_VERBS = ("provision", "agentctl", "inspect", "start", "stop", "expiry
 def cmd_kandev(args, config):
     """`msbctl kandev <verb>`: one JSON document on stdout; exit 0, or 3 with
     {"error": {"code", "message"}}. Everything else goes to stderr."""
+    if args.verb == "proxy":
+        # The long-running service, not a JSON verb: `host serve --kandev`
+        # refuses it, and systemd runs it (`host kandev install`).
+        try:
+            kandev_proxy()
+        except KeyboardInterrupt:
+            pass
+        return
     code, data = 0, None
     with contextlib.redirect_stdout(sys.stderr):
         try:
@@ -9022,8 +9681,9 @@ def kandev_guard(args):
 
 
 def host_kandev(args):
-    """`host kandev install`: the reaper as a systemd user timer. Not a daemon:
-    every minute it runs `msbctl kandev reap` once, which exits."""
+    """`host kandev install`: the reaper as a systemd user timer (not a daemon:
+    every minute it runs `msbctl kandev reap` once, which exits), and the TLS
+    proxy as a service. The proxy listens on nothing unless serve = "proxy"."""
     if args.arg != "install":
         die("host kandev: the only action is `install`")
     me = shutil.which("msbctl") or os.path.realpath(__file__)
@@ -9055,10 +9715,32 @@ OnUnitActiveSec=60s
 [Install]
 WantedBy=timers.target
 """)
-    note(f"wrote {tilde(service)} and {tilde(timer)}")
+    proxy = os.path.join(SYSTEMD_USER_DIR, f"{KANDEV_PROXY_UNIT}.service")
+    with open(proxy, "w", encoding="utf-8") as fh:
+        fh.write(f"""# Written by `msbctl host kandev install`. The TLS proxy for Kandev's
+# sandboxes ([kandev] serve = "proxy"): one listener per published port on
+# proxy_listen, each connection checked for a lease token. It reads the kandev
+# entries and the certificate itself, so it never needs a restart for them.
+[Unit]
+Description=msb-manager: TLS proxy for Kandev's sandboxes
+
+[Service]
+Type=simple
+Environment=PATH={path_env}
+ExecStart={me} kandev proxy
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+""")
+    note(f"wrote {tilde(service)}, {tilde(timer)} and {tilde(proxy)}")
     if shutil.which("systemctl"):
         run(["systemctl", "--user", "daemon-reload"], check=False)
         run(["systemctl", "--user", "enable", "--now", f"{KANDEV_REAP_UNIT}.timer"], check=False)
+        # restart, not just --now: an upgrade must run the new code.
+        run(["systemctl", "--user", "enable", f"{KANDEV_PROXY_UNIT}.service"], check=False)
+        run(["systemctl", "--user", "restart", f"{KANDEV_PROXY_UNIT}.service"], check=False)
     user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
     if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
         note("a user timer runs with nobody logged in only with lingering on; once, as root:")
@@ -10328,9 +11010,11 @@ def build_parser():
 
     p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",
                        description="Verbs the Kandev plugin runs over ssh. Each prints one JSON "
-                       "document; secrets, the agentctl binary and its nonce come on stdin.")
-    p.add_argument("verb", choices=list(KANDEV_VERBS))
-    p.add_argument("env", nargs="?", metavar="ENV", help="the Kandev environment id")
+                       "document; secrets, the agentctl binary, its nonce and a TLS key come on stdin. "
+                       "`kandev proxy` is not one of them: it is the host's long-running TLS "
+                       "proxy (serve = \"proxy\"), run by `host kandev install`'s service.")
+    p.add_argument("verb", choices=[*KANDEV_VERBS, "proxy"])
+    p.add_argument("env", nargs="?", metavar="ENV", help="the Kandev environment id (tls: install)")
     p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
     p.add_argument("--operation", metavar="OP", help="find: the Kandev operation id")
     p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")

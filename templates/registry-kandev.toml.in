@@ -34,6 +34,13 @@ ssh_keys     = []
 # 127.0.0.1:<host port>:<guest port>, from [kandev] port_pool.
 {{PORTS}}
 
+# [kandev] serve when it was made: what destroy undoes, and how a lease reads.
+serve        = {{SERVE}}
+# serve = "proxy": <public TLS port>:<guest port>, from [kandev] proxy_port_pool,
+# on [kandev] proxy_listen. `msbctl kandev proxy` listens on these while this
+# file exists, and checks each connection's lease token for this sandbox.
+{{PROXY_PORTS}}
+
 # [kandev] rule_groups at provision time, then the request's own egress and the
 # Kandev API host, pinned to the address it resolved to here and written into
 # the guest's /etc/hosts, so DNS rebind protection stays on.

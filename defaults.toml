@@ -227,12 +227,33 @@ max_memory    = "96G"
 # and its three instance ports). Nothing off this machine reaches them directly.
 port_pool     = "20000-29999"
 # The HTTPS address Kandev reaches this host's sandboxes at, e.g.
-# "https://sbx-01.tailnet.ts.net". A lease is this plus /vm/<name>/p/<port>.
+# "https://sbx-01.tailnet.ts.net". With serve = "proxy" only its host name
+# counts: a lease is https://<that host>:<public port>, and the certificate
+# `kandev tls install` brings must name it. With "tailscale", a lease is this
+# plus /vm/<name>/p/<port>.
 base_url      = ""
-# What serves base_url: "tailscale" maps each sandbox port with
-# `tailscale serve --set-path`, using the node's own certificate (grant it once:
-# `sudo tailscale set --operator=$USER`); "none" leaves routing to you.
-serve         = "tailscale"
+# What serves base_url:
+#   "proxy"     `msbctl kandev proxy` (a user service from `host kandev
+#               install`) terminates TLS here, with a certificate the Kandev
+#               plugin issues from its own root, and admits a connection only
+#               with a lease token for that sandbox and port. Needs no
+#               Tailscale: headscale, WireGuard or a LAN all work.
+#   "tailscale" maps each sandbox port with `tailscale serve --set-path`, using
+#               the node's own certificate (grant it once: `sudo tailscale set
+#               --operator=$USER`). Only Tailscale's hosted control plane issues
+#               those; headscale does not.
+#   "none"      leaves routing to you.
+# Changing it affects new sandboxes only: each one is torn down the way it was
+# set up.
+serve         = "proxy"
+# serve = "proxy": the address its TLS ports bind, this host's tailnet or LAN
+# IP (not a name). Required for "proxy": it listens on nothing until it is set.
+# Let only the Kandev server reach it (tailnet ACL or firewall).
+proxy_listen  = ""
+# serve = "proxy": its public TLS ports, four per sandbox (one per published
+# port, so a connection can only ever reach one VM port). Must not overlap
+# port_pool.
+proxy_port_pool = "30000-39999"
 # Egress every Kandev sandbox gets ("base" is always first). The Kandev API
 # host is added per sandbox from the request, pinned to the address it resolves
 # to here, so DNS rebind protection stays on.

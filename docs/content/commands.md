@@ -405,7 +405,8 @@ start --autostart` at boot. Under `host serve`, only `check` is allowed.
 `--kandev` is the [Kandev plugin's key](kandev.md#the-plugin-key): its line
 runs `host serve --kandev`, which admits `msbctl kandev` verbs and nothing
 else, while the everyday key runs none of them. `kandev install` writes and
-enables the [reaper](kandev.md#the-reaper)'s systemd user timer.
+enables the [reaper](kandev.md#the-reaper)'s systemd user timer and the
+[TLS proxy](kandev.md#the-tls-proxy)'s service, and restarts the proxy.
 
 ### `msbctl kandev`
 
@@ -415,13 +416,18 @@ msbctl kandev provision|agentctl|inspect|start|stop|destroy ENV
 msbctl kandev find --operation OP
 msbctl kandev expiry ENV --at TIME
 msbctl kandev lease ENV PORT
+msbctl kandev tls install
+msbctl kandev proxy
 ```
 
 What the Kandev plugin runs over ssh to keep [Kandev's sandboxes](kandev.md)
 on this host. Each prints one JSON document on stdout and exits 0, or 3 with
-`{"error": {"code", "message"}}`; secrets, the agentctl binary and its nonce
-come on stdin. Off until `[kandev] enabled = true`. [Every verb](kandev.md#the-verbs)
-is described on the Kandev hosts page.
+`{"error": {"code", "message"}}`; secrets, the agentctl binary and its nonce,
+and the certificate and key for `tls install` come on stdin. Off until
+`[kandev] enabled = true`. [Every verb](kandev.md#the-verbs) is described on
+the Kandev hosts page. `proxy` is not one of them: it's the
+[TLS proxy](kandev.md#the-tls-proxy), the long-running service `host kandev
+install` sets up, and the plugin's key can't run it.
 
 ### `msbctl remote`
 

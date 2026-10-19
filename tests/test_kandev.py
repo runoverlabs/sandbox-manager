@@ -42,7 +42,8 @@ class KandevTest(MsbctlTest):
         os.makedirs(self.m.CONFIG_DIR, exist_ok=True)
         with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
             fh.write("[kandev]\n" + "".join(
-                f"{k} = {str(v).lower() if isinstance(v, bool) else v}\n" for k, v in values.items()))
+                f"{k} = {str(v).lower() if isinstance(v, bool) else v}\n" for k, v in values.items()
+                if v is not None))
 
     def kandev(self, *argv, stdin=""):
         """(exit code, the one JSON document on stdout)."""

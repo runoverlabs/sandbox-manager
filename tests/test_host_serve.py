@@ -116,6 +116,7 @@ KANDEV_ALLOWED = [
     "msbctl kandev lease 6f1c2b9e-aaaa 8765",
     "msbctl kandev destroy 6f1c2b9e-aaaa",
     "msbctl kandev reap",
+    "msbctl kandev tls install",
 ]
 
 KANDEV_REFUSED = [
@@ -124,6 +125,8 @@ KANDEV_REFUSED = [
     "msbctl allow web x.example", "msbctl add --repo acme/web -y", "msbctl edit web",
     "msbctl rm web", "msbctl purge web -y", "msbctl start web", "msbctl host check",
     "msbctl kandev bogus", "msbctl kandev", "/bin/sh -c ls", "",
+    # The host's own long-running TLS proxy, never something the plugin starts.
+    "msbctl kandev proxy",
 ]
 
 
