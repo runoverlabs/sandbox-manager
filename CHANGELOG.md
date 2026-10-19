@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-10-19
+
 ### Added
 - `[kandev] allow_extra` admits addresses (`192.168.2.6`), `address:port` (`192.168.2.6:8788`) and CIDRs (`192.168.2.0/24`, no wider than /8), so one LAN host can be allowed without `"*"`; `kandev health` reports the list as `egress.allow_extra`.
 
