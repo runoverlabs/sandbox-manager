@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-19
+
 ### Added
 - `kandev health` reports `host`: the machine's OS, kernel, CPUs, memory, load, free disk and uptime.
 - `msbctl host kandev configure` sets `[kandev]` keys (`--enabled`, `--serve`, `--proxy-listen`, `--base-url`, `--allow-extra`) in `config.toml`, keeping the rest of the file, and refuses a bad value without writing.
