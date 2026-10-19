@@ -3,6 +3,7 @@ TLS proxy itself, over real TLS on loopback. The certificates are made by
 `openssl` at test time (a name-constrained root and its leaves), so no key is
 ever committed."""
 
+import contextlib
 import datetime as dt
 import hashlib
 import json
@@ -184,7 +185,6 @@ class Health(TlsTest):
 
     def lock_held(self):
         """Hold the proxy's lock as a running proxy does."""
-        import contextlib
         import fcntl
 
         @contextlib.contextmanager
@@ -408,10 +408,11 @@ class Proxy(TlsTest):
         self.purge("k-e2")
         for public in ports.values():
             self.wait_for(public, listening=False)
-        with self.assertRaises((ssl.SSLEOFError, ConnectionResetError, EOFError)):
-            while tls.recv(4096):                       # and its connection is cut
-                pass
-            raise EOFError
+        # And its connection is cut: EOF, with or without a close_notify. A
+        # connection left open fails the test with the socket's 5 s timeout.
+        with contextlib.suppress(ssl.SSLEOFError, ConnectionResetError):
+            while tls.recv(4096):
+                continue
         tls.close()
         # e1 is untouched.
         port, auth = self.lease("e1", 8765)

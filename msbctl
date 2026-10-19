@@ -8969,10 +8969,9 @@ def kandev_lease_key(create=True):
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(os.urandom(32))
-            try:
-                os.link(tmp, KANDEV_LEASE_KEY)      # never replaces one a racer wrote
-            except FileExistsError:
-                pass
+            # A link never replaces one a racer wrote first; theirs is read below.
+            with contextlib.suppress(FileExistsError):
+                os.link(tmp, KANDEV_LEASE_KEY)
             os.unlink(tmp)
             continue
         if len(key) != 32:
@@ -9565,6 +9564,8 @@ def kandev_proxy_conn(raw, listener, ctx, slots):
         outcome = "forwarded"
         _splice(listener, tls, backend)
     except (OSError, ssl.SSLError, KandevError):
+        # A peer gone, reset or timed out: the connection is simply over.
+        # `outcome` already says how far it got; `finally` logs and closes.
         pass
     finally:
         for sock in (tls, backend, raw):
@@ -9768,10 +9769,8 @@ def host_kandev(args, config):
     if args.arg == "reap":
         json_document(lambda: kandev_reap(args, config, kandev_settings(config)))
     if args.arg == "proxy":
-        try:
+        with contextlib.suppress(KeyboardInterrupt):       # ^C in a terminal: just stop
             kandev_proxy()
-        except KeyboardInterrupt:
-            pass
         return
     if args.arg != "install":
         die("host kandev: install, reap or proxy")
