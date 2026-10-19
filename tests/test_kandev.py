@@ -46,12 +46,25 @@ class KandevTest(MsbctlTest):
                 if v is not None))
 
     def kandev(self, *argv, stdin=""):
-        """(exit code, the one JSON document on stdout)."""
+        """(exit code, the one JSON document on stdout) of `msbctl kandev …`."""
+        return self.msbctl_json("kandev", *argv, stdin=stdin)
+
+    def msbctl_json(self, *argv, stdin="", plugin=True):
+        """(exit code, the one JSON document on stdout) of `msbctl <argv>`, run
+        as the plugin's key runs it (`plugin`) or as the operator at the host."""
+        if plugin:
+            os.environ["MSB_RESTRICTED"] = "kandev"
+        try:
+            return self._msbctl_json(argv, stdin)
+        finally:
+            os.environ.pop("MSB_RESTRICTED", None)
+
+    def _msbctl_json(self, argv, stdin):
         fake_dns = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (API_ADDR, 443))]
         with mock.patch.object(self.m.socket, "getaddrinfo", lambda *a, **k: fake_dns), \
                 mock.patch.object(self.m, "kandev_probe", lambda port, timeout=1.0: self.probe), \
                 mock.patch.object(self.m.time, "sleep", lambda s: None):
-            code, out, err = self.run_main("kandev", *argv, stdin=stdin if isinstance(stdin, bytes)
+            code, out, err = self.run_main(*argv, stdin=stdin if isinstance(stdin, bytes)
                                            else stdin.encode())
         try:
             doc = json.loads(out)
@@ -70,6 +83,36 @@ class KandevTest(MsbctlTest):
         self.assertEqual(code, 3, doc)
         self.assertEqual(doc["error"]["code"], code_name, doc)
         return doc["error"]
+
+    def jok(self, *argv):
+        """`msbctl <argv>` as the plugin runs it, which must succeed."""
+        code, doc = self.msbctl_json(*argv)
+        self.assertEqual(code, 0, doc)
+        return doc
+
+    def jerror(self, code_name, *argv):
+        code, doc = self.msbctl_json(*argv)
+        self.assertEqual(code, 3, doc)
+        self.assertEqual(doc["error"]["code"], code_name, doc)
+        return doc["error"]
+
+    def listed(self):
+        """The records `ls --json` gives the plugin."""
+        return [row["kandev"] for row in self.jok("ls", "--json")["sandboxes"]]
+
+    def inspect(self, name):
+        return self.jok("show", name, "--json")["kandev"]
+
+    def stop(self, name):
+        return self.jok("stop", name, "--json")["sandboxes"][0]["kandev"]
+
+    def purge(self, name):
+        return self.jok("purge", name, "-y", "--json")
+
+    def reap(self):
+        code, doc = self.msbctl_json("host", "kandev", "reap", plugin=False)
+        self.assertEqual(code, 0, doc)
+        return doc
 
     def provision(self, env="6f1c2b9e", **over):
         return self.ok("provision", env, stdin=request(**over))["record"]
@@ -109,7 +152,7 @@ class HealthAndConfig(KandevTest):
         self.configure(enabled=False)
         self.assertFalse(self.ok("health")["enabled"])
         self.error("denied", "provision", "e1", stdin=request())
-        self.error("denied", "list")
+        self.jerror("denied", "ls", "--json")
 
     def test_bad_config_is_named(self):
         for key, value in (("port_pool", '"10-20"'), ("max_memory", '"lots"'),
@@ -182,7 +225,7 @@ class Provision(KandevTest):
         self.assertEqual(err["retry_after_seconds"], 30)
         self.configure(max_sandboxes=3)
         two = self.provision("e2", operation_id="op-2")
-        one = self.ok("inspect", "e1")["record"]
+        one = self.inspect("k-e1")
         self.assertFalse(set(one["ports"].values()) & set(two["ports"].values()))
 
     def test_refused_requests(self):
@@ -230,7 +273,7 @@ class Provision(KandevTest):
     def test_a_failed_create_leaves_the_entry_for_reap(self):
         os.environ["FAKE_MSB_FAIL"] = "create"
         self.error("unavailable", "provision", "e1", stdin=request())
-        self.assertEqual(self.ok("list")["sandboxes"][0]["state"], "creating")
+        self.assertEqual(self.listed()[0]["state"], "creating")
 
     def test_names(self):
         self.assertEqual(self.m.kandev_name("6f1c2b9e-aaaa"), "k-6f1c2b9e-aaaa")
@@ -247,7 +290,7 @@ class Provision(KandevTest):
         self.assertEqual(len(mapped), 4)
         self.assertIn("--set-path=/vm/k-6f1c2b9e/p/8765", mapped[0] + mapped[1] + mapped[2] + mapped[3])
         self.assertIn(f"http://127.0.0.1:{rec['ports']['8765']}", sum(mapped, []))
-        self.ok("destroy", "6f1c2b9e")
+        self.purge("k-6f1c2b9e")
         off = [c for c in self.tailscale_calls() if c[-1:] == ["off"]]
         self.assertEqual(len(off), 4)
 
@@ -298,11 +341,11 @@ class Lifecycle(KandevTest):
 
     def test_inspect_find_list_lease(self):
         self.provision()
-        self.assertEqual(self.ok("inspect", "6f1c2b9e")["record"]["state"], "running")
-        self.error("not_found", "inspect", "nope")
-        self.assertEqual(self.ok("find", "--operation", "op-1")["record"]["env"], "6f1c2b9e")
-        self.error("not_found", "find", "--operation", "op-9")
-        self.assertEqual([s["env"] for s in self.ok("list")["sandboxes"]], ["6f1c2b9e"])
+        rec = self.inspect("k-6f1c2b9e")
+        self.assertEqual((rec["state"], rec["agentctl"]["running"]), ("running", True))
+        self.jerror("not_found", "show", "k-nope", "--json")
+        # What `find --operation` was: the plugin filters the list.
+        self.assertEqual([(r["env"], r["operation_id"]) for r in self.listed()], [("6f1c2b9e", "op-1")])
         lease = self.ok("lease", "6f1c2b9e", "41001")["lease"]
         self.assertEqual(lease["base_url"], "https://sbx-01.example.ts.net/vm/k-6f1c2b9e/p/41001")
         self.assertEqual(lease["generation"], "1")
@@ -312,7 +355,8 @@ class Lifecycle(KandevTest):
 
     def test_stop_start_needs_its_secrets(self):
         self.provision()
-        self.assertEqual(self.ok("stop", "6f1c2b9e")["record"]["state"], "stopped")
+        self.assertEqual(self.stop("k-6f1c2b9e")["state"], "stopped")
+        self.assertEqual(self.stop("k-6f1c2b9e")["state"], "stopped")        # a no-op
         self.error("unavailable", "lease", "6f1c2b9e", "8765")
         self.error("invalid_config", "start", "6f1c2b9e", stdin="")
         wrong = json.dumps({"secrets": [{"name": "OTHER", "value": "v", "hosts": ["a.example"]}]})
@@ -337,21 +381,22 @@ class Lifecycle(KandevTest):
 
     def test_destroy_is_always_safe(self):
         self.provision()
-        self.assertEqual(self.ok("destroy", "6f1c2b9e"), {"destroyed": True})
-        self.assertEqual(self.ok("destroy", "6f1c2b9e"), {"destroyed": True})
-        self.assertEqual(self.ok("list")["sandboxes"], [])
+        self.assertEqual(self.purge("k-6f1c2b9e"), {"purged": ["k-6f1c2b9e"], "absent": []})
+        self.assertEqual(self.purge("k-6f1c2b9e"), {"purged": [], "absent": ["k-6f1c2b9e"]})
+        self.assertEqual(self.listed(), [])
         self.assertNotIn("k-6f1c2b9e", self.fake_state())
 
     def test_an_operator_sandbox_named_like_one_is_never_touched(self):
         self.make_folder_sandbox("k-x")
         self.set_state(**{"k-x": "running"})
-        self.assertEqual(self.ok("destroy", "x"), {"destroyed": True})
-        self.error("not_found", "inspect", "x")
+        self.assertEqual(self.purge("k-x"), {"purged": [], "absent": ["k-x"]})
+        self.jerror("not_found", "show", "k-x", "--json")
+        self.jerror("not_found", "stop", "k-x", "--json")
         self.error("conflict", "provision", "x", stdin=request())
-        self.ok("reap")
+        self.reap()
         self.assertEqual(self.fake_state()["k-x"], "running")
         self.assertTrue(os.path.exists(self.entry_path("k-x")))
-        self.assertEqual(self.ok("list")["sandboxes"], [])
+        self.assertEqual(self.listed(), [])
 
 
 class Reap(KandevTest):
@@ -377,7 +422,7 @@ class Reap(KandevTest):
         del os.environ["FAKE_MSB_FAIL"]
         self.m.set_toml_key(self.entry_path("k-stuck"), "created_at", "2001-01-01T00:00:00Z")
 
-        out = self.ok("reap")
+        out = self.reap()
         self.assertEqual(sorted(out["destroyed"]), ["k-old", "k-stuck"])
         self.assertEqual(out["marked_absent"], ["k-gone"])
         self.assertEqual(out["orphans_removed"], ["k-orphan"])
@@ -385,7 +430,7 @@ class Reap(KandevTest):
         left = self.fake_state()
         self.assertIn("k-live", left)
         self.assertIn("k-young", left)
-        states = {s["name"]: s["state"] for s in self.ok("list")["sandboxes"]}
+        states = {s["name"]: s["state"] for s in self.listed()}
         self.assertEqual(states, {"k-gone": "absent", "k-live": "running"})
 
 
@@ -393,9 +438,9 @@ class OperatorSide(KandevTest):
 
     def test_operator_verbs_look_but_do_not_touch(self):
         self.provision()
-        for argv in (["rebuild", "k-6f1c2b9e"], ["start", "k-6f1c2b9e"], ["stop", "k-6f1c2b9e"],
+        for argv in (["rebuild", "k-6f1c2b9e"], ["start", "k-6f1c2b9e"],
                      ["resize", "k-6f1c2b9e", "--memory", "4G"], ["allow", "k-6f1c2b9e", "x.example"],
-                     ["purge", "k-6f1c2b9e", "-y"], ["edit", "k-6f1c2b9e"],
+                     ["edit", "k-6f1c2b9e"],
                      ["secret", "ls", "k-6f1c2b9e"]):
             with self.subTest(argv=argv):
                 code, _, err = self.run_main(*argv)
@@ -414,7 +459,7 @@ class OperatorSide(KandevTest):
 
     def test_shell_only_while_running(self):
         self.provision()
-        self.ok("stop", "6f1c2b9e")
+        self.stop("k-6f1c2b9e")
         code, _, err = self.run_main("exec", "k-6f1c2b9e", "--", "true")
         self.assertNotEqual(code, 0)
         self.assertIn("only Kandev starts it", err)
@@ -427,9 +472,39 @@ class OperatorSide(KandevTest):
         self.assertEqual(code, 0, err)
         unit = os.path.join(self.m.SYSTEMD_USER_DIR, "msb-kandev-reap")
         with open(unit + ".service", encoding="utf-8") as fh:
-            self.assertIn("ExecStart=/home/x/.local/bin/msbctl kandev reap", fh.read())
+            self.assertIn("ExecStart=/home/x/.local/bin/msbctl host kandev reap", fh.read())
+        with open(os.path.join(self.m.SYSTEMD_USER_DIR, "msb-kandev-proxy.service"), encoding="utf-8") as fh:
+            self.assertIn("ExecStart=/home/x/.local/bin/msbctl host kandev proxy", fh.read())
         with open(unit + ".timer", encoding="utf-8") as fh:
             self.assertIn("OnUnitActiveSec=60s", fh.read())
+
+    def test_the_operator_stops_and_purges_at_the_host_only(self):
+        self.provision()
+        os.environ["MSB_RESTRICTED"] = "1"          # the laptop's everyday key
+        for argv in (["stop", "k-6f1c2b9e"], ["purge", "k-6f1c2b9e", "-y"]):
+            with self.subTest(argv=argv):
+                code, _, err = self.run_main(*argv)
+                self.assertNotEqual(code, 0)
+                self.assertIn("Kandev sandbox", err)
+        del os.environ["MSB_RESTRICTED"]
+        code, _, err = self.run_main("stop", "k-6f1c2b9e")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.m.read_toml(self.entry_path("k-6f1c2b9e"))["state"], "stopped")
+        code, _, err = self.run_main("purge", "k-6f1c2b9e", "-y")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(self.entry_path("k-6f1c2b9e")))
+        self.assertNotIn("k-6f1c2b9e", self.fake_state())
+
+    def test_plugin_sees_only_kandevs_sandboxes(self):
+        self.provision()
+        self.make_folder_sandbox("web")
+        self.assertEqual([r["name"] for r in self.jok("ls", "--json")["sandboxes"]], ["k-6f1c2b9e"])
+        self.jerror("not_found", "show", "web", "--json")
+        self.assertEqual(self.purge("web"), {"purged": [], "absent": ["web"]})
+        self.assertTrue(os.path.exists(self.entry_path("web")))
+        # The operator at the host sees both.
+        code, doc = self.msbctl_json("ls", "--json", plugin=False)
+        self.assertEqual(sorted(r["name"] for r in doc["sandboxes"]), ["k-6f1c2b9e", "web"])
 
     def test_new_names_cannot_take_the_prefix(self):
         self.assertIn("Kandev", self.m.name_problem("k-mine"))

@@ -101,23 +101,23 @@ REFUSED = [
 
 
 # The Kandev plugin's key: `host serve --kandev`. Each kandev verb is allowed
-# there and refused under the everyday key; every operator verb is refused there.
-KANDEV_ALLOWED = [
-    "msbctl --version",
+# there and refused under the everyday key; the generic verbs only in the one
+# JSON shape the plugin uses; every operator verb is refused there.
+KANDEV_VERBS = [
     "msbctl kandev health",
-    "msbctl kandev list",
     "msbctl kandev provision 6f1c2b9e-aaaa",
     "msbctl kandev agentctl 6f1c2b9e-aaaa",
-    "msbctl kandev inspect 6f1c2b9e-aaaa",
-    "msbctl kandev find --operation op-1",
     "msbctl kandev start 6f1c2b9e-aaaa",
-    "msbctl kandev stop 6f1c2b9e-aaaa",
     "msbctl kandev expiry 6f1c2b9e-aaaa --at 2026-10-17T15:00:00Z",
     "msbctl kandev lease 6f1c2b9e-aaaa 8765",
-    "msbctl kandev destroy 6f1c2b9e-aaaa",
-    "msbctl kandev reap",
     "msbctl kandev tls install",
 ]
+
+KANDEV_ALLOWED = ["msbctl --version", *KANDEV_VERBS,
+                  "msbctl ls --json",
+                  "msbctl show k-6f1c2b9e-aaaa --json",
+                  "msbctl stop k-6f1c2b9e-aaaa --json",
+                  "msbctl purge k-6f1c2b9e-aaaa -y --json"]
 
 KANDEV_REFUSED = [
     "msbctl ls", "msbctl status", "msbctl show web", "msbctl shell web",
@@ -125,8 +125,15 @@ KANDEV_REFUSED = [
     "msbctl allow web x.example", "msbctl add --repo acme/web -y", "msbctl edit web",
     "msbctl rm web", "msbctl purge web -y", "msbctl start web", "msbctl host check",
     "msbctl kandev bogus", "msbctl kandev", "/bin/sh -c ls", "",
-    # The host's own long-running TLS proxy, never something the plugin starts.
-    "msbctl kandev proxy",
+    # The generic verbs in any other shape: text output, a prompt, a re-probe,
+    # several names, or the host's own folder.
+    "msbctl stop web", "msbctl purge web --json", "msbctl stop a b --json",
+    "msbctl show . --json", "msbctl show --json", "msbctl ls --json --refresh",
+    "msbctl ls --json --porcelain",
+    # Folded into the generic verbs, or the host's own.
+    "msbctl kandev list", "msbctl kandev inspect x", "msbctl kandev destroy x",
+    "msbctl kandev stop x", "msbctl kandev find --operation op", "msbctl kandev reap",
+    "msbctl host kandev reap", "msbctl host kandev proxy", "msbctl host kandev install",
 ]
 
 
@@ -178,7 +185,7 @@ class HostServeTest(MsbctlTest):
             with self.subTest(command=command):
                 code, seen, err = self.serve(command, kandev=True)
                 self.assertEqual(code, 0, err)
-                self.assertEqual(seen["restricted"], "1")
+                self.assertEqual(seen["restricted"], "kandev")
         for command in KANDEV_REFUSED:
             with self.subTest(command=command):
                 code, seen, err = self.serve(command, kandev=True)
@@ -186,7 +193,7 @@ class HostServeTest(MsbctlTest):
                 self.assertNotIn("argv", seen)
 
     def test_everyday_key_runs_no_kandev_verb(self):
-        for command in KANDEV_ALLOWED[1:]:
+        for command in KANDEV_VERBS:
             with self.subTest(command=command):
                 code, seen, err = self.serve(command)
                 self.assertEqual(code, 126, err)

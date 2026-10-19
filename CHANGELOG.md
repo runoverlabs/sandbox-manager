@@ -9,8 +9,9 @@ release notes.
 ## [Unreleased]
 
 ### Added
-- Kandev sandbox hosts: `msbctl kandev …` lets the Kandev plugin run one microVM per session here over ssh (`host authorize --kandev`, `host kandev install`); off until `[kandev] enabled = true`, see the "Kandev hosts" page.
+- Kandev sandbox hosts: `msbctl kandev …` lets the Kandev plugin run one microVM per session here over ssh, listing, inspecting, stopping and removing them with `ls`, `show`, `stop` and `purge` and `--json` (`host authorize --kandev`, `host kandev install|reap|proxy`); off until `[kandev] enabled = true`, see the "Kandev hosts" page.
 - Kandev hosts serve sandboxes through their own TLS proxy (`[kandev] serve = "proxy"`, the new default; set `proxy_listen`): the plugin installs a certificate with `kandev tls install`, leases carry a short-lived token, and `health` reports `tls`. Re-run `msbctl host kandev install` to get the proxy's service, or set `serve = "tailscale"` to keep `tailscale serve`.
+- `msbctl stop --json` and `msbctl purge -y --json` print one JSON document, as `ls --json` and `show --json` do.
 - Kandev `health` reports `serve.ok = false` in `tailscale` mode when the tailnet issues no certificates (headscale).
 - The `go` egress group allows `vuln.go.dev`, for `govulncheck`; existing sandboxes need a rebuild.
 - Remote hosts from the menu: bare `msbctl` → **remote hosts** adds, sets up, tests and removes them, and `msbctl remote setup NAME` installs what a host is missing (msb and msbctl at this machine's versions, autostart) and restricts your key there, asking before each step.
@@ -21,6 +22,9 @@ release notes.
 
 ### Changed
 - In the picker, Enter now edits the sandbox (`msbctl edit`).
+- `msbctl purge` of a name with nothing registered under it says "nothing found" and succeeds, so purging twice is fine.
+- With `--json`, a failing `ls`, `show`, `stop` or `purge` prints `{"error": {"code", "message"}}` on stdout and exits 3 (`not_found` for an unknown name) instead of a message on stderr and exit 1.
+- `msbctl stop` exits non-zero when msb fails to stop a running sandbox.
 
 ### Removed
 - `msbctl code` and `MSB_EDITOR`: open the project folder in your editor yourself.

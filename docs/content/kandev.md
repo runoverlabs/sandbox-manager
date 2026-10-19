@@ -16,12 +16,13 @@ short-lived lease token.
 
 Kandev's sandboxes are kept apart from yours:
 
-- The kandev verbs find them only through registry entries with
-  `source = "kandev"`, named `k-…`. No kandev verb can reach one of your
+- The plugin finds them only through registry entries with
+  `source = "kandev"`, named `k-…`. Nothing its key runs can reach one of your
   sandboxes, whatever it's called, and new names of yours can't start with `k-`.
 - Your own verbs may `ls`, `show`, `shell` and `exec` into one while it runs,
-  and refuse everything else. Kandev starts its sandboxes, with secrets only its
-  requests carry, and `msbctl kandev destroy ENV` removes one.
+  and, on the host itself, `stop` and `purge` it. They refuse everything else,
+  and your laptop's key can't stop or purge one. Kandev starts its sandboxes,
+  with secrets only its requests carry.
 - None of msbctl's own credential setup applies to them: no bootstrap, no
   CLAUDE.md, no git identity or [git push](credentials.md#git-push-gh-or-ssh)
   rewrites, no ssh agent, no Claude token or `GH_TOKEN`. Kandev delivers agent
@@ -120,7 +121,21 @@ part of its configuration. A private image must name its registry
 
 ## The verbs
 
-Each prints one JSON document on stdout. Exit 0 is success. Exit 3 comes with
+`msbctl kandev` holds only what needs Kandev's own input. For the rest, the
+plugin uses the ordinary verbs with `--json`, which under its key see Kandev's
+sandboxes and nothing else (any other name is `not_found`, or `absent` for
+`purge`):
+
+| Plugin needs | Runs | Gets |
+| --- | --- | --- |
+| the list | `ls --json` | `sandboxes`, each with `kandev`, the record (its `operation_id` is how the plugin finds a lost provision) |
+| one record | `show NAME --json` | `kandev`, the record, with agentctl checked live; `not_found` with no such sandbox |
+| to stop one | `stop NAME --json` | `sandboxes`: what `show` says afterwards. Its disk is kept; a stopped one is a no-op |
+| to remove one | `purge NAME -y --json` | `{"purged": [...], "absent": [...]}`. Serve mappings, VM and entry go; nothing there is a success too. A VM under that name without the Kandev label is `conflict`, and left alone |
+
+`NAME` is the `name` every record carries, which the plugin stores and never
+derives. Each `kandev` verb, and each of these, prints one JSON document on
+stdout. Exit 0 is success. Exit 3 comes with
 `{"error": {"code": …, "message": …}}`, where `code` is one of Kandev's
 (`invalid_config`, `denied`, `unsupported`, `not_found`, `expired`, `conflict`,
 `unavailable`, `rate_limited` with `retry_after_seconds`, `cleanup_pending`).
@@ -130,20 +145,14 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 | Verb | Stdin | Does |
 | --- | --- | --- |
 | `health` | – | protocol (1), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
-| `list` | – | every Kandev sandbox: env, name, state, created, expires |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
-| `inspect ENV` | – | the record, with agentctl checked live |
-| `find --operation OP` | – | the record for a Kandev operation id |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
-| `stop ENV` | – | stops it, keeping its disk |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |
 | `lease ENV PORT` | – | `base_url`, `expires_at` and `generation` for one guest port, plus `headers` with its token through the proxy |
-| `destroy ENV` | – | removes the serve mappings, the VM and the entry. Always succeeds when there's nothing left |
-| `reap` | – | one pass of the reaper, below |
 | `tls install` | a JSON line: `cert_pem` (the leaf, then its issuer), `key_pem` | checks and stores the proxy's certificate, and prints `{"tls": …}` as `health` does |
 
-The record `provision`, `inspect`, `find`, `start`, `stop` and `expiry` return
+The record `provision`, `start` and `expiry` return, and `ls`/`show` give as `kandev`,
 has the env and name, the operation and input digest, `state` (`creating`,
 `running`, `stopped`, or `absent` when the VM is gone), platform, image,
 timestamps, `generation`, the port map and agentctl's state. It never holds a
@@ -151,7 +160,7 @@ secret.
 
 ## The TLS proxy
 
-`msbctl kandev proxy` is the one long-running piece, a systemd user service
+`msbctl host kandev proxy` is the one long-running piece, a systemd user service
 written by `host kandev install`. With `serve = "proxy"` it listens on
 `proxy_listen`, one TLS port per published guest port. For each connection it
 completes the handshake, reads the first request head (16 KiB, 10 s at most)
@@ -190,12 +199,12 @@ means a connection can only ever reach one VM port.
 
 ## The reaper
 
-`msbctl kandev reap` runs every minute from the timer `host kandev install`
+`msbctl host kandev reap` runs every minute from the timer `host kandev install`
 writes. It isn't a daemon: each run makes one pass and exits.
 
 - A sandbox past its `expires_at` is destroyed.
 - A create that never finished is destroyed after 15 minutes.
-- An entry whose VM is gone is marked `absent`, and waits for Kandev's destroy
+- An entry whose VM is gone is marked `absent`, and waits for Kandev's purge
   or its expiry.
 - A VM carrying the Kandev label with no entry, older than an hour, is removed.
 
@@ -205,10 +214,10 @@ It never touches a sandbox that lacks either the `kandev` source or the label.
 
 The line `host authorize --kandev` writes is
 `restrict,command="…/msbctl host serve --kandev" <key>`, with no `pty`. That key
-runs `msbctl kandev …` and `msbctl --version`, nothing else, and not
-`kandev proxy`, which is this host's own service. Your laptop's
-everyday key is refused every kandev verb, since one could create a sandbox with
-any egress.
+runs `msbctl kandev …`, `ls`, `show`, `stop` and `purge -y` with `--json` on
+one named sandbox, and `msbctl --version`. Nothing else, and none of `host`:
+the reaper and the proxy are this host's own. Your laptop's everyday key is
+refused every `kandev` verb, since one could create a sandbox with any egress.
 
 The Kandev key does set egress and secret bindings, which the everyday key may
 never do. A Kandev profile is the policy for its own sandboxes, and the Kandev

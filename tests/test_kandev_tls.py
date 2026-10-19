@@ -16,7 +16,7 @@ import threading
 import time
 from unittest import mock, skipUnless
 
-from tests.test_kandev import KandevTest, PLANTED_NPM, request
+from tests.test_kandev import KandevTest, PLANTED_NPM
 
 HAVE_OPENSSL = shutil.which("openssl") is not None
 
@@ -238,7 +238,7 @@ class Leases(TlsTest):
         self.configure(serve='"tailscale"')
         self.provision()
         self.configure()                                # serve = "proxy" now
-        self.ok("destroy", "6f1c2b9e")
+        self.purge("k-6f1c2b9e")
         self.assertEqual(len([c for c in self.tailscale_calls() if c[-1:] == ["off"]]), 4)
 
     def test_an_entry_from_before_serve_was_recorded(self):
@@ -251,7 +251,7 @@ class Leases(TlsTest):
             fh.write(text)
         # Best effort: a tailscale that fails no longer blocks the destroy.
         os.environ["FAKE_TAILSCALE_FAIL"] = "serve"
-        self.assertEqual(self.ok("destroy", "6f1c2b9e"), {"destroyed": True})
+        self.assertEqual(self.purge("k-6f1c2b9e")["purged"], ["k-6f1c2b9e"])
 
 
 class EchoBackend:
@@ -293,13 +293,13 @@ class Proxy(TlsTest):
             for guest, host in rec["ports"].items():
                 self.backends.append(EchoBackend(host, f"{rec['name']}:{guest}"))
         self.client_ctx = ssl.create_default_context(cafile=self.pki["ca.pem"])
-        self.stop = threading.Event()
+        self.halt = threading.Event()
         patches = [mock.patch.object(self.m, "KANDEV_PROXY_SCAN", 0.2),
                    mock.patch.object(self.m, "kandev_proxy_log", self.logs.append)]
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        self.thread = threading.Thread(target=self.m.kandev_proxy, args=(self.stop,), daemon=True)
+        self.thread = threading.Thread(target=self.m.kandev_proxy, args=(self.halt,), daemon=True)
         self.thread.start()
         self.addCleanup(self.shutdown)
         for rec in (self.e1, self.e2):
@@ -307,7 +307,7 @@ class Proxy(TlsTest):
                 self.wait_for(port, listening=True)
 
     def shutdown(self):
-        self.stop.set()
+        self.halt.set()
         self.thread.join(5)
         for backend in self.backends:
             backend.close()
@@ -391,7 +391,7 @@ class Proxy(TlsTest):
 
     def test_a_new_generation_refuses_the_old_token(self):
         port, auth = self.lease("e1", 8765)
-        self.ok("stop", "e1")
+        self.stop("k-e1")
         start = json.dumps({"secrets": [{"name": "NPM_TOKEN", "value": PLANTED_NPM}]}) + "\n"
         self.assertEqual(self.ok("start", "e1", stdin=start)["record"]["generation"], 2)
         self.assert_refused(port, auth)
@@ -405,7 +405,7 @@ class Proxy(TlsTest):
         port, auth = self.lease("e2", 8765)
         tls, line = self.request(port, auth)            # open across the destroy
         self.assertEqual(line, "k-e2:8765\n")
-        self.ok("destroy", "e2")
+        self.purge("k-e2")
         for public in ports.values():
             self.wait_for(public, listening=False)
         with self.assertRaises((ssl.SSLEOFError, ConnectionResetError, EOFError)):
@@ -438,7 +438,7 @@ class Proxy(TlsTest):
             self.assertNotIn("Authorization", message)
 
     def test_one_proxy_per_host(self):
-        code, _, err = self.run_main("kandev", "proxy")
+        code, _, err = self.run_main("host", "kandev", "proxy")
         self.assertNotEqual(code, 0)
         self.assertIn("already running", err)
         self.assertTrue(self.ok("health")["serve"]["running"])

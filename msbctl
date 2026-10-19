@@ -262,6 +262,14 @@ def die(msg, code=1):
     sys.exit(f"msbctl: {msg}")
 
 
+class NoSuchSandbox(SystemExit):
+    """die() for a name nothing is registered under; `--json` reports it as
+    not_found rather than as a failure."""
+
+    def __init__(self, name):
+        super().__init__(f"msbctl: no sandbox named {name!r} — `msbctl ls` to see what exists")
+
+
 def tilde(path):
     return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
 
@@ -461,7 +469,7 @@ class Sandbox:
         self.config = config
         self.entry = read_toml(os.path.join(REGISTRY_DIR, f"{name}.toml"))
         if not self.entry:
-            die(f"no sandbox named {name!r} — `msbctl ls` to see what exists")
+            raise NoSuchSandbox(name)
         # "folder": the project is a host folder, mounted. "repo": there is no
         # host folder at all — the code is cloned from GitHub into a disk volume
         # inside the sandbox, and the project layer is the repo's own .msb/ as
@@ -2378,7 +2386,13 @@ POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
 
 def restricted():
     """True under `msbctl host serve`: nothing that approves a policy may ask."""
-    return os.environ.get("MSB_RESTRICTED") == "1"
+    return os.environ.get("MSB_RESTRICTED") in ("1", "kandev")
+
+
+def kandev_key():
+    """True under `host serve --kandev`: the Kandev plugin's key, whose generic
+    verbs (ls, show, stop, purge) see Kandev's sandboxes and nothing else."""
+    return os.environ.get("MSB_RESTRICTED") == "kandev"
 
 
 def project_policy(box):
@@ -2903,9 +2917,18 @@ def cmd_start(args, config):
 
 def cmd_stop(args, config):
     box = Sandbox(args.name, config)
-    run(["msb", "stop", box.name], check=False)
-    stop_agent_filter(box)
+    proc = run(["msb", "stop", box.name], check=False)
+    if proc.returncode != 0 and state_of(box.name) == "running":
+        die(f"msb stop {box.name} failed")
+    if box.is_kandev:
+        if box.entry.get("state") != "absent":
+            kandev_set(box.name, state="stopped", agentctl_running=False)
+    else:
+        stop_agent_filter(box)
     note(f"{box.name} stopped — installed packages and state are kept")
+    if getattr(args, "json", False):
+        return show_data(Sandbox(box.name, config))
+    return None
 
 
 def cmd_rebuild(args, config):
@@ -2924,7 +2947,18 @@ def cmd_rebuild(args, config):
 
 
 def cmd_purge(args, config):
-    box = Sandbox(args.name, config)
+    """Returns {"name", "purged"} for `--json`. A name with nothing registered
+    under it is not a failure: what was asked for is true, so a repeated or
+    late purge succeeds. Under the Kandev key, a sandbox that is not Kandev's
+    counts as nothing, and is never touched."""
+    name = args.name
+    entry = read_toml(registry_path_for(name)) if os.path.isfile(registry_path_for(name)) else {}
+    if not entry or (kandev_key() and entry.get("source") != "kandev"):
+        note(f"nothing found named {name}: nothing to purge")
+        return {"name": name, "purged": False}
+    box = Sandbox(name, config)
+    if box.is_kandev:
+        return purge_kandev(box, args)
     secret = os.path.join(SECRETS_DIR, f"{box.name}.env")
     entry = os.path.join(REGISTRY_DIR, f"{box.name}.toml")
 
@@ -2949,7 +2983,7 @@ def cmd_purge(args, config):
     else:
         note(f"The project itself is NOT touched: {tilde(box.project)}")
     if not args.yes and not confirm(f"purge {box.name}?"):
-        return
+        return {"name": box.name, "purged": False}
 
     run(["msb", "stop", box.name], check=False, quiet=True)
     run(["msb", "rm", box.name], check=False, quiet=True)
@@ -2969,6 +3003,29 @@ def cmd_purge(args, config):
     note(f"{box.name} purged")
     if box.repo:
         note("Revoke its PAT: https://github.com/settings/personal-access-tokens")
+    return {"name": box.name, "purged": True}
+
+
+def purge_kandev(box, args):
+    """A Kandev sandbox: its serve mappings, the VM, the entry (kandev_remove()),
+    under the lock the reaper also takes. Nothing else of msbctl's exists for it."""
+    rec = kandev_record(box.name, box.entry)["record"]
+    if not args.yes:
+        say(f"Purging {box.name}, Kandev's sandbox for environment {rec['env']}")
+        note("Kandev loses the session's workspace; its next attach fails.")
+        if not confirm(f"purge {box.name}?"):
+            return {"name": box.name, "purged": False}
+    with kandev_lock():
+        entry = read_toml(registry_path_for(box.name))
+        try:
+            if entry.get("source") == "kandev":
+                kandev_remove(box.name, entry, set(kandev_labelled()))
+        except KandevError as exc:
+            if getattr(args, "json", False):
+                raise                   # its code (conflict, unavailable) reaches the JSON
+            die(exc.message)
+    note(f"{box.name} purged")
+    return {"name": box.name, "purged": True}
 
 
 # ------------------------------------------------------------- rename and move
@@ -5823,12 +5880,7 @@ def print_json(data):
 
 def cmd_ls(args, config):
     if args.json:
-        # Everything a human would read goes to stderr meanwhile, so stdout is
-        # exactly one JSON document whatever a probe or a warning says.
-        with contextlib.redirect_stdout(sys.stderr):
-            data = ls_data(args, config)
-        print_json(data)
-        return
+        return ls_data(args, config)        # main() prints it (json_document())
     names = registered()
     remotes = configured_remotes(config)
     if remotes:
@@ -5929,12 +5981,17 @@ def ls_rows(args, config, names):
                      "location": box.location, "repo": box.repo,
                      "ref": box.entry.get("ref", "") if box.is_repo else "",
                      "autostart": box.autostart, "updates": pending})
+        if box.is_kandev:
+            rows[-1]["kandev"] = kandev_record(name, box.entry, table)["record"]
     return rows
 
 
 def ls_data(args, config):
-    """`ls --json`: {"msbctl": version, "sandboxes": [...]}. Never a secret."""
-    return {"msbctl": version_string(), "sandboxes": ls_rows(args, config, registered())}
+    """`ls --json`: {"msbctl": version, "sandboxes": [...]}. Never a secret.
+    Under the Kandev key, Kandev's sandboxes only: the operator's names and
+    folders are none of its business."""
+    names = [n for n, _ in kandev_entries()] if kandev_key() else registered()
+    return {"msbctl": version_string(), "sandboxes": ls_rows(args, config, names)}
 
 
 def cmd_entry(args, config):
@@ -5978,9 +6035,10 @@ def version_lines(box, info):
 
 def show_data(box, table=None):
     """`show --json`: what one sandbox resolves to. Says whether each secret is
-    STORED, never what it is: no value is ever put in here."""
+    STORED, never what it is: no value is ever put in here. For a Kandev
+    sandbox, its record, with agentctl checked live."""
     if box.is_kandev:
-        record = kandev_record(box.name, box.entry, table)["record"]
+        record = kandev_record(box.name, box.entry, table, live=True)["record"]
         return {"name": box.name, "source": "kandev", "state": record["state"],
                 "location": box.location, "kandev": record}
     own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
@@ -6016,10 +6074,7 @@ def show_data(box, table=None):
 
 def cmd_show(args, config):
     if args.json:
-        with contextlib.redirect_stdout(sys.stderr):
-            data = show_data(Sandbox(args.name, config))
-        print_json(data)
-        return
+        return show_data(Sandbox(args.name, config))     # main() prints it
     box = Sandbox(args.name, config)
     table = msb_table()
     info = read_json(VERSIONS_CACHE).get(box.name, {})
@@ -7712,15 +7767,28 @@ def restricted_problem(argv, kandev=False):
     if argv in (["--version"], ["-V"]):
         return None
     if kandev:
-        if not argv or argv[0] != "kandev":
-            return "this key runs `msbctl kandev` verbs only"
+        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge"):
+            return "this key runs `msbctl kandev` verbs, and ls, show, stop and purge with --json"
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 args = build_parser().parse_args(argv)
         except SystemExit:
             return "the command line does not parse"
-        # A listener on the host's address that outlives the ssh session.
-        return "kandev proxy is the host's own service" if args.verb == "proxy" else None
+        if args.func is cmd_kandev:
+            return None
+        # The generic verbs, in the one shape the plugin uses: JSON, explicit
+        # names, nothing that re-probes or prompts. Under this key they see
+        # only Kandev's sandboxes (kandev_guard(), ls_data(), cmd_purge()).
+        if not args.json:
+            return f"{argv[0]}: only with --json"
+        if args.func is cmd_ls:
+            return None if not (args.refresh or args.porcelain or args.picker) else "ls: only --json"
+        names = [args.name] if args.func is cmd_show else list(args.names or [])
+        if len(names) != 1 or not names[0] or not SANDBOX_NAME.fullmatch(names[0]):
+            return f"{argv[0]}: name exactly one sandbox"
+        if args.func is cmd_purge and not args.yes:
+            return "purge: only with -y"
+        return None
     if argv and argv[0] == "kandev":
         return "kandev verbs are for the Kandev plugin's key (`host authorize --kandev`)"
     try:
@@ -7823,7 +7891,7 @@ def host_serve(kandev=False):
     problem = restricted_problem(argv, kandev=kandev)
     if problem:
         refuse(problem)
-    os.environ["MSB_RESTRICTED"] = "1"
+    os.environ["MSB_RESTRICTED"] = "kandev" if kandev else "1"
     # sshd runs a forced command with its own minimal PATH, so an msb in
     # ~/.local/bin (where get.sh puts it) would not be found by any verb.
     here = os.path.dirname(os.path.realpath(__file__))
@@ -8073,23 +8141,28 @@ def cmd_host(args, config):
     elif args.action == "autostart":
         host_autostart(args)
     elif args.action == "kandev":
-        host_kandev(args)
+        host_kandev(args, config)
 
 
 # ----------------------------------------------------------------- kandev
 #
 # This machine as a sandbox host for Kandev. The Kandev plugin drives it the
 # way a laptop drives a remote: `ssh host msbctl kandev <verb> …`, through
-# `host serve --kandev`, which admits these verbs and nothing else. There is
-# no daemon: each verb runs, prints ONE JSON document on stdout, and exits.
+# `host serve --kandev`, which admits these verbs, plus `ls`, `show`, `stop`
+# and `purge` with --json, and nothing else. `kandev` holds only what needs
+# Kandev's own input; listing, inspecting, stopping and removing are the
+# generic verbs, which under that key see Kandev's sandboxes alone. Each run
+# prints ONE JSON document on stdout (json_document()) and exits. The one
+# long-running piece is the host's own TLS proxy (`host kandev proxy`).
 #
 # Three rules shape everything below:
 #
 #   Kandev's sandboxes are a world of their own. They are found only through
 #   registry entries with `source = "kandev"` (and the msb label for orphans),
-#   by Kandev environment id. No kandev verb reaches one of the operator's
-#   sandboxes, whatever it is called, and the operator's verbs may only look
-#   at, shell into and list Kandev's (kandev_guard()).
+#   by Kandev environment id or, for the generic verbs under the Kandev key,
+#   by name among those entries alone. Nothing the plugin runs reaches one of
+#   the operator's sandboxes, whatever it is called, and the operator's verbs
+#   may only look at, shell into, stop and purge Kandev's (kandev_guard()).
 #
 #   No secret value goes into argv, a file, stdout or a log. Profile secrets,
 #   registry passwords and agentctl's bootstrap nonce arrive on stdin and go
@@ -8366,7 +8439,8 @@ def kandev_state(name, entry, table):
 
 
 def kandev_record(name, entry, table=None, live=False):
-    """The document provision, inspect, find, start, stop and expiry return.
+    """The document provision, start and expiry return, and `kandev` in what
+    `ls --json` and `show --json` (agentctl checked live) say of one.
     Names, ports and timestamps only: no value of any kind of secret."""
     table = msb_table() if table is None else table
     state = kandev_state(name, entry, table)
@@ -8684,7 +8758,7 @@ def kandev_serve(mode, name, ports, on, strict=True):
 
 
 def kandev_proxy_running():
-    """Whether `msbctl kandev proxy` runs: it holds KANDEV_PROXY_LOCK for life."""
+    """Whether `msbctl host kandev proxy` runs: it holds KANDEV_PROXY_LOCK for life."""
     try:
         fh = open(KANDEV_PROXY_LOCK, encoding="utf-8")
     except OSError:
@@ -8959,13 +9033,6 @@ def kandev_health(args, config, settings):
     }
 
 
-def kandev_list(args, config, settings):
-    table = msb_table()
-    return {"sandboxes": [
-        {"env": e.get("kandev_env", ""), "name": n, "state": kandev_state(n, e, table),
-         "created_at": e.get("created_at", ""), "expires_at": e.get("expires_at", "")}
-        for n, e in kandev_entries()]}
-
 
 def _int_field(req, key, low, high, default=None):
     value = req.get(key, default)
@@ -9169,19 +9236,6 @@ def kandev_agentctl(args, config, settings):
     raise KandevError("unavailable", "agentctl did not answer on its control port")
 
 
-def kandev_inspect(args, config, settings):
-    return kandev_record(*kandev_need(args.env), live=True)
-
-
-def kandev_find(args, config, settings):
-    if not isinstance(args.operation, str) or not args.operation:
-        raise KandevError("invalid_config", "find needs --operation")
-    for name, entry in kandev_entries():
-        if entry.get("operation_id") == args.operation:
-            return kandev_record(name, entry)
-    raise KandevError("not_found", "no kandev entry for that operation")
-
-
 def kandev_start(args, config, settings):
     name, entry = kandev_need(args.env)
     req = kandev_read_header(allow_empty=True)
@@ -9203,15 +9257,6 @@ def kandev_start(args, config, settings):
                agentctl_running=False)
     return kandev_record(name, read_toml(registry_path_for(name)))
 
-
-def kandev_stop(args, config, settings):
-    name, entry = kandev_need(args.env)
-    if state_of(name) == "running":
-        if run(["msb", "stop", name], check=False, quiet=True).returncode != 0:
-            raise KandevError("unavailable", "msb stop failed")
-    if entry.get("state") != "absent":
-        kandev_set(name, state="stopped", agentctl_running=False)
-    return kandev_record(name, read_toml(registry_path_for(name)))
 
 
 def kandev_expiry(args, config, settings):
@@ -9255,7 +9300,7 @@ def kandev_lease(args, config, settings):
                       "headers": {"Authorization": f"Bearer {token}"}}}
 
 
-def kandev_remove(name, entry, settings, labelled):
+def kandev_remove(name, entry, labelled):
     """Serve mappings, then the VM, then the entry: each step only once the one
     before it worked, so a failure leaves the entry for a retry or the reaper.
     A VM under this name that does not carry the Kandev label is not Kandev's
@@ -9268,15 +9313,6 @@ def kandev_remove(name, entry, settings, labelled):
         if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode != 0:
             raise KandevError("unavailable", "msb rm failed — the entry is kept for a retry")
     os.remove(registry_path_for(name))
-
-
-def kandev_destroy(args, config, settings):
-    env = kandev_check_env(args.env)
-    with kandev_lock():
-        found = kandev_lookup(env)
-        if found:
-            kandev_remove(*found, settings, set(kandev_labelled()))
-    return {"destroyed": True}
 
 
 def kandev_reap(args, config, settings):
@@ -9295,7 +9331,7 @@ def kandev_reap(args, config, settings):
                 stuck = state == "creating" and (
                     now - parse_iso(entry.get("created_at"), "created_at")).total_seconds() > KANDEV_STUCK_CREATE
                 if expired or stuck:
-                    kandev_remove(name, entry, settings, labelled)
+                    kandev_remove(name, entry, labelled)
                     out["destroyed"].append(name)
                 elif state == "absent" and entry.get("state") != "absent":
                     kandev_set(name, state="absent", agentctl_running=False)
@@ -9368,7 +9404,7 @@ def kandev_tls(args, config, settings):
 
 # ------------------------------------------------------------- the proxy
 #
-# `msbctl kandev proxy`, the long-running half of serve = "proxy" (a systemd
+# `msbctl host kandev proxy`, the long-running half of serve = "proxy" (a systemd
 # user service from `host kandev install`). One TLS listener per published
 # guest port, on proxy_listen:<public port>; a connection is spliced to that
 # port's 127.0.0.1:<host port> once its first request head carries a lease
@@ -9402,7 +9438,7 @@ class _ProxyListener:
 
 
 def kandev_proxy_log(message):
-    print(f"msbctl kandev proxy: {message}", file=sys.stderr, flush=True)
+    print(f"msbctl host kandev proxy: {message}", file=sys.stderr, flush=True)
 
 
 def kandev_proxy_wanted():
@@ -9548,7 +9584,7 @@ def kandev_proxy(stop=None):
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
-        die("another `msbctl kandev proxy` is already running on this host")
+        die("another `msbctl host kandev proxy` is already running on this host")
     sel = selectors.DefaultSelector()
     listeners, slots = {}, threading.BoundedSemaphore(KANDEV_PROXY_MAX_CONNS)
     ctx, stamp, said, next_scan = None, None, "", 0.0
@@ -9614,78 +9650,131 @@ def kandev_proxy(stop=None):
         lock.close()
 
 
+# Only what needs Kandev's own input or knowledge. The rest is generic:
+# `ls --json` lists, `show NAME --json` inspects, `stop NAME --json` stops and
+# `purge NAME -y --json` destroys; under the Kandev key they see only Kandev's
+# sandboxes. The reaper and the proxy are the host's: `host kandev reap|proxy`.
 KANDEV_VERBS = {
-    "health": kandev_health, "list": kandev_list, "provision": kandev_provision,
-    "agentctl": kandev_agentctl, "inspect": kandev_inspect, "find": kandev_find,
-    "start": kandev_start, "stop": kandev_stop, "expiry": kandev_expiry,
-    "lease": kandev_lease, "destroy": kandev_destroy, "reap": kandev_reap,
-    "tls": kandev_tls,
+    "health": kandev_health, "provision": kandev_provision, "agentctl": kandev_agentctl,
+    "start": kandev_start, "expiry": kandev_expiry, "lease": kandev_lease, "tls": kandev_tls,
 }
 # The verbs that name an environment.
-KANDEV_ENV_VERBS = ("provision", "agentctl", "inspect", "start", "stop", "expiry", "lease", "destroy")
+KANDEV_ENV_VERBS = ("provision", "agentctl", "start", "expiry", "lease")
 
 
-def cmd_kandev(args, config):
-    """`msbctl kandev <verb>`: one JSON document on stdout; exit 0, or 3 with
-    {"error": {"code", "message"}}. Everything else goes to stderr."""
-    if args.verb == "proxy":
-        # The long-running service, not a JSON verb: `host serve --kandev`
-        # refuses it, and systemd runs it (`host kandev install`).
-        try:
-            kandev_proxy()
-        except KeyboardInterrupt:
-            pass
-        return
+def json_document(body):
+    """Run body() and print what it returns as the one JSON document on stdout,
+    then exit 0; on failure, exit 3 with {"error": {"code", "message"}}, the
+    code one of Kandev's (KANDEV_ERROR_CODES). Everything else printed
+    meanwhile goes to stderr. The contract of every `kandev` verb and of
+    `ls`, `show`, `stop` and `purge` with --json."""
     code, data = 0, None
     with contextlib.redirect_stdout(sys.stderr):
         try:
-            settings = kandev_settings(config)
-            if args.verb != "health" and not settings["enabled"]:
-                raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
-            if args.verb in KANDEV_ENV_VERBS and not args.env:
-                raise KandevError("invalid_config", f"kandev {args.verb} needs an environment id")
-            data = KANDEV_VERBS[args.verb](args, config, settings)
+            data = body()
         except KandevError as exc:
             code, data = KANDEV_EXIT_ERROR, {"error": {"code": exc.code, "message": exc.message}}
             if exc.retry_after is not None:
                 data["error"]["retry_after_seconds"] = int(exc.retry_after)
         except SystemExit as exc:
-            code = KANDEV_EXIT_ERROR
-            data = {"error": {"code": "unavailable",
-                              "message": str(exc.code or "").replace("msbctl: ", "", 1)[:300]}}
+            if exc.code:
+                kind = "not_found" if isinstance(exc, NoSuchSandbox) else "unavailable"
+                code = KANDEV_EXIT_ERROR
+                data = {"error": {"code": kind,
+                                  "message": str(exc.code).replace("msbctl: ", "", 1)[:300]}}
         except Exception:                       # the contract is JSON, always
             traceback.print_exc()
             code, data = KANDEV_EXIT_ERROR, {"error": {"code": "unavailable",
                                                        "message": "internal error (see stderr)"}}
-    print_json(data)
+    print_json(data if data is not None else {})
     sys.exit(code)
 
 
-def kandev_guard(args):
-    """Die if the operator's verb in `args` would act on a Kandev sandbox.
+JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge)
 
-    The operator may look at one and shell into it while it runs. Starting one
-    would boot it without its secrets, which exist only in Kandev's requests,
-    and everything else would change what Kandev owns."""
-    if args.func in (cmd_ls, cmd_status, cmd_show, cmd_shell, cmd_exec, cmd_kandev):
-        return
+
+def json_verb(args, config):
+    """`ls`, `show`, `stop` or `purge` with --json: one document for all the
+    names given, built from what each call returns."""
+    if kandev_key() and not kandev_settings(config)["enabled"]:
+        raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
+    if args.func is cmd_purge and not args.yes:
+        die("purge --json needs -y: there is no one to ask")
+    if not hasattr(args, "names"):
+        kandev_guard(args)
+        return args.func(args, config)
+    results = []
+    for name in args.names:
+        if split_remote(name):
+            die(f"{name}: --json answers for this machine's sandboxes only")
+        args.name = name
+        kandev_guard(args)
+        results.append(args.func(args, config))
+    if args.func is cmd_purge:
+        return {"purged": [r["name"] for r in results if r["purged"]],
+                "absent": [r["name"] for r in results if not r["purged"]]}
+    return {"sandboxes": results}
+
+
+def cmd_kandev(args, config):
+    """`msbctl kandev <verb>`: one JSON document on stdout (json_document())."""
+    def body():
+        settings = kandev_settings(config)
+        if args.verb != "health" and not settings["enabled"]:
+            raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
+        if args.verb in KANDEV_ENV_VERBS and not args.env:
+            raise KandevError("invalid_config", f"kandev {args.verb} needs an environment id")
+        return KANDEV_VERBS[args.verb](args, config, settings)
+    json_document(body)
+
+
+def kandev_guard(args):
+    """Keep operator verbs and Kandev's sandboxes apart, both ways.
+
+    The operator may look at one, shell into it while it runs, and stop or
+    purge it at the host itself; never from the laptop's restricted key.
+    Starting one would boot it without its secrets, which exist only in
+    Kandev's requests, and everything else would change what Kandev owns.
+
+    Under the Kandev key, `show` and `stop` see only Kandev's sandboxes: any
+    other name is not found. (`purge` makes the same check itself, since a
+    name with nothing under it is a success there.)"""
     names = [getattr(args, "name", None)] + list(getattr(args, "names", None) or [])
     for name in names:
         if not name or split_remote(name) or not SANDBOX_NAME.fullmatch(str(name)):
             continue
         path = registry_path_for(name)
-        if os.path.exists(path) and read_toml(path).get("source") == "kandev":
-            die(f"{name} is a Kandev sandbox: Kandev owns it. You can ls, show, and shell or exec "
-                f"into it while it runs; `msbctl kandev destroy {read_toml(path).get('kandev_env', '…')}` "
-                "removes it.")
+        entry = read_toml(path) if os.path.exists(path) else {}
+        if kandev_key():
+            if args.func in (cmd_show, cmd_stop) and entry.get("source") != "kandev":
+                raise NoSuchSandbox(name)
+            continue
+        if entry.get("source") != "kandev":
+            continue
+        if args.func in (cmd_ls, cmd_status, cmd_show, cmd_shell, cmd_exec, cmd_kandev, cmd_host):
+            continue
+        if args.func in (cmd_stop, cmd_purge) and not restricted():
+            continue
+        die(f"{name} is a Kandev sandbox: Kandev owns it. You can ls, show, and shell or exec "
+            f"into it while it runs, and stop or purge it on this host itself.")
 
 
-def host_kandev(args):
-    """`host kandev install`: the reaper as a systemd user timer (not a daemon:
-    every minute it runs `msbctl kandev reap` once, which exits), and the TLS
-    proxy as a service. The proxy listens on nothing unless serve = "proxy"."""
+def host_kandev(args, config):
+    """`host kandev install|reap|proxy`. What runs on the host for Kandev and
+    is never the plugin's to call: `reap`, one pass of the reaper (a JSON
+    summary), `proxy`, the TLS proxy (long-running), and `install`, which runs
+    the first every minute from a systemd user timer and the second as a user
+    service. The proxy listens on nothing unless serve = "proxy"."""
+    if args.arg == "reap":
+        json_document(lambda: kandev_reap(args, config, kandev_settings(config)))
+    if args.arg == "proxy":
+        try:
+            kandev_proxy()
+        except KeyboardInterrupt:
+            pass
+        return
     if args.arg != "install":
-        die("host kandev: the only action is `install`")
+        die("host kandev: install, reap or proxy")
     me = shutil.which("msbctl") or os.path.realpath(__file__)
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     path_env = f"{os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"
@@ -9701,7 +9790,7 @@ Description=msb-manager: reap expired Kandev sandboxes
 [Service]
 Type=oneshot
 Environment=PATH={path_env}
-ExecStart={me} kandev reap
+ExecStart={me} host kandev reap
 """)
     with open(timer, "w", encoding="utf-8") as fh:
         fh.write("""# Written by `msbctl host kandev install`.
@@ -9727,7 +9816,7 @@ Description=msb-manager: TLS proxy for Kandev's sandboxes
 [Service]
 Type=simple
 Environment=PATH={path_env}
-ExecStart={me} kandev proxy
+ExecStart={me} host kandev proxy
 Restart=always
 RestartSec=5
 
@@ -10870,6 +10959,9 @@ def build_parser():
         if verb == "start":
             p.add_argument("--autostart", action="store_true",
                            help="no names: every sandbox whose entry says autostart = true")
+        if verb == "stop":
+            p.add_argument("--json", action="store_true",
+                           help="one JSON document: what `show --json` says of each, after")
         p.set_defaults(func=func)
 
     # Single-name on purpose: each of these hands the terminal to one thing.
@@ -10886,9 +10978,11 @@ def build_parser():
     p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
     p.set_defaults(func=cmd_rebuild)
 
-    p = sub.add_parser("purge", help="destroy and deregister")
+    p = sub.add_parser("purge", help="destroy and deregister (a name with nothing under it is fine)")
     p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
     p.add_argument("-y", "--yes", action="store_true", help="skip the prompt")
+    p.add_argument("--json", action="store_true",
+                   help='with -y: one JSON document, {"purged": [...], "absent": [...]}')
     p.set_defaults(func=cmd_purge)
 
     p = sub.add_parser("rename", help="give a sandbox a new name (recreates it, keeps its state)")
@@ -10997,8 +11091,9 @@ def build_parser():
 
     p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
     p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
-    p.add_argument("arg", nargs="?", metavar="KEY|install",
-                   help="authorize: one public key line, quoted; autostart, kandev: install")
+    p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy",
+                   help="authorize: one public key line, quoted; autostart: install; "
+                   "kandev: install, reap (one pass) or proxy (the TLS proxy, long-running)")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
     p.add_argument("--kandev", action="store_true",
@@ -11011,12 +11106,11 @@ def build_parser():
     p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",
                        description="Verbs the Kandev plugin runs over ssh. Each prints one JSON "
                        "document; secrets, the agentctl binary, its nonce and a TLS key come on stdin. "
-                       "`kandev proxy` is not one of them: it is the host's long-running TLS "
-                       "proxy (serve = \"proxy\"), run by `host kandev install`'s service.")
-    p.add_argument("verb", choices=[*KANDEV_VERBS, "proxy"])
+                       "Listing, inspecting, stopping and removing Kandev's sandboxes are "
+                       "`ls`, `show`, `stop` and `purge` with --json.")
+    p.add_argument("verb", choices=list(KANDEV_VERBS))
     p.add_argument("env", nargs="?", metavar="ENV", help="the Kandev environment id (tls: install)")
     p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
-    p.add_argument("--operation", metavar="OP", help="find: the Kandev operation id")
     p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")
     p.set_defaults(func=cmd_kandev)
 
@@ -11104,6 +11198,8 @@ def main():
                 args.name = resolve_here(args.name)
             if hasattr(args, "names"):
                 args.names = [n if split_remote(n) else resolve_here(n) for n in args.names or [None]]
+        if getattr(args, "json", False) and args.func in JSON_VERBS:
+            json_document(lambda: json_verb(args, config))
         if not hasattr(args, "names"):
             kandev_guard(args)
             args.func(args, config)

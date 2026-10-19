@@ -66,7 +66,13 @@ fields for scripts; `--picker` is the format `msb-picker` reads. `--json` prints
 one JSON document, `{"msbctl": version, "sandboxes": [...]}`, each with
 `name`, `state`, `source`, `location`, `repo`, `ref`, `autostart` and
 `updates`: this machine's sandboxes only, which is what a laptop asks a
-remote for.
+remote for. A [Kandev](kandev.md) sandbox's row also has `kandev`, its record.
+
+With `--json`, `ls`, `show`, `stop` and `purge` print exactly one JSON
+document on stdout, everything else going to stderr, and exit 0. On failure
+they exit 3 with `{"error": {"code": …, "message": …}}`. The code is
+`not_found` for a name with no sandbox under it, else `unavailable` (or, under
+the Kandev key, `denied` and `conflict`).
 
 ### `msbctl status`
 
@@ -89,7 +95,7 @@ Everything about one sandbox: resources, disks, extra folders, installed
 versions, environment, every egress rule in the order it's emitted, and the
 identity, keys and secrets bound to it. `--json` prints the essentials as one
 JSON document; for each secret it says whether a value is **stored**, never
-what it is.
+what it is. For a Kandev sandbox it's its record, with agentctl checked live.
 
 ### `msbctl config`
 
@@ -126,10 +132,11 @@ and so does the unit [`msbctl host autostart install`](#msbctl-host) writes.
 ### `msbctl stop`
 
 ```text
-msbctl stop [name…]
+msbctl stop [name…] [--json]
 ```
 
-Stop it. Everything is kept.
+Stop it. Everything is kept. `--json` prints `{"sandboxes": [...]}`, what
+`show --json` says of each afterwards.
 
 ### `msbctl rebuild`
 
@@ -145,13 +152,17 @@ hand don't. Doesn't ask first.
 ### `msbctl purge`
 
 ```text
-msbctl purge [name…] [-y]
+msbctl purge [name…] [-y] [--json]
 ```
 
 Destroy the sandbox and deregister it: the VM, its Claude state, its disk
 volumes, its secrets file and its registry entry. Your project folder is never
 touched. Lists exactly what it will delete, and asks once per sandbox unless
-`-y` is given. Remember to revoke its GitHub token too.
+`-y` is given. Remember to revoke its GitHub token too. A name with nothing
+registered under it isn't an error: it says "nothing found" and succeeds, so
+purging twice is fine. `--json` (with `-y`, since it can't ask) prints
+`{"purged": [...], "absent": [...]}`. A Kandev sandbox loses its VM and its
+entry; nothing else of msbctl's exists for one.
 
 ### `msbctl rename`
 
@@ -390,7 +401,7 @@ msbctl host serve [--kandev]
 msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
-msbctl host kandev install
+msbctl host kandev install | reap | proxy
 ```
 
 For running this machine as a [remote host](remote-hosts.md). `serve` is the
@@ -403,21 +414,22 @@ adds a key to `~/.ssh/authorized_keys` with that forced command, or with
 `autostart install` writes and enables a systemd user unit that runs `msbctl
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
 `--kandev` is the [Kandev plugin's key](kandev.md#the-plugin-key): its line
-runs `host serve --kandev`, which admits `msbctl kandev` verbs and nothing
-else, while the everyday key runs none of them. `kandev install` writes and
-enables the [reaper](kandev.md#the-reaper)'s systemd user timer and the
-[TLS proxy](kandev.md#the-tls-proxy)'s service, and restarts the proxy.
+runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`,
+`show`, `stop` and `purge` with `--json` (seeing only Kandev's sandboxes),
+while the everyday key runs no `kandev` verb. `kandev reap` is one pass of the
+[reaper](kandev.md#the-reaper), and `kandev proxy` is the
+[TLS proxy](kandev.md#the-tls-proxy). `kandev install` writes and enables a
+systemd user timer for the first and a service for the second, and restarts
+the proxy.
 
 ### `msbctl kandev`
 
 ```text
-msbctl kandev health | list | reap
-msbctl kandev provision|agentctl|inspect|start|stop|destroy ENV
-msbctl kandev find --operation OP
+msbctl kandev health
+msbctl kandev provision|agentctl|start ENV
 msbctl kandev expiry ENV --at TIME
 msbctl kandev lease ENV PORT
 msbctl kandev tls install
-msbctl kandev proxy
 ```
 
 What the Kandev plugin runs over ssh to keep [Kandev's sandboxes](kandev.md)
@@ -425,9 +437,10 @@ on this host. Each prints one JSON document on stdout and exits 0, or 3 with
 `{"error": {"code", "message"}}`; secrets, the agentctl binary and its nonce,
 and the certificate and key for `tls install` come on stdin. Off until
 `[kandev] enabled = true`. [Every verb](kandev.md#the-verbs) is described on
-the Kandev hosts page. `proxy` is not one of them: it's the
-[TLS proxy](kandev.md#the-tls-proxy), the long-running service `host kandev
-install` sets up, and the plugin's key can't run it.
+the Kandev hosts page. Only what needs Kandev's own input is here: the plugin
+lists, inspects, stops and removes Kandev's sandboxes with `ls`, `show`, `stop`
+and `purge` and `--json`, and the reaper and the TLS proxy are
+[`host kandev reap|proxy`](#msbctl-host).
 
 ### `msbctl remote`
 
