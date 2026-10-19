@@ -91,7 +91,7 @@ other port is ever needed.
 
 With `serve = "proxy"`, the default, each of the four also gets a public TLS
 port on `proxy_listen`, and a lease is `https://<base_url's host>:<that port>`
-with a token in its `Authorization` header, valid for 10 minutes (see
+with a token for its `X-Msb-Lease` header, reported to expire in 10 minutes (see
 [the TLS proxy](#the-tls-proxy)). Kandev talks to this host directly, and needs
 no Tailscale: headscale, WireGuard or a LAN work as well.
 
@@ -164,12 +164,15 @@ secret.
 written by `host kandev install`. With `serve = "proxy"` it listens on
 `proxy_listen`, one TLS port per published guest port. For each connection it
 completes the handshake, reads the first request head (16 KiB, 10 s at most)
-and checks its `Authorization: Bearer` token. A token for another sandbox,
-another port or an earlier generation gets a fixed `401` and the connection
-closes. A valid one is spliced to that port's `127.0.0.1` port, and from then
-on bytes pass both ways untouched until either side closes, so WebSockets and
-streaming need nothing special. There is no path routing: one port per lease
-means a connection can only ever reach one VM port.
+and checks the token in its one `X-Msb-Lease` header. A missing token, two of
+them, or one for another sandbox, another port or an earlier provision of the
+same name gets a fixed `401`, and the connection closes. A valid one is spliced
+to that port's `127.0.0.1` port, and from then on bytes pass both ways
+untouched until either side closes, so WebSockets and streaming need nothing
+special. `Authorization` is never looked at: it carries Kandev's own token for
+agentctl, and reaches the guest as it was sent (which is also why the lease
+can't use it: Kandev refuses a lease that sets it). There is no path routing:
+one port per lease means a connection can only ever reach one VM port.
 
 - **The certificate** comes from the Kandev plugin, which acts as a small
   certificate authority: a root name-constrained to your hosts' domain,
@@ -182,17 +185,24 @@ means a connection can only ever reach one VM port.
   `not_after`, which drives the plugin's renewal, and `issuer_sha256`, the
   SHA-256 of the issuing certificate, so the plugin can tell a certificate from
   an old root.
-- **Tokens** are `v1.<expiry>.<HMAC-SHA256>` over the sandbox's name, the guest
-  port, the generation and the expiry, keyed by 32 random bytes in
+- **Tokens** are `v1.<valid_until>.<HMAC-SHA256>` over the sandbox's name, the
+  guest port, its incarnation (its `created_at` and a value drawn at
+  provision) and `valid_until`, keyed by 32 random bytes in
   `~/.local/state/msb/kandev/lease.key`. `lease` and the proxy share nothing
-  else, so a proxy restart invalidates no lease. A token is accepted until its
-  expiry plus 30 s of clock skew. `kandev start` bumps the generation, which
-  retires every earlier token.
+  else, so a proxy restart invalidates no lease. A lease reports `expires_at`
+  10 minutes out, but its token is accepted until `valid_until`, 15 minutes
+  out, plus 30 s of clock skew: Kandev asks for a new lease only 30 s before
+  `expires_at`, and keeps using the one it has until then, whatever it's
+  answered. For the same reason a token survives a stop and start (they bump
+  `generation`, not the incarnation); only a destroy and a new provision
+  retire it.
+- **Rotating the key:** `msbctl host kandev rotate-lease-key` makes a new one
+  and keeps the old one as `lease.key.prev`, still accepted for 15 minutes,
+  so no lease already handed out breaks. Rotate at most every 15 minutes.
 - **What it follows:** the Kandev entries. It looks every 2 seconds, so a new
   sandbox's ports open within that. A destroyed sandbox's ports close, and
   their open connections are cut. It also re-reads the entry on every
-  connection, so a destroyed sandbox refuses at once, and a new generation's
-  token works as soon as `start` returns.
+  connection, so a destroyed sandbox refuses at once.
 - **What it logs:** the sandbox, the guest port and the outcome, one line per
   connection, in the service's journal. Never a token, a request head or
   anything that passes through.

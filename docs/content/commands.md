@@ -401,7 +401,7 @@ msbctl host serve [--kandev]
 msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
-msbctl host kandev install | reap | proxy
+msbctl host kandev install | reap | proxy | rotate-lease-key
 ```
 
 For running this machine as a [remote host](remote-hosts.md). `serve` is the
@@ -418,7 +418,9 @@ runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`,
 `show`, `stop` and `purge` with `--json` (seeing only Kandev's sandboxes),
 while the everyday key runs no `kandev` verb. `kandev reap` is one pass of the
 [reaper](kandev.md#the-reaper), and `kandev proxy` is the
-[TLS proxy](kandev.md#the-tls-proxy). `kandev install` writes and enables a
+[TLS proxy](kandev.md#the-tls-proxy); `kandev rotate-lease-key` replaces the key
+its tokens are signed with, honouring the old one for 15 minutes. `kandev
+install` writes and enables a
 systemd user timer for the first and a service for the second, and restarts
 the proxy.
 

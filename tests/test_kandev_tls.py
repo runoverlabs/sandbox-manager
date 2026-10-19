@@ -20,6 +20,8 @@ from unittest import mock, skipUnless
 from tests.test_kandev import KandevTest, PLANTED_NPM
 
 HAVE_OPENSSL = shutil.which("openssl") is not None
+# What Kandev sends as Authorization on every request, for agentctl itself.
+AGENTCTL_TOKEN = "planted-agentctl-token"
 
 
 def _openssl(*argv, cwd):
@@ -209,19 +211,41 @@ class Leases(TlsTest):
         lease = self.ok("lease", "6f1c2b9e", "8765")["lease"]
         self.assertEqual(lease["base_url"], f"https://localhost:{public[8765]}")
         self.assertEqual(lease["generation"], "1")
-        token = lease["headers"]["Authorization"].removeprefix("Bearer ")
-        key = self.m.kandev_lease_key(create=False)
+        # Never Authorization: Kandev refuses a lease that sets it.
+        self.assertEqual(list(lease["headers"]), ["X-Msb-Lease"])
+        token = lease["headers"]["X-Msb-Lease"]
         self.assertEqual(os.stat(self.m.KANDEV_LEASE_KEY).st_mode & 0o777, 0o600)
+        keys = self.m.kandev_lease_keys()
+        me = self.m.kandev_incarnation(entry)
         ok = self.m.kandev_token_ok
-        self.assertTrue(ok(key, token, rec["name"], 8765, 1))
-        self.assertFalse(ok(key, token, "k-other", 8765, 1))
-        self.assertFalse(ok(key, token, rec["name"], 41001, 1))
-        self.assertFalse(ok(key, token, rec["name"], 8765, 2))
-        self.assertFalse(ok(os.urandom(32), token, rec["name"], 8765, 1))
-        expiry = int(token.split(".")[1])
-        self.assertTrue(ok(key, token, rec["name"], 8765, 1, now=expiry + 29))
-        self.assertFalse(ok(key, token, rec["name"], 8765, 1, now=expiry + 31))
-        self.assertFalse(ok(key, token[:-1] + ("A" if token[-1] != "A" else "B"), rec["name"], 8765, 1))
+        self.assertTrue(ok(keys, token, rec["name"], 8765, me))
+        self.assertFalse(ok(keys, token, "k-other", 8765, me))
+        self.assertFalse(ok(keys, token, rec["name"], 41001, me))
+        self.assertFalse(ok(keys, token, rec["name"], 8765, me + "x"))     # another incarnation
+        self.assertFalse(ok([os.urandom(32)], token, rec["name"], 8765, me))
+        self.assertFalse(ok(keys, token[:-1] + ("A" if token[-1] != "A" else "B"), rec["name"], 8765, me))
+        # Reported to expire in 10 minutes, accepted for 15 (plus the skew).
+        expires = self.m.parse_iso(lease["expires_at"]).timestamp()
+        valid_until = int(token.split(".")[1])
+        self.assertEqual(valid_until - expires, 300)
+        self.assertTrue(ok(keys, token, rec["name"], 8765, me, now=valid_until + 29))
+        self.assertFalse(ok(keys, token, rec["name"], 8765, me, now=valid_until + 31))
+
+    def test_a_rotated_key_is_accepted_for_15_minutes(self):
+        self.install()
+        self.provision()
+        token = self.ok("lease", "6f1c2b9e", "8765")["lease"]["headers"]["X-Msb-Lease"]
+        me = self.m.kandev_incarnation(self.m.read_toml(self.entry_path("k-6f1c2b9e")))
+        code, _, err = self.run_main("host", "kandev", "rotate-lease-key")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.exists(self.m.KANDEV_LEASE_KEY_PREV))
+        self.assertTrue(self.m.kandev_token_ok(self.m.kandev_lease_keys(), token, "k-6f1c2b9e", 8765, me))
+        fresh = self.ok("lease", "6f1c2b9e", "8765")["lease"]["headers"]["X-Msb-Lease"]
+        self.assertNotEqual(fresh, token)
+        past = time.time() - self.m.KANDEV_LEASE_VALID - 1
+        os.utime(self.m.KANDEV_LEASE_KEY_PREV, (past, past))
+        self.assertFalse(self.m.kandev_token_ok(self.m.kandev_lease_keys(), token, "k-6f1c2b9e", 8765, me))
+        self.assertTrue(self.m.kandev_token_ok(self.m.kandev_lease_keys(), fresh, "k-6f1c2b9e", 8765, me))
 
     def test_two_sandboxes_never_share_a_public_port(self):
         self.provision("e1", operation_id="op-1")
@@ -329,17 +353,19 @@ class Proxy(TlsTest):
         self.fail(f"port {port} still {'refuses' if listening else 'accepts'} after 5 s")
 
     def lease(self, env, guest):
+        """(public port, the lease token)."""
         lease = self.ok("lease", env, str(guest))["lease"]
-        return int(lease["base_url"].rsplit(":", 1)[1]), lease["headers"]["Authorization"]
+        return int(lease["base_url"].rsplit(":", 1)[1]), lease["headers"]["X-Msb-Lease"]
 
-    def request(self, port, auth=None):
-        """(the client's TLS socket, the first line it reads back)."""
+    def request(self, port, lease=None, extra=""):
+        """(the client's TLS socket, the first line it reads back). As Kandev
+        sends it: the lease headers, and its own Authorization for agentctl."""
         raw = socket.create_connection(("127.0.0.1", port), timeout=5)
         tls = self.client_ctx.wrap_socket(raw, server_hostname="localhost")
-        head = b"GET / HTTP/1.1\r\nHost: localhost\r\n"
-        if auth:
-            head += f"Authorization: {auth}\r\n".encode()
-        tls.sendall(head + b"\r\n")
+        head = f"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {AGENTCTL_TOKEN}\r\n"
+        if lease:
+            head += f"X-Msb-Lease: {lease}\r\n"
+        tls.sendall((head + extra + "\r\n").encode())
         line = b""
         while not line.endswith(b"\n"):
             chunk = tls.recv(1)
@@ -348,62 +374,77 @@ class Proxy(TlsTest):
             line += chunk
         return tls, line.decode()
 
-    def assert_refused(self, port, auth=None):
-        tls, line = self.request(port, auth)
+    def assert_refused(self, port, lease=None, extra=""):
+        tls, line = self.request(port, lease, extra)
         tls.close()
         self.assertTrue(line.startswith("HTTP/1.1 401"), line)
 
     def test_a_lease_reaches_its_port_and_splices_both_ways(self):
-        port, auth = self.lease("e1", 8765)
-        tls, line = self.request(port, auth)
+        port, token = self.lease("e1", 8765)
+        tls, line = self.request(port, token)
         with tls:
             self.assertEqual(line, "k-e1:8765\n")
             echoed = b""
             while not echoed.endswith(b"\r\n\r\n"):
                 echoed += tls.recv(4096)
             self.assertTrue(echoed.startswith(b"GET / HTTP/1.1\r\n"))
+            # agentctl's own Authorization reaches the guest untouched.
+            self.assertIn(f"Authorization: Bearer {AGENTCTL_TOKEN}\r\n".encode(), echoed)
             time.sleep(0.5)                 # idle, then more traffic, as a WebSocket would
             tls.sendall(b"ping")
             self.assertEqual(tls.recv(4), b"ping")
 
     def test_refusals(self):
-        port, auth = self.lease("e1", 8765)
+        port, token = self.lease("e1", 8765)
         self.assert_refused(port)
-        self.assert_refused(port, "Bearer v1.1.x")
+        self.assert_refused(port, "v1.1.x")
         _, other_sandbox = self.lease("e2", 8765)
         self.assert_refused(port, other_sandbox)
         _, other_port = self.lease("e1", 41001)
         self.assert_refused(port, other_port)
         key = self.m.kandev_lease_key(create=False)
-        old = self.m.kandev_token(key, "k-e1", 8765, 1, int(time.time()) - 60)
-        self.assert_refused(port, f"Bearer {old}")
-        two = auth + "\r\nAuthorization: " + auth
-        self.assert_refused(port, two)
+        me = self.m.kandev_incarnation(self.m.read_toml(self.entry_path("k-e1")))
+        old = self.m.kandev_token(key, "k-e1", 8765, me, int(time.time()) - 60)
+        self.assert_refused(port, old)
+        self.assert_refused(port, token, extra=f"X-Msb-Lease: {token}\r\n")        # two
+        # A valid token anywhere but X-Msb-Lease is nothing.
+        self.assert_refused(port, None, extra=f"Authorization: Bearer {token}\r\n")
 
     def test_ports_never_cross(self):
         for rec in (self.e1, self.e2):
             for guest, public in self.public(rec["name"]).items():
-                port, auth = self.lease(rec["env"], guest)
+                port, token = self.lease(rec["env"], guest)
                 self.assertEqual(port, public)
-                tls, line = self.request(port, auth)
+                tls, line = self.request(port, token)
                 tls.close()
                 self.assertEqual(line, f"{rec['name']}:{guest}\n")
 
-    def test_a_new_generation_refuses_the_old_token(self):
-        port, auth = self.lease("e1", 8765)
+    def test_a_token_survives_stop_and_start_but_not_reprovision(self):
+        port, token = self.lease("e1", 8765)
         self.stop("k-e1")
         start = json.dumps({"secrets": [{"name": "NPM_TOKEN", "value": PLANTED_NPM}]}) + "\n"
         self.assertEqual(self.ok("start", "e1", stdin=start)["record"]["generation"], 2)
-        self.assert_refused(port, auth)
-        port, auth = self.lease("e1", 8765)
-        tls, line = self.request(port, auth)
+        # Kandev keeps the lease it holds until it refreshes it.
+        tls, line = self.request(port, token)
+        tls.close()
+        self.assertEqual(line, "k-e1:8765\n")
+        # Destroyed and provisioned again, within the same second even: a new
+        # incarnation, which the old token is not for.
+        self.purge("k-e1")
+        again = self.provision("e1", operation_id="op-3")
+        self.backends.append(EchoBackend(again["ports"]["8765"], "k-e1:8765"))
+        port = self.public("k-e1")[8765]
+        self.wait_for(port, listening=True)
+        self.assert_refused(port, token)
+        port, token = self.lease("e1", 8765)
+        tls, line = self.request(port, token)
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
 
     def test_a_destroyed_sandboxs_port_refuses(self):
         ports = self.public("k-e2")
-        port, auth = self.lease("e2", 8765)
-        tls, line = self.request(port, auth)            # open across the destroy
+        port, token = self.lease("e2", 8765)
+        tls, line = self.request(port, token)            # open across the destroy
         self.assertEqual(line, "k-e2:8765\n")
         self.purge("k-e2")
         for public in ports.values():
@@ -415,16 +456,16 @@ class Proxy(TlsTest):
                 continue
         tls.close()
         # e1 is untouched.
-        port, auth = self.lease("e1", 8765)
-        tls, line = self.request(port, auth)
+        port, token = self.lease("e1", 8765)
+        tls, line = self.request(port, token)
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
 
     def test_logs_hold_no_token(self):
-        port, auth = self.lease("e1", 8765)
-        tls, _ = self.request(port, auth)
+        port, token = self.lease("e1", 8765)
+        tls, _ = self.request(port, token)
         tls.close()
-        self.assert_refused(port, auth + "x")
+        self.assert_refused(port, token + "x")
         deadline = time.monotonic() + 5
         while not {"forwarded", "unauthorized"} <= {m.rsplit(" ", 1)[-1] for m in self.logs} \
                 and time.monotonic() < deadline:
@@ -433,10 +474,10 @@ class Proxy(TlsTest):
         outcomes = [m.rsplit(" ", 1)[-1] for m in self.logs if "k-e1 8765" in m]
         self.assertIn("forwarded", outcomes)
         self.assertIn("unauthorized", outcomes)
-        token = auth.removeprefix("Bearer ")
         for message in self.logs:
             self.assertNotIn(token, message)
-            self.assertNotIn("Authorization", message)
+            self.assertNotIn(AGENTCTL_TOKEN, message)
+            self.assertNotIn("X-Msb-Lease", message)
 
     def test_one_proxy_per_host(self):
         code, _, err = self.run_main("host", "kandev", "proxy")

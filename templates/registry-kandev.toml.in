@@ -24,6 +24,9 @@ cpus         = {{CPUS}}
 memory       = "{{MEMORY}}"
 root_disk    = "{{DISK}}"
 created_at     = "{{CREATED}}"
+# Drawn at provision; with created_at, what a lease token is bound to (one
+# provision of this name, through stops and starts).
+incarnation    = "{{INCARNATION}}"
 expires_at     = "{{EXPIRES}}"
 max_expires_at = "{{EXPIRES}}"
 # Bumped on every start; Kandev drops idle connections when it changes.

@@ -10,7 +10,7 @@ release notes.
 
 ### Added
 - Kandev sandbox hosts: `msbctl kandev …` lets the Kandev plugin run one microVM per session here over ssh, listing, inspecting, stopping and removing them with `ls`, `show`, `stop` and `purge` and `--json` (`host authorize --kandev`, `host kandev install|reap|proxy`); off until `[kandev] enabled = true`, see the "Kandev hosts" page.
-- Kandev hosts serve sandboxes through their own TLS proxy (`[kandev] serve = "proxy"`, the new default; set `proxy_listen`): the plugin installs a certificate with `kandev tls install`, leases carry a short-lived token, and `health` reports `tls`. Re-run `msbctl host kandev install` to get the proxy's service, or set `serve = "tailscale"` to keep `tailscale serve`.
+- Kandev hosts serve sandboxes through their own TLS proxy (`[kandev] serve = "proxy"`, the new default; set `proxy_listen`): the plugin installs a certificate with `kandev tls install`, leases carry a short-lived token in `X-Msb-Lease` that survives a stop and start (`host kandev rotate-lease-key` replaces its key), and `health` reports `tls`. Re-run `msbctl host kandev install` to get the proxy's service, or set `serve = "tailscale"` to keep `tailscale serve`.
 - `msbctl stop --json` and `msbctl purge -y --json` print one JSON document, as `ls --json` and `show --json` do.
 - Kandev `health` reports `serve.ok = false` in `tailscale` mode when the tailnet issues no certificates (headscale).
 - The `go` egress group allows `vuln.go.dev`, for `govulncheck`; existing sandboxes need a rebuild.

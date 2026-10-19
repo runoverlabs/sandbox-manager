@@ -8187,6 +8187,10 @@ KANDEV_EXIT_ERROR = 3
 KANDEV_HEADER_MAX = 64 * 1024
 KANDEV_AGENTCTL_MAX = 512 * 1024 * 1024
 KANDEV_LEASE_SECONDS = 600
+# How long the proxy accepts a lease's token: past the expires_at it reports.
+# Kandev refreshes a lease only 30 s before expires_at, and a 401 does not make
+# it ask again, so a token must outlive the expiry it was given with.
+KANDEV_LEASE_VALID = 900
 KANDEV_STUCK_CREATE = 15 * 60       # past Kandev's own 10-minute provision deadline
 KANDEV_ORPHAN_AGE = 3600
 KANDEV_AGENTCTL_WAIT = 30
@@ -8202,7 +8206,14 @@ KANDEV_TLS_DIR = os.path.join(CONFIG_DIR, "kandev", "tls")
 KANDEV_TLS_CERT = os.path.join(KANDEV_TLS_DIR, "cert.pem")
 KANDEV_TLS_KEY = os.path.join(KANDEV_TLS_DIR, "key.pem")
 # Beside the per-sandbox dirs (STATE_DIR/kandev/k-…), which a dot never names.
+# `host kandev rotate-lease-key` moves the key to .prev, which the proxy keeps
+# accepting for KANDEV_LEASE_VALID after the change (its mtime), so no lease
+# already handed out stops working.
 KANDEV_LEASE_KEY = os.path.join(STATE_DIR, "kandev", "lease.key")
+KANDEV_LEASE_KEY_PREV = KANDEV_LEASE_KEY + ".prev"
+# The header a lease's token travels in. Not Authorization: Kandev refuses a
+# lease that sets it, and sets it itself on every request, for agentctl.
+KANDEV_LEASE_HEADER = "X-Msb-Lease"
 # Held by the running proxy: one proxy per host, and how `health` knows it runs.
 KANDEV_PROXY_LOCK = os.path.join(STATE_DIR, "kandev", "proxy.lock")
 KANDEV_HEAD_MAX = 16 * 1024
@@ -8210,8 +8221,7 @@ KANDEV_HEAD_WAIT = 10
 KANDEV_TOKEN_SKEW = 30
 KANDEV_PROXY_SCAN = 2               # seconds: a destroyed sandbox's port refuses within this
 KANDEV_PROXY_MAX_CONNS = 512
-KANDEV_UNAUTHORIZED = (b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer\r\n"
-                       b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+KANDEV_UNAUTHORIZED = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 KANDEV_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
 # Names a Kandev secret or env var may not take, beyond is_reserved_var().
 # Credentials Kandev itself delivers, agentctl's own settings, and anything
@@ -8980,23 +8990,62 @@ def kandev_lease_key(create=True):
     raise KandevError("unavailable", "could not create the lease key")
 
 
-def kandev_token(key, name, guest, generation, expiry):
-    """v1.<expiry>.<base64url HMAC-SHA256(name|guest port|generation|expiry)>"""
-    msg = f"{name}|{int(guest)}|{int(generation)}|{int(expiry)}".encode()
+def kandev_lease_keys(now=None):
+    """The keys a token may be signed with: the current one, and the previous
+    one for KANDEV_LEASE_VALID after a rotation."""
+    keys = [k for k in [kandev_lease_key(create=False)] if k]
+    try:
+        changed = os.stat(KANDEV_LEASE_KEY_PREV).st_mtime
+        if (time.time() if now is None else now) - changed <= KANDEV_LEASE_VALID:
+            with open(KANDEV_LEASE_KEY_PREV, "rb") as fh:
+                prev = fh.read()
+            if len(prev) == 32:
+                keys.append(prev)
+    except OSError:
+        pass                            # no rotation yet: the current key alone
+    return keys
+
+
+def kandev_rotate_lease_key():
+    """`host kandev rotate-lease-key`: a new key; the old one becomes .prev,
+    accepted for KANDEV_LEASE_VALID from now. A key rotated again within that
+    time drops the one before it, so rotate at most every 15 minutes."""
+    with kandev_lock():
+        if os.path.exists(KANDEV_LEASE_KEY):
+            os.replace(KANDEV_LEASE_KEY, KANDEV_LEASE_KEY_PREV)
+            os.utime(KANDEV_LEASE_KEY_PREV)     # the change time, not the key's age
+        kandev_lease_key(create=True)
+    note(f"new lease key; the previous one is accepted for {KANDEV_LEASE_VALID // 60} more minutes")
+
+
+def kandev_incarnation(entry):
+    """What a token is bound to besides name and port: this sandbox as it was
+    provisioned. Its created_at, and a random value provision draws, since two
+    provisions under one name can share a second. Not the generation: Kandev
+    keeps using a lease until it refreshes it, so a token must survive a
+    stop and start; only a destroy and a new provision retire it."""
+    return f"{entry.get('created_at', '')}|{entry.get('incarnation', '')}"
+
+
+def kandev_token(key, name, guest, incarnation, valid_until):
+    """v1.<valid_until>.<base64url HMAC-SHA256(name|guest port|incarnation|valid_until)>"""
+    msg = f"{name}|{int(guest)}|{incarnation}|{int(valid_until)}".encode()
     mac = base64.urlsafe_b64encode(hmac.new(key, msg, hashlib.sha256).digest()).rstrip(b"=")
-    return f"v1.{int(expiry)}.{mac.decode()}"
+    return f"v1.{int(valid_until)}.{mac.decode()}"
 
 
-def kandev_token_ok(key, token, name, guest, generation, now=None):
-    """Whether `token` is a lease for this sandbox, guest port and generation,
-    not past its expiry by more than the allowed clock skew."""
+def kandev_token_ok(keys, token, name, guest, incarnation, now=None):
+    """Whether `token` is a lease for this sandbox incarnation and guest port,
+    signed with one of `keys`, not past valid_until by more than the allowed
+    clock skew."""
     found = re.fullmatch(r"v1\.(\d{1,12})\.[A-Za-z0-9_-]{43}", token or "")
-    if not key or not found:
+    if not found:
         return False
-    expiry = int(found.group(1))
-    if (time.time() if now is None else now) > expiry + KANDEV_TOKEN_SKEW:
+    valid_until = int(found.group(1))
+    if (time.time() if now is None else now) > valid_until + KANDEV_TOKEN_SKEW:
         return False
-    return hmac.compare_digest(kandev_token(key, name, guest, generation, expiry), token)
+    return any(hmac.compare_digest(kandev_token(key, name, guest, incarnation, valid_until), token)
+               for key in keys)
 
 
 def kandev_labelled(fmt_json=False):
@@ -9121,7 +9170,7 @@ def kandev_provision(args, config, settings):
                 "registry-kandev.toml.in", NAME=name, DATE=now.date().isoformat(),
                 ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
                 IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
-                CREATED=iso(now), EXPIRES=iso(expires),
+                CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
                 PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
                 PROXY_PORTS=f"proxy_ports = {toml_literal(public)}", API=toml_literal(api_host),
                 API_IP=toml_literal(api_addr),
@@ -9293,10 +9342,13 @@ def kandev_lease(args, config, settings):
         raise KandevError("unavailable", "the proxy has no proxy_listen or no certificate yet")
     host = urllib.parse.urlsplit(settings["base_url"]).hostname
     host = f"[{host}]" if ":" in host else host
-    token = kandev_token(kandev_lease_key(), name, port, generation, int(expires.timestamp()))
+    # Reported to expire at `expires`, accepted until valid_until: Kandev asks
+    # for a new lease only 30 s before expires_at, whatever answers it gets.
+    valid_until = int(expires.timestamp()) + KANDEV_LEASE_VALID - KANDEV_LEASE_SECONDS
+    token = kandev_token(kandev_lease_key(), name, port, kandev_incarnation(entry), valid_until)
     return {"lease": {"base_url": f"https://{host}:{public}", "expires_at": iso(expires),
                       "generation": str(generation),
-                      "headers": {"Authorization": f"Bearer {token}"}}}
+                      "headers": {KANDEV_LEASE_HEADER: token}}}
 
 
 def kandev_remove(name, entry, labelled):
@@ -9406,14 +9458,16 @@ def kandev_tls(args, config, settings):
 # `msbctl host kandev proxy`, the long-running half of serve = "proxy" (a systemd
 # user service from `host kandev install`). One TLS listener per published
 # guest port, on proxy_listen:<public port>; a connection is spliced to that
-# port's 127.0.0.1:<host port> once its first request head carries a lease
-# token for this sandbox, guest port and generation. One port per lease means
-# a pooled connection can only ever reach one VM port, so there is no HTTP
-# parsing past that first head and no path routing: WebSockets and streaming
-# need nothing special. The kandev entries are the only source of truth; the
-# proxy rescans them every KANDEV_PROXY_SCAN seconds and re-reads the one
-# entry on each connection, so a destroyed sandbox refuses at once and a new
-# generation's token works the moment `start` has written it.
+# port's 127.0.0.1:<host port> once its first request head carries, in one
+# X-Msb-Lease header, a lease token for this sandbox incarnation and guest
+# port. Every byte is forwarded as it came, Authorization (Kandev's token for
+# agentctl) included. One port per lease means a pooled connection can only
+# ever reach one VM port, so there is no HTTP parsing past that first head and
+# no path routing: WebSockets and streaming need nothing special. The kandev
+# entries are the only source of truth; the proxy rescans them every
+# KANDEV_PROXY_SCAN seconds and re-reads the one entry on each connection, so
+# a destroyed sandbox refuses at once, and a token minted before a stop and
+# start still works, while one from before a destroy and re-provision does not.
 #
 # Logged: the sandbox, the guest port and the outcome. Never a token, a
 # request head or a byte of what passes through.
@@ -9486,16 +9540,19 @@ def _read_head(tls):
     return buf
 
 
-def _bearer(head):
-    """The one Authorization: Bearer token in a request head, or None."""
+def _lease_token(head):
+    """The value of the one X-Msb-Lease header in a request head, or None.
+    Authorization is not looked at: it is Kandev's token for agentctl, and
+    passes to the guest untouched with everything else."""
     found = []
+    want = KANDEV_LEASE_HEADER.lower().encode()
     for line in head.split(b"\r\n\r\n", 1)[0].split(b"\r\n")[1:]:
         key, _, value = line.partition(b":")
-        if key.strip().lower() == b"authorization":
+        if key.strip().lower() == want:
             found.append(value.strip())
-    if len(found) != 1 or not found[0][:7].lower() == b"bearer ":
+    if len(found) != 1:
         return None
-    return found[0][7:].strip().decode("ascii", "replace")
+    return found[0].decode("ascii", "replace")
 
 
 def _splice(listener, tls, backend):
@@ -9546,8 +9603,8 @@ def kandev_proxy_conn(raw, listener, ctx, slots):
             entry = {}
         ok = (entry.get("source") == "kandev"
               and kandev_proxy_ports(entry).get(listener.guest) == listener.port
-              and kandev_token_ok(kandev_lease_key(create=False), _bearer(head), listener.name,
-                                  listener.guest, int(entry.get("generation", 0))))
+              and kandev_token_ok(kandev_lease_keys(), _lease_token(head), listener.name,
+                                  listener.guest, kandev_incarnation(entry)))
         if not ok:
             outcome = "unauthorized"
             tls.sendall(KANDEV_UNAUTHORIZED)
@@ -9772,8 +9829,11 @@ def host_kandev(args, config):
         with contextlib.suppress(KeyboardInterrupt):       # ^C in a terminal: just stop
             kandev_proxy()
         return
+    if args.arg == "rotate-lease-key":
+        kandev_rotate_lease_key()
+        return
     if args.arg != "install":
-        die("host kandev: install, reap or proxy")
+        die("host kandev: install, reap, proxy or rotate-lease-key")
     me = shutil.which("msbctl") or os.path.realpath(__file__)
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     path_env = f"{os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"
@@ -11090,9 +11150,10 @@ def build_parser():
 
     p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
     p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
-    p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy",
+    p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy|rotate-lease-key",
                    help="authorize: one public key line, quoted; autostart: install; "
-                   "kandev: install, reap (one pass) or proxy (the TLS proxy, long-running)")
+                   "kandev: install, reap (one pass), proxy (the TLS proxy, long-running) "
+                   "or rotate-lease-key (the old key is still accepted for 15 minutes)")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
     p.add_argument("--kandev", action="store_true",
