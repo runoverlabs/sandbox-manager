@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-19
+
 ### Added
 - Kandev sandboxes get their own disk at `/workspace` (`workspace_gib` in `kandev provision`, now required), deleted with the sandbox; `kandev health` lists `features`, starting with `workspace_disk`.
 
