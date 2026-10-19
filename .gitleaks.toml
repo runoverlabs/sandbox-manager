@@ -7,7 +7,7 @@ description = "NodeSource's public apt signing-key fingerprint, pinned in bootst
 regexes = ['''6F71F525282841EEDAF851B42F59B5F99B1BE0B4''']
 
 [[allowlists]]
-description = "A planted test value in tests/test_kandev.py at e14b182, renamed since: the tests assert it never reaches argv or a file. Not a credential; flagged as generic-api-key because the constant was called SECRET."
+description = "A planted test value in tests/test_kandev.py at e14b182 (on its branch) and 7e65a45 (the same commit as merged into main), renamed since: the tests assert it never reaches argv or a file. Not a credential; flagged as generic-api-key because the constant was called SECRET."
 condition = "AND"
-commits = ["e14b1828bf625f8f9d4304542d5f7b341872ab96"]
+commits = ["e14b1828bf625f8f9d4304542d5f7b341872ab96", "7e65a457d02c50e5b99542192deab057fd168e6b"]
 paths = ['''tests/test_kandev\.py''']
