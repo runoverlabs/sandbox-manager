@@ -110,6 +110,21 @@ protection would otherwise discard in the guest. That protection stays on.
 msb writes a fresh `/etc/hosts` on every boot, so `kandev start` writes the
 line again.
 
+## The workspace disk
+
+Kandev starts every session's agent in `/workspace`, and nothing else creates
+that directory. So each Kandev sandbox gets its own disk there, `workspace_gib`
+from the provision request: an empty ext4 filesystem, writable by root, which
+agentctl runs as. It's kept across `stop` and `start`, like the root disk.
+
+It's an *owned* disk (`msb create --mount-owned`): msb deletes it with the VM.
+Nothing of a workspace outlives its sandbox, whichever way the sandbox goes
+(`purge`, the reaper's expiry, or an orphan's removal), and there's no separate
+volume that a second step could fail to delete. It's never a host folder: a
+host mount is virtiofs, which is slow for git and builds and has corrupted
+git's index; it has no quota, so one build could fill the host; and it would
+put what untrusted code wrote on the host's own filesystem.
+
 ## Private images
 
 A request's `registry` credentials are used for one `msb pull`. The password is
@@ -144,8 +159,8 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
-| `provision ENV` | a JSON line: image (digest-pinned), resources, `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |

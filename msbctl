@@ -6086,6 +6086,9 @@ def cmd_show(args, config):
         note(f"image      {rec['image']}")
         note(f"resources  {box.entry.get('cpus')} cpu, {box.entry.get('memory')}, "
              f"{box.entry.get('root_disk')} disk")
+        if box.entry.get("workspace_disk"):
+            note(f"workspace  {box.entry['workspace_disk']} disk at {KANDEV_WORKSPACE}, "
+                 "deleted with the sandbox")
         note(f"expires    {rec['expires_at']}  (created {rec['created_at']})")
         note("ports      " + ", ".join(f"{g} <- 127.0.0.1:{h}" for g, h in rec["ports"].items()))
         note(f"secrets    {', '.join(secret_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
@@ -8197,6 +8200,22 @@ KANDEV_AGENTCTL_WAIT = 30
 KANDEV_OWNER_LABEL = "msbctl.owner=kandev"
 KANDEV_LOCK = os.path.join(STATE_DIR, "kandev.lock")
 GUEST_AGENTCTL = "/opt/kandev/agentctl"
+# Where Kandev creates every session's agentctl instance and starts the agent
+# (pluginExecutorWorkspacePath, fixed). Nothing else creates it, so each Kandev
+# sandbox gets its own disk there. An OWNED disk (`--mount-owned`): msb deletes
+# it with the VM, so nothing of a workspace outlives its sandbox, whichever way
+# the sandbox goes (purge, the reaper's expiry, an orphan's `msb rm -f`) and
+# with no second step that could fail. Never a host directory: that is virtiofs
+# (slow for git and builds, and it has corrupted git's index), has no quota, and
+# puts what untrusted code wrote on the host's own filesystem. Verified on msb
+# 0.7.7: an empty ext4 of the size asked (no lost+found), root-writable, kept
+# across stop and start, gone after `msb rm` and `msb rm -f`.
+KANDEV_WORKSPACE = "/workspace"
+KANDEV_WORKSPACE_MAX_GIB = 500
+# What `health` lists for the plugin to require, within protocol 1. 0.4.0
+# ignored unknown request keys, so the plugin cannot tell from a provision that
+# went through whether it got what it asked for: it asks here first.
+KANDEV_FEATURES = ("workspace_disk",)
 KANDEV_REAP_UNIT = "msb-kandev-reap"
 KANDEV_PROXY_UNIT = "msb-kandev-proxy"
 KANDEV_SERVE_MODES = ("proxy", "tailscale", "none")
@@ -9069,7 +9088,8 @@ def kandev_health(args, config, settings):
     count, cpus, mem = kandev_usage(table)
     tls = kandev_tls_status(settings)
     return {
-        "protocol": KANDEV_PROTOCOL, "msbctl_version": version_string(),
+        "protocol": KANDEV_PROTOCOL, "features": list(KANDEV_FEATURES),
+        "msbctl_version": version_string(),
         "msb_version": local_msb_version() or "",
         "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK), "enabled": settings["enabled"],
         "platform": host_platform(), "base_url": settings["base_url"],
@@ -9122,6 +9142,9 @@ def kandev_provision(args, config, settings):
     cpus = _int_field(req, "cpus", 1, 64)
     mem = _int_field(req, "memory_mib", 256, 1024 * 1024)
     disk = _int_field(req, "disk_gib", 1, 4096, 20)
+    # Required: a sandbox without it starts agents in a directory that does
+    # not exist ("fork/exec <agent>: no such file or directory").
+    workspace = _int_field(req, "workspace_gib", 1, KANDEV_WORKSPACE_MAX_GIB)
     expires = parse_iso(req.get("expires_at"), "expires_at")
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
@@ -9170,6 +9193,7 @@ def kandev_provision(args, config, settings):
                 "registry-kandev.toml.in", NAME=name, DATE=now.date().isoformat(),
                 ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
                 IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
+                WORKSPACE=f"{workspace}G",
                 CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
                 PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
                 PROXY_PORTS=f"proxy_ports = {toml_literal(public)}", API=toml_literal(api_host),
@@ -9190,6 +9214,7 @@ def kandev_provision(args, config, settings):
     # As every msbctl sandbox: hostname rules and secret substitution both
     # need the interceptor. Ports bind 127.0.0.1 only; base_url is the way in.
     argv += ["--tls-intercept"]
+    argv += ["--mount-owned", f"{KANDEV_WORKSPACE}:kind=disk,size={workspace}G"]
     for spec in ports:
         argv += ["--port", spec]
     for key, value in env_pairs:

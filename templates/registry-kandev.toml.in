@@ -23,6 +23,9 @@ image        = {{IMAGE}}
 cpus         = {{CPUS}}
 memory       = "{{MEMORY}}"
 root_disk    = "{{DISK}}"
+# An ext4 disk at /workspace, where Kandev starts its agents. Owned by the VM
+# (`--mount-owned`): msb deletes it with the sandbox, and nothing else has it.
+workspace_disk = "{{WORKSPACE}}"
 created_at     = "{{CREATED}}"
 # Drawn at provision; with created_at, what a lease token is bound to (one
 # provision of this name, through stops and starts).

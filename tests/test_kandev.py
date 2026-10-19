@@ -17,7 +17,8 @@ API_ADDR = "100.64.0.5"
 
 def request(**over):
     req = {"operation_id": "op-1", "input_digest": "sha256:1", "image": IMAGE,
-           "cpus": 2, "memory_mib": 2048, "disk_gib": 10, "expires_at": "2099-01-01T00:00:00Z",
+           "cpus": 2, "memory_mib": 2048, "disk_gib": 10, "workspace_gib": 20,
+           "expires_at": "2099-01-01T00:00:00Z",
            "kandev_api": {"host": "kandev.example.ts.net", "port": 443},
            "egress_allow": ["pypi.org"],
            "env": [{"name": "NODE_ENV", "value": "development"}],
@@ -201,6 +202,28 @@ class Provision(KandevTest):
         execs = self.msb_calls("exec")
         self.assertEqual(len(execs), 1)
         self.assertEqual(execs[0]["argv"][-2:], [API_ADDR, "kandev.example.ts.net"])
+
+    def test_workspace_disk(self):
+        self.provision(workspace_gib=7)
+        argv = self.msb_calls("create")[0]["argv"]
+        # Owned, so msb deletes it with the VM: no named volume to leak.
+        self.assertIn("/workspace:kind=disk,size=7G", argv)
+        self.assertEqual(argv[argv.index("/workspace:kind=disk,size=7G") - 1], "--mount-owned")
+        self.assertNotIn("--mount-named", argv)
+        self.assertEqual(self.m.read_toml(self.entry_path("k-6f1c2b9e"))["workspace_disk"], "7G")
+        self.assertIn("workspace_disk", self.ok("health")["features"])
+
+    def test_a_provision_without_a_workspace_is_refused(self):
+        for value in (None, 0, 501, "20", 2.5, True):
+            with self.subTest(value=value):
+                req = json.loads(request())
+                if value is None:
+                    del req["workspace_gib"]
+                else:
+                    req["workspace_gib"] = value
+                err = self.error("invalid_config", "provision", "e1", stdin=json.dumps(req) + "\n")
+                self.assertIn("workspace_gib", err["message"])
+        self.assertEqual(self.msb_calls("create"), [])
 
     def test_entry_is_kandevs(self):
         self.provision()
