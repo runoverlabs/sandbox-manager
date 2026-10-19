@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-10-19
+
 ### Added
 - `msbctl kandev restart-proxy` restarts the Kandev proxy if it runs an older release, and `kandev health` reports the proxy's release as `serve.version`: run it once after updating a 0.6.0 host.
 
