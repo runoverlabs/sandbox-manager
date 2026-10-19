@@ -8367,14 +8367,14 @@ KANDEV_CIDR_MIN = {4: 8, 6: 32}
 
 
 def kandev_allow_entry(text):
-    """One [kandev] allow_extra entry, parsed, or None if it is not one:
-    ("any",) for "*"; ("host", pattern) for a hostname or *.suffix, any port;
-    ("net", network, port or None) for an address (a /32 or /128), an
-    address:port, or a CIDR (any port). Addresses are tried first: "10.0.0.10"
+    """One [kandev] allow_extra entry as (kind, value, port), or None if it is
+    not one: ("any", None, None) for "*"; ("host", pattern, None) for a
+    hostname or *.suffix, any port; ("net", network, port or None) for an
+    address (a /32 or /128), an address:port, or a CIDR (any port). Addresses are tried first: "10.0.0.10"
     also has the shape of a hostname."""
     text = text.strip()
     if text == "*":
-        return ("any",)
+        return ("any", None, None)
     body, port = text, None
     found = (re.fullmatch(r"\[([0-9A-Fa-f:.]+)\]:(\d{1,5})", text)
              or re.fullmatch(r"([0-9.]+):(\d{1,5})", text))
@@ -8388,7 +8388,9 @@ def kandev_allow_entry(text):
         # strict: "192.168.2.6/24" is a typo for one of two things, not a guess.
         net = ipaddress.ip_network(body, strict=True)
     except ValueError:
-        return ("host", text.lower()) if port is None and HOSTNAME.fullmatch(text.lower()) else None
+        if port is None and HOSTNAME.fullmatch(text.lower()):
+            return ("host", text.lower(), None)
+        return None
     if port is not None and "/" in body:
         return None                     # a CIDR is any port; a port goes with one address
     return ("net", net, port)
@@ -8407,15 +8409,14 @@ def kandev_target_allowed(target, entries):
         net = ipaddress.ip_network(host.strip("[]"), strict=False)
     except ValueError:
         net = None
-    for entry in entries:
-        if entry[0] == "any":
+    for kind, value, port in entries:
+        if kind == "any":
             return True
-        if entry[0] == "host" and net is None and (
-                host == entry[1] or (entry[1].startswith("*.") and host.endswith(entry[1][1:]))):
+        if kind == "host" and net is None and (
+                host == value or (value.startswith("*.") and host.endswith(value[1:]))):
             return True
-        if entry[0] == "net" and net is not None and net.version == entry[1].version \
-                and net.subnet_of(entry[1]) \
-                and (entry[2] is None or (ports.isdigit() and int(ports) == entry[2])):
+        if kind == "net" and net is not None and net.version == value.version \
+                and net.subnet_of(value) and (port is None or (ports.isdigit() and int(ports) == port)):
             return True
     return False
 
