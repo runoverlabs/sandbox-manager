@@ -1,7 +1,6 @@
 """The host itself, for the Kandev plugin: health.host (F22), `host kandev
 configure` (F23) and `self-update --json` under the plugin's key (F24)."""
 
-import json
 import os
 from unittest import main, mock
 
