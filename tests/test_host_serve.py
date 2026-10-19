@@ -31,6 +31,7 @@ ALLOWED = [
     "msbctl purge web -y",
     "msbctl rename web shop -y",
     "msbctl self-update",
+    "msbctl self-update --version v99.0.0",
     "msbctl cache web",
     "msbctl cache web clear npm",
     "msbctl observe web",
@@ -72,6 +73,8 @@ REFUSED = [
     "msbctl exec web -e",
     "msbctl rename web ../x",
     "msbctl self-update --version v0.1.0",
+    "msbctl self-update --version latest",
+    "msbctl host kandev configure --allow-extra '*'",
     "msbctl observe web on",
     "msbctl secret add web",
     "msbctl setup",
@@ -117,7 +120,9 @@ KANDEV_ALLOWED = ["msbctl --version", *KANDEV_VERBS,
                   "msbctl ls --json",
                   "msbctl show k-6f1c2b9e-aaaa --json",
                   "msbctl stop k-6f1c2b9e-aaaa --json",
-                  "msbctl purge k-6f1c2b9e-aaaa -y --json"]
+                  "msbctl purge k-6f1c2b9e-aaaa -y --json",
+                  "msbctl self-update --json",
+                  "msbctl self-update --version 99.0.0 --json"]
 
 KANDEV_REFUSED = [
     "msbctl ls", "msbctl status", "msbctl show web", "msbctl shell web",
@@ -134,6 +139,9 @@ KANDEV_REFUSED = [
     "msbctl kandev list", "msbctl kandev inspect x", "msbctl kandev destroy x",
     "msbctl kandev stop x", "msbctl kandev find --operation op", "msbctl kandev reap",
     "msbctl host kandev reap", "msbctl host kandev proxy", "msbctl host kandev install",
+    # Its own egress is the operator's to decide; an update only forward.
+    "msbctl host kandev configure --allow-extra '*' --json",
+    "msbctl self-update", "msbctl self-update --version 0.4.0 --json",
 ]
 
 

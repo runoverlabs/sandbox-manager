@@ -5011,19 +5011,64 @@ substituted on the way out. Four one-time settings make it yours. Every one is
 optional, and `msbctl setup` brings you back to any of them later."""
 
 
+def release_tuple(text):
+    """(0, 5, 2) for "0.5.2", "v0.5.2" or a checkout's "0.5.2+abc1234 (git
+    checkout)", else None."""
+    found = re.match(r"v?(\d+)\.(\d+)\.(\d+)(?:$|[+ ])", str(text or ""))
+    return tuple(int(g) for g in found.groups()) if found else None
+
+
+def self_update_problem(version):
+    """Why `self-update --version VERSION` may not run under host serve, or
+    None. Only forward or the same release: the way down is to a weaker host
+    serve, the very thing that decides what this key may do."""
+    want, have = release_tuple(version), release_tuple(version_string())
+    if want is None:
+        return f"self-update --version: {version!r} is not a release like 0.5.2"
+    if have is None or want < have:
+        return "self-update --version can downgrade host serve itself"
+    return None
+
+
 def cmd_self_update(args, config):
     """Upgrade a packaged install by re-running the get.sh that shipped with it, which
     fetches the latest (or --version) release, verifies its checksum and installs it
-    next to the current one. A git checkout updates with `git pull` instead."""
+    next to the current one. A git checkout updates with `git pull` instead.
+    --json (the Kandev plugin's Update): get.sh's output goes to stderr and the
+    answer is {"msbctl_version", "updated"}, the version now installed."""
     get = os.path.join(HERE, "get.sh")
     if IS_CHECKOUT or not os.path.isfile(get):
-        note("this is a git checkout: `git pull` updates it" if IS_CHECKOUT else
-             "no get.sh beside msbctl, so this is not a packaged install — reinstall with the curl command")
-        return
+        why = ("this is a git checkout: `git pull` updates it" if IS_CHECKOUT else
+               "no get.sh beside msbctl, so this is not a packaged install — reinstall with the curl command")
+        if args.json:
+            raise KandevError("unsupported", why)
+        note(why)
+        return None
+    if restricted() and args.version:
+        problem = self_update_problem(args.version)
+        if problem and args.json:
+            raise KandevError("denied", problem)
+        if problem:
+            die(problem)
+    argv = ["sh", get] + (["--version", args.version] if args.version else [])
+    if args.json:
+        before = version_string()
+        # get.sh never reads stdin, and its progress is not the document.
+        if subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=2).returncode:
+            raise KandevError("unavailable", "the update failed (get.sh's output is on stderr)")
+        # The release get.sh just switched `current` to: this process is still
+        # the old one, and its own VERSION never changes.
+        try:
+            with open(os.path.join(os.path.dirname(os.path.dirname(HERE)), "current", "VERSION"),
+                      encoding="utf-8") as fh:
+                after = fh.read().strip()
+        except OSError:
+            raise KandevError("unavailable", "get.sh finished, but no installed VERSION was found") from None
+        return {"msbctl_version": after, "updated": after != before}
     note(f"installed: {version_string()}")
     sys.stdout.flush()              # exec replaces the process; buffered output would be lost
-    argv = ["sh", get] + (["--version", args.version] if args.version else [])
     os.execvp("sh", argv)
+    return None
 
 
 def store_claude_token(args):
@@ -7770,8 +7815,8 @@ def restricted_problem(argv, kandev=False):
     if argv in (["--version"], ["-V"]):
         return None
     if kandev:
-        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge"):
-            return "this key runs `msbctl kandev` verbs, and ls, show, stop and purge with --json"
+        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge", "self-update"):
+            return "this key runs `msbctl kandev` verbs, and ls, show, stop, purge and self-update with --json"
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 args = build_parser().parse_args(argv)
@@ -7784,6 +7829,9 @@ def restricted_problem(argv, kandev=False):
         # only Kandev's sandboxes (kandev_guard(), ls_data(), cmd_purge()).
         if not args.json:
             return f"{argv[0]}: only with --json"
+        if args.func is cmd_self_update:
+            # As for the everyday key: the Update button, never a downgrade.
+            return self_update_problem(args.version) if args.version else None
         if args.func is cmd_ls:
             return None if not (args.refresh or args.porcelain or args.picker) else "ls: only --json"
         names = [args.name] if args.func is cmd_show else list(args.names or [])
@@ -7834,8 +7882,8 @@ def restricted_problem(argv, kandev=False):
         return None
     if func is cmd_self_update:
         # Only forward: the latest release is how a remote gets upgraded without
-        # the admin key; --version is the way DOWN, to a weaker host serve.
-        return "self-update --version can downgrade host serve itself" if args.version else None
+        # the admin key; an older --version is the way DOWN, to a weaker host serve.
+        return self_update_problem(args.version) if args.version else None
     if func is cmd_cache:
         return None if args.action in ("ls", "clear") else "cache: only ls and clear"
     if func is cmd_observe:
@@ -8137,6 +8185,9 @@ def cmd_host(args, config):
         die(f"host {args.action} is for the host itself")
     elif args.kandev and args.action not in ("authorize", "serve"):
         die("--kandev goes with host authorize or host serve")
+    elif (any(getattr(args, attr) is not None for attr, _ in KANDEV_CONFIGURE_KEYS)
+          and (args.action, args.arg) != ("kandev", "configure")):
+        die("--enabled, --serve, --proxy-listen, --base-url and --allow-extra go with host kandev configure")
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
@@ -8151,8 +8202,8 @@ def cmd_host(args, config):
 #
 # This machine as a sandbox host for Kandev. The Kandev plugin drives it the
 # way a laptop drives a remote: `ssh host msbctl kandev <verb> …`, through
-# `host serve --kandev`, which admits these verbs, plus `ls`, `show`, `stop`
-# and `purge` with --json, and nothing else. `kandev` holds only what needs
+# `host serve --kandev`, which admits these verbs, plus `ls`, `show`, `stop`,
+# `purge` and `self-update` with --json, and nothing else. `kandev` holds only what needs
 # Kandev's own input; listing, inspecting, stopping and removing are the
 # generic verbs, which under that key see Kandev's sandboxes alone. Each run
 # prints ONE JSON document on stdout (json_document()) and exits. The one
@@ -9147,6 +9198,57 @@ def kandev_labelled(fmt_json=False):
 
 # ------------------------------------------------------------- the verbs
 
+# What health.host reads, as names a test can point elsewhere.
+OS_RELEASE = "/etc/os-release"
+PROC_MEMINFO = "/proc/meminfo"
+PROC_UPTIME = "/proc/uptime"
+
+
+def kandev_host_facts():
+    """health.host: this machine as the operator's host list shows it. Not the
+    [kandev] limits (placement reads capacity), and nothing secret. Each field
+    is left out when it cannot be read, never guessed."""
+    facts = {}
+
+    def text(value):
+        return "".join(c for c in value if c.isprintable())[:120]
+
+    with contextlib.suppress(OSError, ValueError):
+        with open(OS_RELEASE, encoding="utf-8") as fh:
+            for line in fh:
+                key, _, value = line.strip().partition("=")
+                if key == "PRETTY_NAME":
+                    words = shlex.split(value)
+                    if words:
+                        facts["os"] = text(words[0])
+    with contextlib.suppress(OSError):
+        facts["kernel"] = text(os.uname().release)
+    if os.cpu_count():
+        facts["cpus"] = os.cpu_count()
+    with contextlib.suppress(OSError, ValueError):
+        with open(PROC_MEMINFO, encoding="utf-8") as fh:
+            mem = {k: int(v.split()[0]) for k, _, v in (line.partition(":") for line in fh)
+                   if k in ("MemTotal", "MemAvailable")}
+        for key, field in (("MemTotal", "memory_total_mib"), ("MemAvailable", "memory_available_mib")):
+            if key in mem:
+                facts[field] = mem[key] // 1024             # kB
+    with contextlib.suppress(OSError):
+        facts["load_1m"] = round(os.getloadavg()[0], 2)
+    # The filesystem msb keeps its sandboxes and their owned disks on; before
+    # msb has made its directory, the one it will be made in.
+    where = MSB_HOME
+    while not os.path.exists(where) and os.path.dirname(where) != where:
+        where = os.path.dirname(where)
+    with contextlib.suppress(OSError):
+        usage = shutil.disk_usage(where)
+        facts["disk_total_gib"] = round(usage.total / (1024 * MIB), 2)
+        facts["disk_free_gib"] = round(usage.free / (1024 * MIB), 2)
+    with contextlib.suppress(OSError, ValueError, IndexError):
+        with open(PROC_UPTIME, encoding="utf-8") as fh:
+            facts["uptime_seconds"] = int(float(fh.read().split()[0]))
+    return facts
+
+
 def kandev_health(args, config, settings):
     table = msb_table()
     count, cpus, mem = kandev_usage(table)
@@ -9166,6 +9268,7 @@ def kandev_health(args, config, settings):
         # default egress against it, since one refused entry refuses a whole
         # provision and would make every profile fail on this host.
         "egress": {"allow_extra": list(settings["allow_extra"])},
+        "host": kandev_host_facts(),
     }
 
 
@@ -9818,7 +9921,7 @@ def json_document(body):
     then exit 0; on failure, exit 3 with {"error": {"code", "message"}}, the
     code one of Kandev's (KANDEV_ERROR_CODES). Everything else printed
     meanwhile goes to stderr. The contract of every `kandev` verb and of
-    `ls`, `show`, `stop` and `purge` with --json."""
+    `ls`, `show`, `stop`, `purge` and `self-update` with --json."""
     code, data = 0, None
     with contextlib.redirect_stdout(sys.stderr):
         try:
@@ -9841,12 +9944,12 @@ def json_document(body):
     sys.exit(code)
 
 
-JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge)
+JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge, cmd_self_update)
 
 
 def json_verb(args, config):
-    """`ls`, `show`, `stop` or `purge` with --json: one document for all the
-    names given, built from what each call returns."""
+    """`ls`, `show`, `stop`, `purge` or `self-update` with --json: one
+    document for all the names given, built from what each call returns."""
     if kandev_key() and not kandev_settings(config)["enabled"]:
         raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
     if args.func is cmd_purge and not args.yes:
@@ -9910,6 +10013,41 @@ def kandev_guard(args):
             f"into it while it runs, and stop or purge it on this host itself.")
 
 
+# `host kandev configure` flag → [kandev] key.
+KANDEV_CONFIGURE_KEYS = (("enabled", "enabled"), ("serve", "serve"), ("proxy_listen", "proxy_listen"),
+                         ("base_url", "base_url"), ("allow_extra", "allow_extra"))
+
+
+def kandev_configure(args):
+    """`host kandev configure`: set the [kandev] keys given, in place in
+    config.toml (its comments and every other table kept), and only if the
+    result passes kandev_settings(), the check every verb makes at load. A
+    refused value leaves the file as it was. Run from the host or an admin
+    login (a bootstrap), never from either restricted key: the plugin's key
+    deciding its own egress is what allow_extra exists to prevent."""
+    changes = [(key, getattr(args, attr)) for attr, key in KANDEV_CONFIGURE_KEYS
+               if getattr(args, attr) is not None]
+    changes = [(k, [e for e in v if e.strip()] if k == "allow_extra" else v) for k, v in changes]
+    ensure_local_config()
+    target = os.path.realpath(CONFIG_FILE)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".config-", suffix=".toml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out, open(target, encoding="utf-8") as src:
+            out.write(src.read())
+        shutil.copymode(target, tmp)
+        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table="kandev")]
+        settings = kandev_settings(merge_config(read_toml(DEFAULTS_FILE), read_toml(tmp)))
+        if changed:
+            os.replace(tmp, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+    effective = {k: v for k, v in settings.items() if k != "allow_extra_entries"}
+    for key in ("port_pool", "proxy_port_pool"):
+        effective[key] = "%d-%d" % effective[key]
+    return {"changed": changed, "kandev": effective}
+
+
 def host_kandev(args, config):
     """`host kandev install|reap|proxy`. What runs on the host for Kandev and
     is never the plugin's to call: `reap`, one pass of the reaper (a JSON
@@ -9925,8 +10063,18 @@ def host_kandev(args, config):
     if args.arg == "rotate-lease-key":
         kandev_rotate_lease_key()
         return
+    if args.arg == "configure":
+        if args.json:
+            json_document(lambda: kandev_configure(args))
+        try:
+            done = kandev_configure(args)
+        except KandevError as exc:
+            die(f"{exc.message}; {tilde(CONFIG_FILE)} is unchanged")
+        note(f"[kandev] in {tilde(CONFIG_FILE)}: " +
+             (f"set {', '.join(done['changed'])}" if done["changed"] else "nothing to change"))
+        return
     if args.arg != "install":
-        die("host kandev: install, reap, proxy or rotate-lease-key")
+        die("host kandev: install, reap, proxy, rotate-lease-key or configure")
     me = shutil.which("msbctl") or os.path.realpath(__file__)
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     path_env = f"{os.path.join(HOME, '.local', 'bin')}:/usr/local/bin:/usr/bin:/bin"
@@ -11208,6 +11356,8 @@ def build_parser():
 
     p = sub.add_parser("self-update", help="upgrade a packaged install to the latest release")
     p.add_argument("--version", help="a specific release, e.g. v0.2.0 (default: the latest)")
+    p.add_argument("--json", action="store_true",
+                   help='install, then print {"msbctl_version", "updated"}; get.sh\'s output goes to stderr')
     p.set_defaults(func=cmd_self_update)
 
     p = sub.add_parser("setup", help="your machine-level settings: identities, Claude login, network, defaults")
@@ -11243,24 +11393,34 @@ def build_parser():
 
     p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
     p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
-    p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy|rotate-lease-key",
+    p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy|rotate-lease-key|configure",
                    help="authorize: one public key line, quoted; autostart: install; "
-                   "kandev: install, reap (one pass), proxy (the TLS proxy, long-running) "
-                   "or rotate-lease-key (the old key is still accepted for 15 minutes)")
+                   "kandev: install, reap (one pass), proxy (the TLS proxy, long-running), "
+                   "rotate-lease-key (the old key is still accepted for 15 minutes) "
+                   "or configure (set [kandev] keys in config.toml)")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
     p.add_argument("--kandev", action="store_true",
                    help="authorize, serve: the Kandev plugin's key, which runs `msbctl kandev` verbs only")
     p.add_argument("--replace", action="store_true",
                    help="authorize: rewrite the key's existing line instead of refusing")
-    p.add_argument("--json", action="store_true", help="check: one JSON document")
+    p.add_argument("--json", action="store_true", help="check, kandev configure: one JSON document")
+    p.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
+                   help="kandev configure: [kandev] enabled")
+    p.add_argument("--serve", metavar="MODE", help="kandev configure: proxy, tailscale or none")
+    p.add_argument("--proxy-listen", metavar="IP", help="kandev configure: the address the proxy binds")
+    p.add_argument("--base-url", metavar="URL", help="kandev configure: https://host[:port]")
+    p.add_argument("--allow-extra", action="append", metavar="ENTRY",
+                   help="kandev configure: the whole allow_extra list, one entry per flag; "
+                   "'' alone empties it")
     p.set_defaults(func=cmd_host)
 
     p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",
                        description="Verbs the Kandev plugin runs over ssh. Each prints one JSON "
                        "document; secrets, the agentctl binary, its nonce and a TLS key come on stdin. "
                        "Listing, inspecting, stopping and removing Kandev's sandboxes are "
-                       "`ls`, `show`, `stop` and `purge` with --json.")
+                       "`ls`, `show`, `stop` and `purge` with --json; updating msbctl is "
+                       "`self-update --json`.")
     p.add_argument("verb", choices=list(KANDEV_VERBS))
     p.add_argument("env", nargs="?", metavar="ENV", help="the Kandev environment id (tls: install)")
     p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")

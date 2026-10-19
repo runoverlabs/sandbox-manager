@@ -386,11 +386,14 @@ restricted key, only `--claude-token NAME --stdin` is allowed.
 ### `msbctl self-update`
 
 ```text
-msbctl self-update [--version vX.Y.Z]
+msbctl self-update [--version vX.Y.Z] [--json]
 ```
 
 Upgrade a packaged install to the latest release, or a given one, verifying it
 the same way the installer does. In a git checkout it tells you to `git pull`.
+`--json` prints `{"msbctl_version", "updated"}` once it is installed, with the
+installer's output on stderr. Under `host serve`, either key, `--version` may
+not name a release older than the running one.
 
 ## Remote hosts
 
@@ -402,6 +405,8 @@ msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
 msbctl host kandev install | reap | proxy | rotate-lease-key
+msbctl host kandev configure [--[no-]enabled] [--serve MODE] [--proxy-listen IP]
+                             [--base-url URL] [--allow-extra ENTRY …] [--json]
 ```
 
 For running this machine as a [remote host](remote-hosts.md). `serve` is the
@@ -415,14 +420,16 @@ adds a key to `~/.ssh/authorized_keys` with that forced command, or with
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
 `--kandev` is the [Kandev plugin's key](kandev.md#the-plugin-key): its line
 runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`,
-`show`, `stop` and `purge` with `--json` (seeing only Kandev's sandboxes),
-while the everyday key runs no `kandev` verb. `kandev reap` is one pass of the
+`show`, `stop`, `purge` and `self-update` with `--json` (seeing only Kandev's
+sandboxes), while the everyday key runs no `kandev` verb. `kandev reap` is one pass of the
 [reaper](kandev.md#the-reaper), and `kandev proxy` is the
 [TLS proxy](kandev.md#the-tls-proxy); `kandev rotate-lease-key` replaces the key
 its tokens are signed with, honouring the old one for 15 minutes. `kandev
 install` writes and enables a
 systemd user timer for the first and a service for the second, and restarts
-the proxy.
+the proxy. `kandev configure` sets the [`[kandev]` keys](kandev.md#setting-a-host-up)
+it is given in `config.toml`, keeping everything else, and only if the result
+is valid.
 
 ### `msbctl kandev`
 

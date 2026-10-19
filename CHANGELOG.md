@@ -8,6 +8,11 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- `kandev health` reports `host`: the machine's OS, kernel, CPUs, memory, load, free disk and uptime.
+- `msbctl host kandev configure` sets `[kandev]` keys (`--enabled`, `--serve`, `--proxy-listen`, `--base-url`, `--allow-extra`) in `config.toml`, keeping the rest of the file, and refuses a bad value without writing.
+- The Kandev plugin's key may run `self-update --json`, which answers `{"msbctl_version", "updated"}`; under either restricted key `--version` may now name any release not older than the running one.
+
 ## [0.5.1] - 2026-10-19
 
 ### Added

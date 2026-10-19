@@ -155,7 +155,7 @@ $ ssh -t msb@host -- 'msbctl shell webshop'
 | Command | Allowed |
 | --- | --- |
 | `ls`, `status`, `show`, `config`, `start` (and `--autostart`), `stop`, `reclaim`, `shell`, `exec`, `update`, `resize`, `rebuild`, `purge`, `rename`, `--version` | yes |
-| `self-update` | without `--version` (that is the way back to an older `host serve`) |
+| `self-update` | with no `--version`, or one not older than the running release (an older one is the way back to a weaker `host serve`) |
 | `cache` | `ls`, `clear` |
 | `observe` | `report`, `off` (`on` turns egress filtering off) |
 | `secret` | `ls`, `set`, `rm` (`add` binds a value to a host) |

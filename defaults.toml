@@ -233,7 +233,7 @@ port_pool     = "20000-29999"
 # plus /vm/<name>/p/<port>.
 base_url      = ""
 # What serves base_url:
-#   "proxy"     `msbctl kandev proxy` (a user service from `host kandev
+#   "proxy"     `msbctl host kandev proxy` (a user service from `host kandev
 #               install`) terminates TLS here, with a certificate the Kandev
 #               plugin issues from its own root, and admits a connection only
 #               with a lease token for that sandbox and port. Needs no

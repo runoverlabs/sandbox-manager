@@ -50,6 +50,24 @@ Kandev's sandboxes are kept apart from yours:
    `base_url` names this host as the Kandev server will reach it, and
    `proxy_listen` is its address on that network (a tailnet or LAN IP). Every
    key is described in `defaults.toml` and [below](#the-kandev-section).
+
+   A script (the plugin's bootstrap, say) sets the same keys with
+   `msbctl host kandev configure`, which edits only the keys it is given and
+   keeps the rest of the file and its comments. It checks the result as every
+   verb does at load, so a bad value (`--proxy-listen sbx-01`, a name) is
+   refused and the file is left as it was:
+
+   ```sh
+   msbctl host kandev configure --enabled --serve proxy \
+     --proxy-listen 100.64.0.7 --base-url https://sbx-01.tailnet.example \
+     --allow-extra pypi.org --allow-extra '*.pythonhosted.org' --json
+   ```
+
+   `--allow-extra` gives the whole list, one entry per flag (`--allow-extra ''`
+   empties it), and `--no-enabled` turns Kandev off. With `--json` it prints
+   `{"changed": [keys], "kandev": {…}}`, the section as verbs now load it.
+   Neither restricted key may run it: what the plugin's sandboxes may reach is
+   yours to decide, from the host or an admin login.
 3. Authorize the plugin's public key, which the plugin's Sandbox Hosts page
    shows: `msbctl host authorize 'ssh-ed25519 AAAA… kandev' --kandev`.
 4. Install the reaper and the TLS proxy: `msbctl host kandev install`.
@@ -159,7 +177,7 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
@@ -240,8 +258,16 @@ It never touches a sandbox that lacks either the `kandev` source or the label.
 The line `host authorize --kandev` writes is
 `restrict,command="…/msbctl host serve --kandev" <key>`, with no `pty`. That key
 runs `msbctl kandev …`, `ls`, `show`, `stop` and `purge -y` with `--json` on
-one named sandbox, and `msbctl --version`. Nothing else, and none of `host`:
-the reaper and the proxy are this host's own. Your laptop's everyday key is
+one named sandbox, `self-update --json`, and `msbctl --version`. Nothing else,
+and none of `host`: the reaper, the proxy and `host kandev configure` are this
+host's own.
+
+`self-update --json` is the plugin's Update: it installs the latest release
+(get.sh's output goes to stderr) and prints `{"msbctl_version": "0.5.2",
+"updated": true}`, the version now installed. `--version X` is allowed only
+when X is not older than the running version, as for the everyday key, since a
+downgrade could weaken `host serve` itself. A git checkout answers
+`unsupported`, and a host with Kandev off `denied`. Your laptop's everyday key is
 refused every `kandev` verb, since one could create a sandbox with any egress.
 
 The Kandev key does set egress and secret bindings, which the everyday key may
