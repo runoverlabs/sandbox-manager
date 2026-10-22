@@ -837,6 +837,9 @@ class Sandbox:
         # A machine-local group that resolves to LAN addresses brings it along,
         # from the same machine-local place: such a group does not work without
         # it, and the failure reads as a missing rule.
+        if self.is_kandev:
+            # kandev_provision() decided it at create, from the request.
+            return bool(self.entry.get("private_names"))
         private = self.config.get("defaults", {}).get("private_dns_groups", [])
         return bool(self._pick("allow_private_dns", False)
                     or any(g in private for g in self.machine_rule_groups))
@@ -8198,7 +8201,8 @@ def cmd_host(args, config):
         die("--kandev goes with host authorize or host serve")
     elif (any(getattr(args, attr) is not None for attr, _ in KANDEV_CONFIGURE_KEYS)
           and (args.action, args.arg) != ("kandev", "configure")):
-        die("--enabled, --serve, --proxy-listen, --base-url and --allow-extra go with host kandev configure")
+        die("--enabled, --serve, --proxy-listen, --base-url, --allow-extra and --private-name "
+            "go with host kandev configure")
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
@@ -8277,7 +8281,18 @@ KANDEV_WORKSPACE_MAX_GIB = 500
 # What `health` lists for the plugin to require, within protocol 1. 0.4.0
 # ignored unknown request keys, so the plugin cannot tell from a provision that
 # went through whether it got what it asked for: it asks here first.
-KANDEV_FEATURES = ("workspace_disk",)
+KANDEV_FEATURES = ("workspace_disk", "private_names")
+# What a sandbox with `private_names` denies in place of msb's DNS rebind
+# protection, which it has to turn off: every destination group msb knows but
+# `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
+# link-local, multicast) and the reserved IPv4 ranges msb's rebind filter also
+# drops. One token, as `base` writes several; emitted after the requested names
+# and every address rule, before every other hostname rule (kandev_private_order).
+KANDEV_PRIVATE_DENY = ",".join(
+    f"deny@{target}" for target in (
+        "host", "meta", "loopback", "private", "link-local", "multicast",
+        "0.0.0.0/8", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "198.18.0.0/15",
+        "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4"))
 KANDEV_REAP_UNIT = "msb-kandev-reap"
 KANDEV_PROXY_UNIT = "msb-kandev-proxy"
 KANDEV_SERVE_MODES = ("proxy", "tailscale", "none")
@@ -8420,6 +8435,12 @@ def kandev_settings(config):
             bad("allow_extra", f"{text} is wider than /{KANDEV_CIDR_MIN[entry[1].version]}")
     out["allow_extra"] = extra
     out["allow_extra_entries"] = entries
+    names = raw.get("private_names", [])
+    if not isinstance(names, list) or any(
+            not isinstance(n, str) or not HOSTNAME.fullmatch(n.strip().lower())
+            or n.strip().startswith("*.") for n in names):
+        bad("private_names", 'a list of exact hostnames ("git.example.com"), no patterns or addresses')
+    out["private_names"] = [n.strip().lower() for n in names]
     return out
 
 
@@ -8762,6 +8783,49 @@ def kandev_egress(raw, settings):
             raise KandevError("invalid_config", f"{target} is not allowed by [kandev] allow_extra")
         rules.append(rule)
     return rules
+
+
+def kandev_private_names(raw, settings, egress_allow):
+    """A request's `private_names`: hosts that may resolve to a private address,
+    each listed in [kandev] private_names and reachable through the request's
+    own `egress_allow` (this only lets a name resolve; what it may reach is
+    allow_extra's to say). Empty when absent."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(n, str) for n in raw):
+        raise KandevError("invalid_config", "private_names must be a list of hostnames")
+    allowed = {_split_rule_target(t.strip())[0].lower() for t in egress_allow or []
+               if isinstance(t, str)}
+    names = []
+    for name in (n.strip().lower() for n in raw):
+        if name not in settings["private_names"]:
+            raise KandevError("invalid_config", f"{name} is not allowed by [kandev] private_names")
+        if name not in allowed:
+            raise KandevError("invalid_config", f"private_names: {name} is not in egress_allow")
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def kandev_private_order(rules, base_count, names):
+    """`rules` (net_rules(): `base` first, `base_count` tokens of it) reordered
+    for a sandbox whose DNS rebind protection is off: base, then the rules for
+    `names`, then every rule that names an address (the Kandev API pin, address
+    egress, an operator group's LAN host: none depends on a DNS answer), then
+    KANDEV_PRIVATE_DENY, then every other rule. First match wins, so another
+    allowed name that answers with a private address is refused at connect.
+    Moving an address rule ahead of a hostname rule changes nothing unless the
+    two disagree about one connection; no shipped group has a deny that could."""
+    base, first, addresses, rest = rules[:base_count], [], [], []
+    for token in (t.strip() for rule in rules[base_count:] for t in rule.split(",") if t.strip()):
+        target = _split_rule_target(token.partition("@")[2])[0].lower()
+        try:
+            ipaddress.ip_network(target.strip("[]"), strict=False)
+            is_address = True
+        except ValueError:
+            is_address = False
+        (first if target in names else addresses if is_address else rest).append(token)
+    return base + first + addresses + [KANDEV_PRIVATE_DENY] + rest
 
 
 def kandev_api(raw):
@@ -9331,7 +9395,8 @@ def kandev_health(args, config, settings):
         # The operator's own policy, not a secret: the plugin's Test checks its
         # default egress against it, since one refused entry refuses a whole
         # provision and would make every profile fail on this host.
-        "egress": {"allow_extra": list(settings["allow_extra"])},
+        "egress": {"allow_extra": list(settings["allow_extra"]),
+                   "private_names": list(settings["private_names"])},
         "host": kandev_host_facts(),
     }
 
@@ -9400,6 +9465,7 @@ def kandev_provision(args, config, settings):
             raise KandevError("invalid_config", f"env {item['name']}: one line of at most 4096 characters")
         env_pairs.append((item["name"], item["value"]))
     egress = kandev_egress(req.get("egress_allow"), settings)
+    private = kandev_private_names(req.get("private_names"), settings, req.get("egress_allow"))
     api_host, api_addr, api_port, api_rule = kandev_api(req.get("kandev_api"))
     registry = kandev_registry(req.get("registry"), image)
 
@@ -9435,10 +9501,13 @@ def kandev_provision(args, config, settings):
                 API_IP=toml_literal(api_addr),
                 RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
                 EXTRA_RULES=f"extra_rules = {toml_literal(egress + [api_rule])}",
-                BINDINGS=f"secret_binds = {toml_literal(binds)}"))
+                BINDINGS=f"secret_binds = {toml_literal(binds)}",
+                PRIVATE=f"private_names = {toml_literal(private)}"))
 
     box = Sandbox(name, config)
     rules = _kandev_try(box.net_rules)
+    if private:
+        rules = kandev_private_order(rules, len(config.get("rules", {}).get("base", [])), private)
     kandev_pull(image, registry)
     seconds = int((expires - utc_now()).total_seconds()) + 300
     argv = ["msb", "create", "--name", name, "--pull", "never",
@@ -9449,6 +9518,10 @@ def kandev_provision(args, config, settings):
     # As every msbctl sandbox: hostname rules and secret substitution both
     # need the interceptor. Ports bind 127.0.0.1 only; base_url is the way in.
     argv += ["--tls-intercept"]
+    if private:
+        # msb has no per-name exemption: off for the VM, and KANDEV_PRIVATE_DENY
+        # in the rules above stands in for it for every name but those.
+        argv += ["--no-dns-rebind-protection"]
     argv += ["--mount-owned", f"{KANDEV_WORKSPACE}:kind=disk,size={workspace}G"]
     for spec in ports:
         argv += ["--port", spec]
@@ -10084,7 +10157,8 @@ def kandev_guard(args):
 
 # `host kandev configure` flag → [kandev] key.
 KANDEV_CONFIGURE_KEYS = (("enabled", "enabled"), ("serve", "serve"), ("proxy_listen", "proxy_listen"),
-                         ("base_url", "base_url"), ("allow_extra", "allow_extra"))
+                         ("base_url", "base_url"), ("allow_extra", "allow_extra"),
+                         ("private_names", "private_names"))
 
 
 def kandev_configure(args):
@@ -10096,7 +10170,8 @@ def kandev_configure(args):
     deciding its own egress is what allow_extra exists to prevent."""
     changes = [(key, getattr(args, attr)) for attr, key in KANDEV_CONFIGURE_KEYS
                if getattr(args, attr) is not None]
-    changes = [(k, [e for e in v if e.strip()] if k == "allow_extra" else v) for k, v in changes]
+    changes = [(k, [e for e in v if e.strip()] if k in ("allow_extra", "private_names") else v)
+               for k, v in changes]
     ensure_local_config()
     target = os.path.realpath(CONFIG_FILE)
     fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".config-", suffix=".toml")
@@ -11481,6 +11556,9 @@ def build_parser():
     p.add_argument("--base-url", metavar="URL", help="kandev configure: https://host[:port]")
     p.add_argument("--allow-extra", action="append", metavar="ENTRY",
                    help="kandev configure: the whole allow_extra list, one entry per flag; "
+                   "'' alone empties it")
+    p.add_argument("--private-name", dest="private_names", action="append", metavar="HOST",
+                   help="kandev configure: the whole private_names list, one host per flag; "
                    "'' alone empties it")
     p.set_defaults(func=cmd_host)
 

@@ -381,7 +381,76 @@ class AllowExtra(KandevTest):
     def test_health_reports_the_list(self):
         loaded = ["pypi.org", "*.pythonhosted.org", "192.168.2.6:8788", "192.168.2.0/24"]
         self.configure(allow_extra=json.dumps(loaded))
-        self.assertEqual(self.ok("health")["egress"], {"allow_extra": loaded})
+        self.assertEqual(self.ok("health")["egress"], {"allow_extra": loaded, "private_names": []})
+
+
+class PrivateNames(KandevTest):
+    """[kandev] private_names: a name that may resolve inward, with msbctl's
+    own deny standing in for the DNS rebind protection that comes off."""
+
+    FORGE = "git.example.com"
+
+    def setUp(self):
+        super().setUp()
+        self.configure(allow_extra=json.dumps(["pypi.org", self.FORGE, "10.0.0.5:22"]),
+                       private_names=json.dumps([self.FORGE]))
+
+    def rules(self):
+        argv = self.msb_calls("create")[0]["argv"]
+        return argv, [argv[i + 1] for i, a in enumerate(argv) if a == "--net-rule"]
+
+    def test_the_guard_sits_between_the_names_and_every_other_hostname(self):
+        rec = self.provision(egress_allow=["pypi.org", self.FORGE, "10.0.0.5:22"],
+                             private_names=[self.FORGE.upper()])
+        argv, rules = self.rules()
+        self.assertIn("--no-dns-rebind-protection", argv)
+        base = self.m.read_toml(self.m.DEFAULTS_FILE)["rules"]["base"]
+        self.assertEqual(rules[:len(base)], base)
+        rest = rules[len(base):]
+        deny = rest.index(self.m.KANDEV_PRIVATE_DENY)
+        self.assertEqual(rest[0], f"allow@{self.FORGE}:tcp:443")
+        # Address rules need no DNS answer, so the API pin keeps working.
+        self.assertEqual(set(rest[1:deny]), {f"allow@{API_ADDR}:tcp:443", "allow@10.0.0.5:tcp:22"})
+        after = rest[deny + 1:]
+        self.assertIn("allow@pypi.org:tcp:443", after)
+        self.assertIn("allow@api.github.com:tcp:443", after)     # a [kandev] rule group's
+        for group in ("host", "meta", "loopback", "private", "link-local", "multicast"):
+            self.assertIn(f"deny@{group}", self.m.KANDEV_PRIVATE_DENY.split(","))
+        self.assertIsNone(self.m.rule_problem(self.m.KANDEV_PRIVATE_DENY))
+        entry = self.m.read_toml(self.entry_path(rec["name"]))
+        self.assertEqual(entry["private_names"], [self.FORGE])
+        self.assertTrue(self.m.Sandbox(rec["name"], self.m.load_config()).allow_private_dns)
+
+    def test_without_the_field_nothing_changes(self):
+        rec = self.provision(egress_allow=[self.FORGE])
+        argv, rules = self.rules()
+        self.assertNotIn("--no-dns-rebind-protection", argv)
+        self.assertNotIn(self.m.KANDEV_PRIVATE_DENY, rules)
+        self.assertEqual(self.m.read_toml(self.entry_path(rec["name"]))["private_names"], [])
+        self.assertFalse(self.m.Sandbox(rec["name"], self.m.load_config()).allow_private_dns)
+
+    def test_refusals(self):
+        for over, says in (
+                ({"egress_allow": ["pypi.org"], "private_names": ["pypi.org"]}, "[kandev] private_names"),
+                ({"egress_allow": ["pypi.org"], "private_names": [self.FORGE]}, "egress_allow"),
+                ({"private_names": self.FORGE}, "list"),
+                ({"private_names": [7]}, "list")):
+            with self.subTest(over=over):
+                self.assertIn(says, self.error("invalid_config", "provision", "e1",
+                                               stdin=request(**over))["message"])
+        self.assertEqual(self.msb_calls("create"), [])
+
+    def test_config_takes_exact_hostnames_only(self):
+        for bad in (["*.example.com"], ["192.168.2.6"], ["not a host"], "git.example.com"):
+            with self.subTest(bad=bad):
+                self.fresh()
+                self.configure(private_names=json.dumps(bad))
+                self.assertIn("private_names", self.error("invalid_config", "health")["message"])
+
+    def test_health_reports_it(self):
+        doc = self.ok("health")
+        self.assertEqual(doc["egress"]["private_names"], [self.FORGE])
+        self.assertIn("private_names", doc["features"])
 
 
 class Lifecycle(KandevTest):

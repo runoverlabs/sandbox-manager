@@ -96,6 +96,7 @@ installs it with [`kandev tls install`](#the-tls-proxy). `health` reports
 | `proxy_port_pool` | `"30000-39999"` | the proxy's public TLS ports, four per sandbox. Must not overlap `port_pool` |
 | `rule_groups` | `["github", "npm", "python", "claude"]` | egress every Kandev sandbox gets, after `base` |
 | `allow_extra` | `[]` | what a profile's extra egress may add: hostname patterns (`"pypi.org"`, `"*.example.com"`, any port), addresses (`"192.168.2.6"`, any port), `address:port` (`"192.168.2.6:8788"`, `"[fd00::1]:22"`) and CIDRs (`"192.168.2.0/24"`, any port, no wider than /8 or IPv6 /32). A hostname pattern never matches an address. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
+| `private_names` | `[]` | exact hostnames a profile may ask to have resolved to a private address (a LAN forge published as `192.168.x.x`). See [names on your LAN](#names-on-your-lan) |
 
 Nothing in a request can raise these limits or remove a base rule. Profiles add
 egress only within `allow_extra`.
@@ -127,6 +128,34 @@ resolved to **on the host**, and that name is written into the guest's
 protection would otherwise discard in the guest. That protection stays on.
 msb writes a fresh `/etc/hosts` on every boot, so `kandev start` writes the
 line again.
+
+## Names on your LAN
+
+msb discards a DNS answer with a private address (DNS rebind protection), so a
+name like `git.example.com → 192.168.2.6` comes back NXDOMAIN in the guest.
+Pinning the address in `/etc/hosts`, as the Kandev API is, gets a connection
+through but not a secret: msb substitutes a bound secret only on a connection
+to an address it resolved for that name, and blocks the request otherwise.
+
+So a host can let profiles name such hosts. List them in `[kandev]
+private_names` (or `host kandev configure --private-name git.example.com`, one
+per flag, `''` alone empties it), and a provision request's `private_names`
+may then name any of them that its `egress_allow` also reaches. msb's
+protection is all or nothing, so that sandbox is created with it off, and
+msbctl orders its rules to stand in for it:
+
+1. `base`;
+2. the rules for the requested names;
+3. every rule that names an address (the Kandev API pin, address egress);
+4. a deny of this host, cloud metadata, loopback, private (RFC 1918, CGNAT,
+   ULA), link-local, multicast and the reserved IPv4 ranges;
+5. every other rule.
+
+Rules are first-match-wins, so only the requested names may resolve inward:
+any other allowed name that answers with a private address is refused at
+connect. Patterns and addresses are refused in the list. `health` reports it
+as `egress.private_names` and the feature as `private_names`, so the plugin can
+tell before a launch whether a profile asking for one would be refused here.
 
 ## The workspace disk
 
@@ -177,8 +206,8 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
-| `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `egress.private_names`, `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `private_names`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |

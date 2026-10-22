@@ -142,6 +142,7 @@ KANDEV_REFUSED = [
     "msbctl host kandev reap", "msbctl host kandev proxy", "msbctl host kandev install",
     # Its own egress is the operator's to decide; an update only forward.
     "msbctl host kandev configure --allow-extra '*' --json",
+    "msbctl host kandev configure --private-name git.example.com --json",
     "msbctl self-update", "msbctl self-update --version 0.4.0 --json",
 ]
 

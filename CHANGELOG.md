@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- `[kandev] private_names` (`host kandev configure --private-name`) lets a Kandev profile name a host that resolves to a LAN address, such as a forge with a bound token; that sandbox runs with DNS rebind protection off and msbctl denies every other private destination in its place.
+
 ## [0.6.1] - 2026-10-19
 
 ### Added

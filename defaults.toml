@@ -268,6 +268,22 @@ rule_groups   = ["github", "npm", "python", "claude"]
 # profiles ask for. `kandev health` reports this list, so the plugin can tell
 # before any launch whether its default egress would be refused here.
 allow_extra   = []
+# Names a profile may ask to have resolved to a PRIVATE address, e.g. a forge
+# on your LAN published in DNS as 192.168.x.x. Exact hostnames only, never a
+# pattern or an address. msb drops such answers (DNS rebind protection), and an
+# address pinned in /etc/hosts, as the Kandev API is, is not enough when a
+# secret is bound to the name: msb substitutes only on a connection to an
+# address it resolved for that name, and blocks the request otherwise.
+#
+# A profile that asks for one turns rebind protection off for its whole VM, so
+# msbctl puts its own guard where msb's was: the requested names first, then
+# rules that name an address, then a deny of every private, loopback,
+# link-local, metadata, multicast and reserved destination and of this host,
+# then the other hostname rules. Only the listed names may resolve inward; any
+# other allowed name that answers with a private address is refused at
+# connect. Such a name must also be reachable through the request's
+# egress_allow, which allow_extra governs as always. Empty allows none.
+private_names = []
 
 # ---------------------------------------------------------------------------
 # Egress rule groups

@@ -55,3 +55,7 @@ kandev_api_ip = {{API_IP}}
 {{RULE_GROUPS}}
 {{EXTRA_RULES}}
 {{BINDINGS}}
+# Hosts the request let resolve to a private address. When not empty, the VM was
+# created with DNS rebind protection off, and these names' rules first, ahead
+# of a deny of every non-public destination.
+{{PRIVATE}}

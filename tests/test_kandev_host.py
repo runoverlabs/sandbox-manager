@@ -122,6 +122,15 @@ class Configure(KandevTest):
         self.assertEqual((code, doc["kandev"]["allow_extra"]), (0, []))
         self.assertIn("allow_extra = []", self.config_text())
 
+    def test_private_names(self):
+        code, doc = self.configure_json("--private-name", "git.example.com")
+        self.assertEqual((code, doc["changed"]), (0, ["private_names"]))
+        self.assertEqual(doc["kandev"]["private_names"], ["git.example.com"])
+        code, doc = self.configure_json("--private-name", "*.example.com")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"))
+        code, doc = self.configure_json("--private-name", "")
+        self.assertEqual((code, doc["kandev"]["private_names"]), (0, []))
+
     def test_without_json(self):
         code, out, err = self.run_main("host", "kandev", "configure", "--proxy-listen", "sbx-01")
         self.assertNotEqual(code, 0)
