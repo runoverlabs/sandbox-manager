@@ -14,3 +14,10 @@ updates:
       default-days: 7
     commit-message:
       prefix: "ci"
+    # codeql-action's init, analyze and upload-sarif are one release and must
+    # match: analyze refuses a config written by another version's init. Apart,
+    # each gets its own PR, and none of them can pass CI alone.
+    groups:
+      codeql-action:
+        patterns:
+          - "github/codeql-action*"
