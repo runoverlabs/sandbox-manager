@@ -133,6 +133,7 @@ packages = [
 bun = false
 gitleaks = true
 claude = true
+pi = true
 
 # Run after everything else, inside the guest, with the repo at /work. Use it
 # for `npm ci`-type project setup. Failures are reported, not fatal.

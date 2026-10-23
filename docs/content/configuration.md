@@ -52,6 +52,7 @@ including a whole egress group, replaces the shipped value.
 | `private_dns_groups` | `[]` | groups whose names resolve to private addresses; projects using one get `allow_private_dns` |
 | `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
 | `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
+| `llm` | `[]` | the [model endpoints](models.md) a sandbox with pi gets unless its registry entry sets `llm`; the first is pi's default |
 | `identity` | `""` | the `[identities]` entry new sandboxes use |
 | `git_push` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` (https, the GitHub token) or `"ssh"` (the agent). See [git push](credentials.md#git-push-gh-or-ssh) |
 | `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
@@ -91,6 +92,19 @@ off telemetry, error reporting, feedback prompts and the auto-updater, and sets
 setting it and `claude-agent-acp` (the adapter Zed uses) don't offer bypass-permissions mode
 (`--dangerously-skip-permissions`). Every `[env]` table, yours or a project's,
 overrides these. Fixed at create time.
+
+### `[agent_env.pi]`
+
+The same for sandboxes with pi: `PI_OFFLINE = "1"`, which turns off its update
+check and install ping.
+
+### `[llm.<name>]`
+
+A model endpoint for pi: `base_url` (HTTPS) and `models` for your own server,
+or `provider` for one pi knows, plus `context_window`, `max_tokens`,
+`reasoning`, `api`, `private_dns`, `ca_cert` and `compat`. None ship; `msbctl
+setup` → "Model endpoints" writes them, and its key goes to `secrets/global.env`
+as `LLM_KEY_<NAME>`. See [Your own models](models.md).
 
 ### `[versions]`
 
@@ -141,6 +155,7 @@ name, so it's safe to commit.
 | --- | --- |
 | `packages` | extra apt packages |
 | `claude` | install Claude Code and its ACP adapter, `claude-agent-acp` (default true) |
+| `pi` | install [pi](models.md), the agent for any model (default false). Which endpoints it gets is machine-local |
 | `bun`, `gitleaks` | install these (default false) |
 | `containers_storage` | `"fuse-overlayfs"` for podman without a container disk |
 | `script` | a project script run last, inside the guest, from the project folder |
@@ -174,11 +189,13 @@ it.
 These keys in `.msb/sandbox.toml` are applied only once approved on the host
 (see [the policy pin](egress.md#the-policy-pin)): `rule_groups`,
 `extra_rules`, `allow_private_dns`, `secret_binds`, `[secrets]`, `cpus`,
-`memory`, `root_disk`, `containers_disk` and `[caches]`. They decide what may
+`memory`, `root_disk`, `containers_disk`, `[caches]` and, once it is on,
+`[bootstrap] pi`, which brings this machine's [model endpoints](models.md)
+with it. They decide what may
 leave the sandbox, which host a stored value is sent to, and what the sandbox
 takes from the host: a committed `memory = "256G"` is as much a change as a
-new rule. `image`, `[bootstrap]` and `[env]` aren't pinned; they act only
-inside the guest. The approved values are kept in
+new rule. `image`, the rest of `[bootstrap]` and `[env]` aren't pinned; they
+act only inside the guest. The approved values are kept in
 `~/.local/state/msb/policy-approved/<name>.json`, and their digest as
 `policy_pin` in the registry entry. Keys in the registry entry itself are
 yours and are never re-approved.
@@ -195,6 +212,8 @@ Any key it sets overrides the project's file.
 | `guest_path` | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
 | `repo` | `owner/name` on GitHub, for the token binding and the picker |
 | `identity` | an `[identities]` name; applied at every start |
+| `claude_token` | a stored Claude token's name; absent means `[defaults] claude_token` |
+| `llm` | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |
 | `autostart` | started when the picker opens |
 | `ssh_keys` | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |

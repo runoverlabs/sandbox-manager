@@ -62,7 +62,7 @@ class LocalGroupsTest(MsbctlTest):
 
     def test_the_entry_template_renders_them(self):
         text = self.m.render("registry.toml.in", NAME="web", PROJECT="/p", GUEST_PATH="/work",
-                             REPO="", DATE="2026-10-16", IDENTITY="", GIT_PUSH="gh", CLAUDE_TOKEN="",
+                             REPO="", DATE="2026-10-16", IDENTITY="", GIT_PUSH="gh", CLAUDE_TOKEN="", LLM="",
                              SSH_KEYS="ssh_keys = []", MOUNTS="", AUTOSTART="false",
                              EXTRA_RULE_GROUPS=self.m.format_list("extra_rule_groups", ["homelab"], ""))
         self.assertEqual(tomllib.loads(text)["extra_rule_groups"], ["homelab"])

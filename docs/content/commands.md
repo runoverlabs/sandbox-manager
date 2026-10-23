@@ -256,7 +256,7 @@ msbctl edit [name]
 The setup wizard as a menu of sections, run one at a time against an existing
 sandbox: name and folder, features and agents, resources, package caches,
 container storage, extra folders, published ports, egress rules, SSH keys,
-git push, Claude token, GitHub token,
+git push, Claude token, models for pi, GitHub token,
 secrets, identity and autostart, or the files themselves in your editor. "View
 the CLAUDE.md it gets" shows the instructions its agent is given on the next
 start. Applies
@@ -360,7 +360,7 @@ msbctl update [name…] [-c component…]
 ```
 
 Update components in place, without a rebuild. Components: `claude` (the
-default), `gh`, `gitleaks`, `bun`, `apt`. Versions installed this way are
+default), `pi`, `gh`, `gitleaks`, `bun`, `apt`. Versions installed this way are
 recorded so a rebuild reproduces them. Run `msbctl ls --refresh` first for
 `gh`, `gitleaks` and `bun`.
 
@@ -374,8 +374,9 @@ msbctl setup --claude-token NAME [--stdin] [--default]
 msbctl setup --identity KEY --git-name NAME --git-email EMAIL [--default]
 ```
 
-Your machine-level settings as a menu: git identities, Claude login, your
-network, new-sandbox defaults, or the config file itself. `--welcome` runs the
+Your machine-level settings as a menu: git identities, Claude login, model
+endpoints (for [pi](models.md)), your network, new-sandbox defaults, or the
+config file itself. `--welcome` runs the
 first-time walk-through. `--claude-token NAME` skips the menu and stores one
 Claude token under that name (`main` is the default one), from a hidden prompt
 or `--stdin`. `--identity` adds or changes a git identity the same way, without

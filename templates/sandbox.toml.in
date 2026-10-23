@@ -142,6 +142,12 @@ packages = {{PACKAGES}}
 # and set `claude_auth` if you want those gone too.
 claude = {{CLAUDE}}
 
+# pi (https://pi.dev), a coding agent for any model: your own server or a
+# provider's. Off by default. Which models it gets is this MACHINE's choice
+# ([llm] in ~/.config/msb/config.toml, `llm` in the registry entry), never the
+# project's, since an endpoint decides where a stored key is sent.
+pi = {{PI}}
+
 # bun and gitleaks are off by default.
 bun = {{BUN}}
 gitleaks = {{GITLEAKS}}

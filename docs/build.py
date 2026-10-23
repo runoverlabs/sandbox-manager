@@ -72,7 +72,9 @@ def esc(text):
 
 
 def slugify(text):
-    text = re.sub(r"<[^>]+>", "", text).lower()
+    # Headings arrive HTML-escaped: drop the entities whole, or "doesn't"
+    # becomes "doesnx27t" and no one can guess the anchor.
+    text = re.sub(r"&#?\w+;", "", re.sub(r"<[^>]+>", "", text)).lower()
     text = re.sub(r"[^a-z0-9\s-]", "", text)
     return re.sub(r"[\s-]+", "-", text).strip("-")
 

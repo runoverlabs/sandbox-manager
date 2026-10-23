@@ -97,6 +97,11 @@ egress_mode = "enforce"
 # egress rule rather than as a DNS one.
 private_dns_groups = []
 
+# The model endpoints ([llm.<name>], see "Model endpoints" below) a sandbox
+# with pi gets unless its registry entry says `llm = [...]`; the first is pi's
+# default. `msbctl setup` → Model endpoints sets both.
+llm = []
+
 # "secret" — bind CLAUDE_CODE_OAUTH_TOKEN with --secret and give the sandbox
 #            its own ~/.claude. The real credential never enters the VM.
 # "mount"  — bind-mount the host's ~/.claude and ~/.claude.json. Shared
@@ -189,6 +194,59 @@ DISABLE_AUTOUPDATER = "1"
 # it, set IS_SANDBOX = "" in an [env]: the adapter treats any non-empty value,
 # "0" included, as set.
 IS_SANDBOX = "1"
+
+[agent_env.pi]
+# pi's update check (pi.dev/api/latest-version) and its install ping
+# (pi.dev/api/report-install), both off; neither host is allowed anyway, and a
+# refused check only costs a startup delay. `msbctl update -c pi` is the
+# update path, as for Claude. msbctl also sets enableInstallTelemetry = false
+# in pi's settings.json.
+PI_OFFLINE = "1"
+
+# ---------------------------------------------------------------------------
+# Model endpoints, for pi
+#
+# None ship: an endpoint is this machine's, so it lives in YOUR config.toml
+# (`msbctl setup` → Model endpoints writes it). One table per endpoint:
+#
+#   [llm.qwen]
+#   base_url = "https://llm.home.example:8443/v1"   # https only (see below)
+#   models = ["Qwen3-Coder-Next"]                   # the first is pi's default
+#   context_window = 131072                         # optional, pi's default 128000
+#   max_tokens = 32768                              # optional, pi's default 16384
+#   reasoning = false                               # optional
+#   api = "openai-completions"                      # the default; or
+#                                                   # openai-responses,
+#                                                   # anthropic-messages,
+#                                                   # google-generative-ai
+#   private_dns = true      # the name resolves to a LAN address: sets
+#                           # allow_private_dns for the sandboxes using it
+#   ca_cert = "/home/you/.config/msb/home-ca.pem"   # the CA that signed the
+#                           # server's certificate, trusted for that host only
+#   compat = { thinkingFormat = "qwen-chat-template" }
+#                           # passed to pi as is (see pi's docs/models.md).
+#                           # msbctl already sets supportsDeveloperRole and
+#                           # supportsReasoningEffort false for
+#                           # openai-completions, which vLLM, llama.cpp and
+#                           # Ollama need; set them true here to undo that.
+#
+#   [llm.openrouter]
+#   provider = "openrouter"          # one of pi's own: anthropic, openai,
+#                                    # openrouter, google, mistral, groq,
+#                                    # deepseek, xai, cerebras, fireworks,
+#                                    # huggingface. pi knows its models.
+#   models = ["qwen/qwen3-coder"]    # optional: only picks the default
+#
+# The key is LLM_KEY_<NAME> (LLM_KEY_QWEN) in secrets/global.env, or in a
+# sandbox's own secrets/<name>.env, which wins. It is bound to that endpoint's
+# host alone and substituted host-side into the request header; the guest sees
+# a placeholder. No key stored means none is sent.
+#
+# HTTPS ONLY, on any port but 80: msb substitutes a secret only into a TLS
+# connection it intercepts, so over plain http the real key would have to be
+# inside the VM. A LAN server needs a certificate (from your own CA, given as
+# ca_cert) and nothing else; msbctl intercepts its port, allows its host and
+# port, and adds it to the transcript passthrough list (spike 17).
 
 [versions]
 # Defaults for bootstrap.sh. A sandbox entry's [versions] table overrides these

@@ -55,6 +55,13 @@ git_push = "{{GIT_PUSH}}"
 # value is read on every start, so a change needs a restart, not a rebuild.
 claude_token = "{{CLAUDE_TOKEN}}"
 
+# Which of this machine's model endpoints ([llm.<name>] in config.toml,
+# `msbctl setup` → Model endpoints) pi gets, the first being its default. Only
+# read when the project turns pi on. Absent follows [defaults] llm. Each brings
+# its own egress rule and key binding, fixed at create time: `msbctl edit
+# {{NAME}}` → Models for pi offers the rebuild.
+{{LLM}}
+
 # Started by `msbctl start --autostart`: when the picker opens, and on a host
 # after a reboot (`msbctl host autostart install`). Each idle sandbox costs
 # ~300 MB, so this is cheap, but a stopped sandbox cannot be version-probed.

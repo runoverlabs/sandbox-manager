@@ -13,6 +13,7 @@
 #   MSB_BUN_VERSION       pinned; checksum-verified below
 #   MSB_EXTRA_PACKAGES    space-separated apt packages for this project
 #   MSB_WANT_CLAUDE       1 to install Claude Code (default 1)
+#   MSB_WANT_PI           1 to install the pi coding agent
 #   MSB_WANT_BUN          1 to install bun
 #   MSB_WANT_GITLEAKS     1 to install gitleaks
 #   MSB_CONTAINERS_STORAGE  "fuse-overlayfs" to point podman at it
@@ -40,6 +41,7 @@ GH_VERSION="${MSB_GH_VERSION:-2.102.0}"
 BUN_VERSION="${MSB_BUN_VERSION:-1.4.2}"
 EXTRA_PACKAGES="${MSB_EXTRA_PACKAGES:-}"
 WANT_CLAUDE="${MSB_WANT_CLAUDE:-1}"
+WANT_PI="${MSB_WANT_PI:-0}"
 WANT_BUN="${MSB_WANT_BUN:-0}"
 WANT_GITLEAKS="${MSB_WANT_GITLEAKS:-0}"
 PROJECT_DIR="${MSB_PROJECT_DIR:-/work}"
@@ -212,6 +214,21 @@ do_claude_acp() {
 	command -v claude-agent-acp
 }
 
+# pi, the agent for any model endpoint (msbctl writes its ~/.pi/agent config on
+# every start, not here). Unpinned for the same reason as claude: `msbctl
+# update <name> -c pi` tracks latest. Pure npm, `engines: node >=20.6`,
+# registry.npmjs.org only (checked by installing it under deny-by-default).
+do_pi() {
+	command -v pi >/dev/null && { pi --version; return 0; }
+	if ! command -v npm >/dev/null; then
+		echo "   npm is absent because the node step did not succeed —" >&2
+		echo "   fix that first; this failure follows from it" >&2
+		return 1
+	fi
+	npm install -g @mariozechner/pi-coding-agent || return 1
+	pi --version
+}
+
 do_bun() {
 	command -v bun >/dev/null && { bun --version; return 0; }
 	local arch base zip tmp rc
@@ -377,20 +394,23 @@ do_cache_links() {
 [ "$CONTAINERS_STORAGE" = fuse-overlayfs ] \
 	&& step optional "podman storage (fuse-overlayfs)" -- do_container_storage
 
-# node's required-ness FOLLOWS claude's, because node is here to install claude
-# and nothing else in this script needs it. Reporting "REQUIRED, FAILED: node"
-# in a sandbox that never asked for an agent names a problem the operator does
-# not have.
+# node's required-ness FOLLOWS the agents', because node is here to install
+# them and nothing else in this script needs it. Reporting "REQUIRED, FAILED:
+# node" in a sandbox that never asked for an agent names a problem the operator
+# does not have.
 #
 # Required-ness means "the sandbox cannot do its job without this": the runtime
 # an agent installs with, when one was asked for.
-if [ "$WANT_CLAUDE" = 1 ]; then
+if [ "$WANT_CLAUDE" = 1 ] || [ "$WANT_PI" = 1 ]; then
 	step required "node ${NODE_MAJOR}" -- do_node
-	step optional "claude-code"        -- do_claude
-	step optional "claude-agent-acp"   -- do_claude_acp
 else
 	step optional "node ${NODE_MAJOR}" -- do_node
 fi
+if [ "$WANT_CLAUDE" = 1 ]; then
+	step optional "claude-code"        -- do_claude
+	step optional "claude-agent-acp"   -- do_claude_acp
+fi
+[ "$WANT_PI" = 1 ] && step optional "pi" -- do_pi
 
 # Optional: commits and pushes work without gh; only PRs and CI reads need it.
 # Never `gh auth login` here — pass GH_TOKEN per invocation so the --secret

@@ -12,7 +12,7 @@
     msbctl purge <name>           destroy, delete state, secret and registration
     msbctl rename <name> <new>    new name; recreates it, everything else moves along
     msbctl move <name> <dir>      point it at another project folder (then rebuild)
-    msbctl update <name>… [-c what…] update claude / gh / gitleaks / bun / apt in place
+    msbctl update <name>… [-c what…] update claude / pi / gh / gitleaks / bun / apt in place
     msbctl shell <name>           interactive shell, ssh-agent wired up
     msbctl keys <name>            choose which host ssh keys it can use
     msbctl config                 the merged configuration, with where each value is from
@@ -221,8 +221,11 @@ EGRESS_MODES = ("enforce", "observe")
 AGENT_TRANSCRIPT_HOSTS = ("api.anthropic.com", "platform.claude.com")
 
 
-def with_transcript_passthrough(spec):
+def with_transcript_passthrough(spec, transcript_hosts=AGENT_TRANSCRIPT_HOSTS):
     """`ENV[:OPTIONS]@HOST[,HOST]` with the transcript hosts added to passthrough.
+
+    `transcript_hosts` is the sandbox's own list (Sandbox.transcript_hosts):
+    Anthropic's hosts, plus the model endpoints pi talks to.
 
     Left alone if the spec already says `passthrough=`: that is an operator who
     wrote the binding by hand and said what they meant, and msb rejects a second,
@@ -234,7 +237,7 @@ def with_transcript_passthrough(spec):
     var, _, options = env.partition(":")
     if "passthrough=" in options:
         return spec
-    added = "passthrough=[" + ",".join(AGENT_TRANSCRIPT_HOSTS) + "]"
+    added = "passthrough=[" + ",".join(transcript_hosts) + "]"
     # Options are COMMA-separated (msb splits on commas outside brackets); a
     # colon here would make `query:passthrough=[...]` one option msb refuses.
     return f"{var}:{options + ',' if options else ''}{added}@{hosts}"
@@ -242,6 +245,175 @@ def with_transcript_passthrough(spec):
 
 # The Claude token's binding (see secret_env for why both hosts).
 CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com,platform.claude.com"
+
+
+# ------------------------------------------------------------- pi's models
+#
+# pi (https://pi.dev) is the second coding agent, and the one that is not tied
+# to a vendor: it talks to whatever `[llm.<name>]` endpoints in config.toml the
+# sandbox is given (`llm` in the registry entry, else [defaults] llm). Each is
+# turned into everything it needs, so nobody writes the parts separately:
+#
+#   egress      allow@HOST:tcp:PORT, after the rule groups
+#   TLS         that PORT intercepted (443 stays: msb's --tls-intercept-port
+#               REPLACES the default rather than adding to it — spike 17), and
+#               `ca_cert` trusted for that host only
+#   DNS         `private_dns = true` brings allow_private_dns, for a LAN name
+#   the key     LLM_KEY_<NAME> from secrets/<sandbox>.env, else global.env,
+#               bound to HOST alone: the guest holds a placeholder, and the real
+#               value goes into the Authorization header host-side
+#   transcript  HOST joins the passthrough list of EVERY binding, since it now
+#               receives the agent's whole conversation (AGENT_TRANSCRIPT_HOSTS)
+#   pi's config ~/.pi/agent/models.json and settings.json, written on every
+#               start (ensure_pi())
+#
+# HTTPS only. msb substitutes a secret only into a TLS connection it
+# intercepts, so over plain HTTP the real key would have to be inside the VM —
+# and `base` denies :80 anyway. A server on a LAN gets a certificate from its
+# own CA (`ca_cert`) and works on any port (spike 17).
+#
+# Machine-local, all of it: the endpoints are this machine's, and a project
+# naming a host its key is sent to is exactly what the policy pin exists to
+# stop. A project only says whether pi is installed ([bootstrap] pi).
+
+PI_PACKAGE = "@mariozechner/pi-coding-agent"
+GUEST_PI_DIR = "/root/.pi"
+LLM_KEY_PREFIX = "LLM_KEY_"
+PI_APIS = ("openai-completions", "openai-responses", "anthropic-messages",
+           "google-generative-ai")
+
+# pi's built-in API-key providers, by pi's own provider name, and where pi
+# sends their requests (from @mariozechner/pi-ai 0.73). `provider = "<name>"`
+# in an [llm] table uses one: pi knows its models, msbctl knows its host. Each
+# key is sent as a header (Authorization, x-api-key or x-goog-api-key), which
+# is what substitution needs. Only providers with one fixed host are here.
+PI_PROVIDERS = {
+    "anthropic":   "https://api.anthropic.com",
+    "openai":      "https://api.openai.com/v1",
+    "openrouter":  "https://openrouter.ai/api/v1",
+    "google":      "https://generativelanguage.googleapis.com/v1beta",
+    "mistral":     "https://api.mistral.ai",
+    "groq":        "https://api.groq.com/openai/v1",
+    "deepseek":    "https://api.deepseek.com",
+    "xai":         "https://api.x.ai/v1",
+    "cerebras":    "https://api.cerebras.ai/v1",
+    "fireworks":   "https://api.fireworks.ai/inference",
+    "huggingface": "https://router.huggingface.co/v1",
+}
+
+# The keys an [llm.<name>] table may have; anything else is a typo, refused.
+LLM_KEYS = ("provider", "base_url", "api", "models", "context_window", "max_tokens",
+            "reasoning", "private_dns", "ca_cert", "compat")
+
+
+def llm_key_var(name):
+    """The variable an endpoint's key is stored and bound under: LLM_KEY_QWEN
+    for [llm.qwen]. Reserved (is_reserved_var), so no `secret_binds` entry can
+    point the same value at another host."""
+    return LLM_KEY_PREFIX + name.upper().replace("-", "_")
+
+
+def llm_url(spec):
+    """(base_url, host, port) of an endpoint, its provider's URL if it names one."""
+    url = spec.get("base_url") or PI_PROVIDERS.get(spec.get("provider", ""), "")
+    parsed = urllib.parse.urlsplit(url)
+    return url, (parsed.hostname or ""), (parsed.port or 443)
+
+
+def llm_problem(name, spec):
+    """Why an [llm.<name>] table cannot be used, or None."""
+    if not NAME_SLUG.fullmatch(name):
+        return "the name must be lowercase letters, digits and dashes, starting with a letter"
+    if not isinstance(spec, dict):
+        return "must be a table"
+    unknown = [k for k in spec if k not in LLM_KEYS]
+    if unknown:
+        return f"unknown key(s) {', '.join(unknown)} (known: {', '.join(LLM_KEYS)})"
+    provider = spec.get("provider")
+    if provider is not None and provider not in PI_PROVIDERS:
+        return (f"provider {provider!r} is not one msbctl knows the host of "
+                f"({', '.join(PI_PROVIDERS)}); give base_url instead")
+    if not provider and name in PI_PROVIDERS:
+        return (f"{name} is one of pi's own providers — say provider = {name!r}, "
+                "or pick another name for your server")
+    if not provider and not spec.get("base_url"):
+        return "needs base_url (your server) or provider (one of pi's)"
+    if spec.get("base_url"):
+        parsed = urllib.parse.urlsplit(str(spec["base_url"]))
+        if parsed.scheme != "https":
+            return ("base_url must be https:// — the key is substituted only into a TLS "
+                    "connection msb intercepts, so plain http would need the real key in the VM")
+        if not parsed.hostname or parsed.username or parsed.password or parsed.query:
+            return "base_url must be https://HOST[:PORT]/path, with no credentials or query"
+        try:
+            port = parsed.port
+        except ValueError:
+            return "base_url has an invalid port"
+        if port == 80:
+            return "port 80 is denied by `base` first"
+    api = spec.get("api")
+    if api is not None and api not in PI_APIS:
+        return f"api {api!r} is not one of {', '.join(PI_APIS)}"
+    models = spec.get("models", [])
+    if not isinstance(models, list) or not all(isinstance(m, str) and m for m in models):
+        return "models must be a list of model ids"
+    if not provider and not models:
+        return "needs at least one model id in `models`"
+    for key in ("context_window", "max_tokens"):
+        if key in spec and (not isinstance(spec[key], int) or isinstance(spec[key], bool)
+                            or spec[key] <= 0):
+            return f"{key} must be a positive integer"
+    for key in ("reasoning", "private_dns"):
+        if key in spec and not isinstance(spec[key], bool):
+            return f"{key} must be true or false"
+    if "compat" in spec and not isinstance(spec["compat"], dict):
+        return "compat must be a table (passed to pi as is)"
+    if spec.get("ca_cert"):
+        path = os.path.expanduser(str(spec["ca_cert"]))
+        if not os.path.isabs(path) or not os.path.isfile(path):
+            return f"ca_cert {spec['ca_cert']!r} must be an absolute path to a PEM file"
+    return None
+
+
+def llm_endpoints(config):
+    """Every [llm.<name>] table in the merged config, by name."""
+    table = config.get("llm", {})
+    return table if isinstance(table, dict) else {}
+
+
+def pi_models_json(endpoints):
+    """~/.pi/agent/models.json for these (name, spec) pairs. Holds no secret:
+    `apiKey` NAMES the variable, which pi reads from its environment, where
+    msb has put the placeholder."""
+    providers = {}
+    for name, spec in endpoints:
+        url, _, _ = llm_url(spec)
+        if spec.get("provider"):
+            # A built-in: pi has its models already, and `models` only picks
+            # the default. What changes is where the key is (msbctl's variable,
+            # not pi's usual one) and, with base_url, where requests go.
+            providers[spec["provider"]] = {"baseUrl": url, "apiKey": llm_key_var(name)}
+            continue
+        entry = {"baseUrl": url, "api": spec.get("api", "openai-completions"),
+                 "apiKey": llm_key_var(name)}
+        # The `developer` role and `reasoning_effort` are OpenAI's own; vLLM,
+        # llama.cpp, Ollama and SGLang reject or ignore them, which surfaces as
+        # an empty or failed first turn. `compat` overrides either.
+        if entry["api"] == "openai-completions":
+            entry["compat"] = {"supportsDeveloperRole": False, "supportsReasoningEffort": False}
+        if "compat" in spec:
+            entry["compat"] = {**entry.get("compat", {}), **spec["compat"]}
+        models = []
+        for model in spec["models"]:
+            m = {"id": model}
+            for key, pikey in (("context_window", "contextWindow"), ("max_tokens", "maxTokens"),
+                               ("reasoning", "reasoning")):
+                if key in spec:
+                    m[pikey] = spec[key]
+            models.append(m)
+        entry["models"] = models
+        providers[name] = entry
+    return json.dumps({"providers": providers}, indent=2) + "\n"
 
 
 # --------------------------------------------------------------------- output
@@ -530,6 +702,9 @@ class Sandbox:
         # Registry only: token names exist on this machine, not in the project.
         self.claude_token_pinned = self.entry.get("claude_token", "")
         self.claude_token = self.claude_token_pinned or default_claude_token(config)
+        # Registry only, like the token: which of this machine's [llm]
+        # endpoints pi gets. Absent follows [defaults] llm. See PI_PACKAGE.
+        self.llm_pinned = self.entry.get("llm")
         self.identity_name = self._pick("identity", defaults.get("identity"))
         # Registry only, like the identity's keys it may name: how git reaches
         # GitHub is this machine's credentials, not the project's. See GIT_PUSH.
@@ -553,6 +728,7 @@ class Sandbox:
         # the registry entry) rather than losing its caches and images.
         self.volume_prefix = self.entry.get("volumes") or name
         self.state = os.path.join(STATE_DIR, "claude", name)
+        self.pi_state = os.path.join(STATE_DIR, "pi", name)
         self.agent_sock = os.path.join(AGENT_DIR, f"{name}.sock")
 
     def reload(self):
@@ -593,7 +769,49 @@ class Sandbox:
             return bool(boot.get("gitleaks"))
         if comp == "claude":
             return boot.get("claude") is not False
+        if comp == "pi":
+            return bool(boot.get("pi"))
         return True
+
+    @property
+    def llm_names(self):
+        """The [llm] endpoints this sandbox names, whether or not pi is on."""
+        names = self.llm_pinned
+        if names is None:
+            names = self.config.get("defaults", {}).get("llm", [])
+        return [names] if isinstance(names, str) else list(names)
+
+    @property
+    def llms(self):
+        """(name, spec) of each endpoint pi gets, checked; [] without pi. The
+        first is pi's default. Dies on a name config.toml does not define."""
+        if not self.wants_component("pi"):
+            return []
+        table = llm_endpoints(self.config)
+        where = (tilde(registry_path(self)) if self.llm_pinned is not None
+                 else f"[defaults] in {tilde(CONFIG_FILE)}")
+        out, providers = [], {}
+        for name in self.llm_names:
+            if name not in table:
+                die(f"{self.name}: llm {name!r} (in {where}) is not defined — config.toml has "
+                    f"{', '.join(sorted(table)) or 'no [llm] tables'} (`msbctl setup` → Model endpoints)")
+            problem = llm_problem(name, table[name])
+            if problem:
+                die(f"{self.name}: [llm.{name}] in {tilde(CONFIG_FILE)}: {problem}")
+            pid = table[name].get("provider") or name
+            if pid in providers:
+                die(f"{self.name}: llm {providers[pid]!r} and {name!r} are both pi's {pid!r} "
+                    f"provider — give it one of them (in {where})")
+            providers[pid] = name
+            out.append((name, table[name]))
+        return out
+
+    @property
+    def transcript_hosts(self):
+        """Every host that receives an agent's whole conversation: Anthropic's,
+        and each model endpoint pi uses. See AGENT_TRANSCRIPT_HOSTS."""
+        hosts = list(AGENT_TRANSCRIPT_HOSTS) + [llm_url(spec)[1] for _, spec in self.llms]
+        return tuple(dict.fromkeys(hosts))
 
     def cache_volume(self, key):
         return f"{self.volume_prefix}-cache-{key}"
@@ -842,7 +1060,8 @@ class Sandbox:
             return bool(self.entry.get("private_names"))
         private = self.config.get("defaults", {}).get("private_dns_groups", [])
         return bool(self._pick("allow_private_dns", False)
-                    or any(g in private for g in self.machine_rule_groups))
+                    or any(g in private for g in self.machine_rule_groups)
+                    or any(spec.get("private_dns") for _, spec in self.llms))
 
     def image_or_none(self):
         """image, but None instead of dying when the conf file is missing.
@@ -871,13 +1090,18 @@ class Sandbox:
                 die(f"{self.name}: unknown rule group {group!r}. "
                     f"Known: {', '.join(sorted(table))}")
             sources.append((group, table[group]))
+        # Each model endpoint's own host and port, on HTTPS. After the groups
+        # and before extra_rules, like a group would be.
+        sources.append(("llm", [f"allow@{host}:tcp:{port}"
+                                for _, spec in self.llms for _, host, port in [llm_url(spec)]]))
         sources.append((None, self.extra_rules))
         rules = []
         for group, items in sources:
             for rule in items:
                 problem = rule_problem(rule)
                 if problem:
-                    where = (f"rule group `{group}` (`msbctl config` shows which file)" if group
+                    where = (f"[llm] in {tilde(CONFIG_FILE)}" if group == "llm"
+                             else f"rule group `{group}` (`msbctl config` shows which file)" if group
                              else f"extra_rules in {tilde(self._origin('extra_rules'))}")
                     die(f"{self.name}: {rule!r} in {where}: {problem}")
             rules.extend(items)
@@ -925,7 +1149,9 @@ class Sandbox:
                 # placeholder is allowed to appear in the BODY — which is where
                 # it lands as soon as the agent reads it back out of its own
                 # environment and it becomes part of the transcript.
-                flags += ["--secret", with_transcript_passthrough(CLAUDE_SPEC)]
+                flags += ["--secret", with_transcript_passthrough(CLAUDE_SPEC, self.transcript_hosts)]
+            elif not self.wants_component("claude"):
+                pass        # nothing here would use it
             elif claude_tokens():
                 warn(f"{self.name}: no Claude token named {self.claude_token!r} — Claude Code "
                      "will not be logged in. Add it with `msbctl setup` → Claude login, or "
@@ -940,7 +1166,7 @@ class Sandbox:
             if token:
                 env["GH_TOKEN"] = token
                 flags += ["--secret", with_transcript_passthrough(
-                    "GH_TOKEN@github.com,api.github.com")]
+                    "GH_TOKEN@github.com,api.github.com", self.transcript_hosts)]
             else:
                 note(f"no GH_TOKEN for {self.name} — " + (
                     "the clone of a private repo, git push and the GitHub API need one: "
@@ -975,7 +1201,7 @@ class Sandbox:
             value = own.get(var) or (shared.get(var) if from_registry else None)
             if value:
                 env[var] = value
-                flags += ["--secret", with_transcript_passthrough(spec)]
+                flags += ["--secret", with_transcript_passthrough(spec, self.transcript_hosts)]
             elif not from_registry:
                 note(f"no {var} for {self.name} — a binding from the project's sandbox.toml "
                      f"takes its value from {tilde(os.path.join(SECRETS_DIR, self.name + '.env'))} "
@@ -983,6 +1209,20 @@ class Sandbox:
             else:
                 note(f"no {var} for {self.name} — `msbctl secret add {self.name}` "
                      "(skipped for now)")
+
+        # Each model endpoint's key, bound to that endpoint's host alone. The
+        # operator's [llm] table names the host, so the shared file is a
+        # valid source; this sandbox's own file wins, for a key of its own.
+        for name, spec in self.llms:
+            var, host = llm_key_var(name), llm_url(spec)[1]
+            value = own.get(var) or shared.get(var)
+            if value:
+                env[var] = value
+                flags += ["--secret", with_transcript_passthrough(f"{var}@{host}",
+                                                                  self.transcript_hosts)]
+            else:
+                note(f"no {var} stored — pi sends {name} ({host}) no key, which is right only "
+                     "for a server that wants none (`msbctl setup` → Model endpoints)")
 
         if flags:
             # Substitution happens in request HEADERS only. A placeholder sent
@@ -1036,6 +1276,11 @@ class Sandbox:
             flags += ["--mount-dir", f"{src}:{dest}:" + ("ro" if mode == "ro"
                                                          else f"uid={uid},gid={gid}")]
 
+        if self.wants_component("pi"):
+            # pi's own state, kept here like Claude's, so its sessions survive a
+            # rebuild and ensure_pi() can write its config before every start.
+            os.makedirs(self.pi_state, mode=0o700, exist_ok=True)
+            flags += ["--mount-dir", f"{self.pi_state}:{GUEST_PI_DIR}:uid={uid},gid={gid}"]
         if self.claude_auth == "secret":
             os.makedirs(self.state, mode=0o700, exist_ok=True)
             flags += ["--mount-dir", f"{self.state}:/root/.claude:uid={uid},gid={gid}"]
@@ -1140,6 +1385,19 @@ class Sandbox:
         # log, which is what the rules are written in — so it stays on there
         # too, even though nothing is being enforced.
         flags += ["--tls-intercept"]
+        # A model endpoint on another port needs interception there too, or its
+        # key is never substituted. --tls-intercept-port REPLACES msb's default
+        # of 443 rather than adding to it, which would silently break every
+        # other HTTPS rule, so 443 is always restated (spike 17).
+        ports = sorted({llm_url(spec)[2] for _, spec in self.llms} - {443})
+        for port in [443, *ports] if ports else []:
+            flags += ["--tls-intercept-port", str(port)]
+        # A LAN server's certificate from its own CA, trusted for that host
+        # alone, never machine-wide. Create-time, like every TLS flag.
+        for _, spec in self.llms:
+            if spec.get("ca_cert"):
+                flags += ["--tls-upstream-ca-cert-for",
+                          f"{llm_url(spec)[1]}={os.path.expanduser(spec['ca_cert'])}"]
         flags += ["--root-disk", str(self.root_disk)]
         # From sandbox.toml / the registry / [defaults], never from dev.yaml,
         # which is not passed to msb. Flags also win over an msb_conf
@@ -2072,6 +2330,68 @@ def ensure_profile(box):
          "_", MERGE_CLAUDE_JSON, sandbox_profile_section(box)], check=False, quiet=True)
 
 
+def _write_private(path, text):
+    """Replace a file under a sandbox's state dir in one step."""
+    tmp = path + ".tmp"
+    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w",
+              encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def ensure_pi(box):
+    """Write pi's config into its state dir on THIS side, before every start.
+    The dir is the guest's ~/.pi, mounted, so no `msb exec` is involved and an
+    edit to config.toml lands on the next start. Three files, three rules:
+
+    agent/models.json    OVERWRITTEN: the sandbox's [llm] endpoints, and nothing
+                         else. No secret in it — `apiKey` names LLM_KEY_<NAME>,
+                         whose value in the guest is msb's placeholder.
+    agent/settings.json  MERGED: pi writes it too (the model you pick, the
+                         theme). msbctl turns install telemetry off and points
+                         the default at the first endpoint only while it names
+                         a provider the sandbox no longer has.
+    agent/AGENTS.md      OVERWRITTEN: the same managed text Claude gets as
+                         CLAUDE.md, with this sandbox's section.
+    """
+    if not box.wants_component("pi"):
+        return
+    endpoints = box.llms
+    agent = os.path.join(box.pi_state, "agent")
+    os.makedirs(agent, mode=0o700, exist_ok=True)
+    _write_private(os.path.join(agent, "models.json"), pi_models_json(endpoints))
+
+    path = os.path.join(agent, "settings.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            settings = json.load(fh)
+        if not isinstance(settings, dict):
+            settings = {}
+    except (OSError, ValueError):
+        settings = {}
+    # PI_OFFLINE in [agent_env.pi] already stops the ping; this is the switch
+    # pi documents for it, so a run without that env stays quiet too.
+    settings["enableInstallTelemetry"] = False
+    ours = [spec.get("provider") or name for name, spec in endpoints]
+    if ours and settings.get("defaultProvider") not in ours:
+        spec = endpoints[0][1]
+        settings["defaultProvider"] = ours[0]
+        if spec.get("models"):
+            settings["defaultModel"] = spec["models"][0]
+        else:
+            settings.pop("defaultModel", None)      # pi picks its provider's default
+    _write_private(path, json.dumps(settings, indent=2) + "\n")
+
+    if assemble_profile():
+        with open(os.path.join(PROFILE_DIR, "CLAUDE.md"), encoding="utf-8") as fh:
+            text = fh.read()
+        _write_private(os.path.join(agent, "AGENTS.md"),
+                       text.rstrip("\n") + "\n\n" + sandbox_profile_section(box) + "\n")
+    if not endpoints:
+        warn(f"{box.name}: pi has no model endpoint — `msbctl setup` → Model endpoints, "
+             f"then `msbctl edit {box.name}` → Models for pi")
+
+
 # Where ensure_identity() writes the guest's allowed-signers file for ssh
 # commit signing. Under /etc like the --system config that points at it.
 GUEST_ALLOWED_SIGNERS = "/etc/git/allowed_signers"
@@ -2286,6 +2606,7 @@ def ensure_running(box, table=None):
     ensure_agent_filter(box)
     ensure_bridge(box)
     ensure_profile(box)
+    ensure_pi(box)
     ensure_identity(box)
     ensure_git_push(box)
     ensure_git_checkstat(box)
@@ -2313,15 +2634,20 @@ def warn_missing_prereqs(box):
     """
     boot = box.project_cfg.get("bootstrap", {})
     wants_claude = boot.get("claude") is not False
+    wants_pi = bool(boot.get("pi"))
 
     needs = []
     # node comes from NodeSource unless the image already carries it, and this
     # cannot know which — so it is listed whenever anything needs node at all.
+    if wants_claude or wants_pi:
+        needs.append(("node (for the agents)", ["deb.nodesource.com"]))
     if wants_claude:
-        needs.append(("node (for claude-code)", ["deb.nodesource.com"]))
         needs.append(("claude-code install", ["registry.npmjs.org"]))
         needs.append(("claude-code runtime", ["api.anthropic.com",
                                               "platform.claude.com"]))
+    if wants_pi:
+        # Its runtime hosts are the [llm] endpoints, which bring their own rules.
+        needs.append(("pi install", ["registry.npmjs.org"]))
     needs.append(("gh" + (" + gitleaks" if boot.get("gitleaks") else "") + " downloads",
                   ["github.com", "release-assets.githubusercontent.com"]))
     if box.is_repo:
@@ -2380,8 +2706,8 @@ PINNED_KEYS = (
     # with nobody watching it.
     "cpus", "memory", "root_disk", "containers_disk", "caches", "workspace_disk",
 )
-# NOT pinned, on purpose: `image`, [bootstrap] and [env] act only inside the
-# guest, which is what the sandbox is for, and `conf` only names the file the
+# NOT pinned, on purpose: `image`, [bootstrap] (but for `pi`, see
+# project_policy()) and [env] act only inside the guest, which is what the sandbox is for, and `conf` only names the file the
 # image is read from (and must stay in the project).
 
 POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
@@ -2402,6 +2728,12 @@ def project_policy(box):
     """The project-layer values the pin covers. For a repo sandbox, also the
     commit they were read at, so a diff always names the commit being approved."""
     policy = {k: box.project_cfg[k] for k in PINNED_KEYS if k in box.project_cfg}
+    # Unlike the rest of [bootstrap], pi reaches outside the guest: it brings
+    # this machine's model endpoints with it — their egress, their keys and
+    # perhaps allow_private_dns. Recorded only when on, so a pin taken before
+    # pi existed still matches.
+    if box.project_cfg.get("bootstrap", {}).get("pi"):
+        policy["bootstrap.pi"] = True
     if box.is_repo:
         policy["_commit"] = box.repo_meta.get("sha", "")
     return policy
@@ -2774,12 +3106,13 @@ def refuse_before_create(box):
 
 
 def is_reserved_var(var):
-    """Variables with a FIXED binding: GH_TOKEN (github.com, api.github.com) and
-    every Claude token (Anthropic's hosts). No `secret_binds` entry, in any
-    layer, may name one: a second binding `GH_TOKEN@attacker.example` would
-    send the sandbox's real token wherever the binding says."""
+    """Variables with a FIXED binding: GH_TOKEN (github.com, api.github.com),
+    every Claude token (Anthropic's hosts) and every model endpoint's key
+    (LLM_KEY_*, its [llm] host). No `secret_binds` entry, in any layer, may name
+    one: a second binding `GH_TOKEN@attacker.example` would send the sandbox's
+    real token wherever the binding says."""
     return (var == "GH_TOKEN" or var == CLAUDE_TOKEN_VAR
-            or var.startswith(CLAUDE_TOKEN_VAR + "_"))
+            or var.startswith(CLAUDE_TOKEN_VAR + "_") or var.startswith(LLM_KEY_PREFIX))
 
 
 def reserved_binding_problems(box):
@@ -2829,6 +3162,7 @@ def do_create(box):
                 bootstrap_payload(box)], check=False)
     ensure_bridge(box)
     ensure_profile(box)
+    ensure_pi(box)
     ensure_identity(box)
     ensure_git_push(box)
     ensure_git_checkstat(box)
@@ -2885,6 +3219,8 @@ def bootstrap_payload(box):
         # Default TRUE: this manager exists to run agents, so an explicit
         # opt-out is the right shape rather than an explicit opt-in.
         "MSB_WANT_CLAUDE": "0" if boot.get("claude") is False else "1",
+        # Opt-in: it needs a model endpoint of this machine's to be any use.
+        "MSB_WANT_PI": "1" if boot.get("pi") else "0",
         "MSB_WANT_BUN": "1" if boot.get("bun") else "0",
         "MSB_WANT_GITLEAKS": "1" if boot.get("gitleaks") else "0",
         "MSB_PROJECT_DIR": box.guest_project,
@@ -2969,6 +3305,8 @@ def cmd_purge(args, config):
     note("This deletes, in this order:")
     note(f"  the sandbox          {box.name}")
     note(f"  its Claude state     {tilde(box.state)}")
+    if os.path.isdir(box.pi_state):
+        note(f"  its pi state         {tilde(box.pi_state)}  (pi's sessions)")
     owned = box.owned_volumes()
     if owned:
         note(f"  its disk volumes     {', '.join(owned)}  (package caches, container images"
@@ -2992,6 +3330,7 @@ def cmd_purge(args, config):
     run(["msb", "rm", box.name], check=False, quiet=True)
     stop_agent_filter(box)
     shutil.rmtree(box.state, ignore_errors=True)
+    shutil.rmtree(box.pi_state, ignore_errors=True)
     if box.is_repo:
         shutil.rmtree(box.project, ignore_errors=True)
     remove_sandbox_volumes(box)
@@ -3082,6 +3421,7 @@ def rename_sandbox(box, new):
     old = box.name
     moves = [(os.path.join(SECRETS_DIR, f"{old}.env"), os.path.join(SECRETS_DIR, f"{new}.env")),
              (box.state, os.path.join(STATE_DIR, "claude", new)),
+             (box.pi_state, os.path.join(STATE_DIR, "pi", new)),
              (os.path.join(AGENT_DIR, f"{old}.log"), os.path.join(AGENT_DIR, f"{new}.log")),
              (approved_path(old), approved_path(new)),
              (policy_dir(old), policy_dir(new))]
@@ -3883,7 +4223,7 @@ def _observe_report(box):
 # Guest paths the manager owns. A folder mounted over or inside one of these
 # would shadow the Claude state, the profile or podman's storage. The project's
 # own guest path is per sandbox, so callers add it (see parse_mount_spec()).
-RESERVED_GUEST = ("/root/.claude", "/opt/msb-profile", "/var/lib/containers",
+RESERVED_GUEST = ("/root/.claude", GUEST_PI_DIR, "/opt/msb-profile", "/var/lib/containers",
                   "/root/.ssh", "/tmp/ssh-agent.sock")
 # Where the project cannot go: inside the system, or over a folder whose
 # contents the image needs (mounting at /home would hide every home in it).
@@ -4319,7 +4659,7 @@ def bind_secret_live(box, config, spec, restart):
     if ":" in spec.split("@", 1)[0]:
         note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
         return
-    argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec)]
+    argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec, box.transcript_hosts)]
     if state == "running":
         argv.append("--restart" if restart else "--next-start")
     run(argv, env=env)
@@ -5000,9 +5340,147 @@ def section_local_file(config, ctx):
                 return
 
 
+# -- model endpoints, for pi
+
+def _summary_llms(config):
+    table = llm_endpoints(config)
+    if not table:
+        return "none yet (pi needs one)"
+    default = config.get("defaults", {}).get("llm", [])
+    return ", ".join(n + (" (default)" if n in default else "") for n in table)
+
+
+def section_llms(config, ctx):
+    while True:
+        config = load_config()
+        env = read_env_file(GLOBAL_ENV)
+        table = llm_endpoints(config)
+        default = list(config.get("defaults", {}).get("llm", []))
+        say("Model endpoints")
+        note("Where pi sends its requests: your own server (vLLM, llama.cpp, Ollama, …")
+        note("anything OpenAI-compatible) or a provider pi knows. HTTPS only — the key")
+        note("stays on this machine and is swapped in on the way out, which needs TLS.")
+        note("Keys are stored 0600 in secrets/global.env as LLM_KEY_<NAME>.")
+        for name, spec in table.items():
+            problem = llm_problem(name, spec)
+            url, _, _ = llm_url(spec)
+            key = "key stored" if env.get(llm_key_var(name)) else "no key"
+            models = ", ".join(spec.get("models", [])) or "(pi's own models)"
+            note(f"  {name:<12} {url}  {models}  {key}{'  (default)' if name in default else ''}")
+            if problem:
+                warn(f"[llm.{name}]: {problem}")
+        rows = ["add your own server", "add a provider pi knows (OpenRouter, OpenAI, …)"]
+        if table:
+            rows += ["store or replace a key", "choose the defaults for new sandboxes", "remove one"]
+        rows += ["back"]
+        action = choose_one("model endpoints", rows, 0)
+        if action.startswith("add your"):
+            _add_llm(config, None)
+        elif action.startswith("add a"):
+            provider = choose_one("which", list(PI_PROVIDERS) + ["cancel"], 0)
+            if provider != "cancel":
+                _add_llm(config, provider)
+        elif action.startswith("store"):
+            name = choose_one("key for", list(table) + ["cancel"], 0)
+            if name != "cancel":
+                _store_llm_key(name)
+        elif action.startswith("choose"):
+            names = list(table)
+            picked = toggle_list("defaults", names, [n for n in default if n in names])
+            set_toml_key(CONFIG_FILE, "llm", picked, table="defaults")
+            note("new sandboxes with pi get " + (", ".join(picked) or "no endpoint"))
+        elif action.startswith("remove"):
+            name = choose_one("remove which", list(table) + ["cancel"], 0)
+            if name == "cancel":
+                continue
+            remove_toml_table(CONFIG_FILE, f"llm.{name}")
+            if name in default:
+                set_toml_key(CONFIG_FILE, "llm", [n for n in default if n != name], table="defaults")
+            set_env_file_value(GLOBAL_ENV, llm_key_var(name), None)
+            using = [n for n in registered()
+                     if name in (read_toml(registry_path_for(n)).get("llm") or [])]
+            note(f"removed {name} and its key"
+                 + (f" — still named by {', '.join(using)}: `msbctl edit <name>` → Models for pi"
+                    if using else ""))
+        else:
+            return
+
+
+def _add_llm(config, provider):
+    """Ask for one [llm.<name>] table and write it, key by key, to config.toml."""
+    table = llm_endpoints(config)
+    name = ask("name for it (e.g. qwen)", provider or "").strip().lower()
+    if name in table:
+        warn(f"{name} exists already — remove it first")
+        return
+    spec = {}
+    if provider:
+        spec["provider"] = provider
+        model = ask(f"default model id (blank: pi's default for {provider})").strip()
+        if model:
+            spec["models"] = [model]
+    else:
+        spec["base_url"] = ask("its base URL (e.g. https://llm.home.example/v1)").strip()
+        if urllib.parse.urlsplit(spec["base_url"]).path.strip("/") == "":
+            note("no path: OpenAI-compatible servers (vLLM, llama.cpp, Ollama) answer under /v1")
+            if confirm(f"use {spec['base_url'].rstrip('/')}/v1 instead?"):
+                spec["base_url"] = spec["base_url"].rstrip("/") + "/v1"
+        # Commas only: an id may contain spaces ("Qwen3.8 Flash Next"), exactly
+        # as the server lists it under /v1/models.
+        spec["models"] = [m.strip() for m in
+                          ask("model id(s) as /v1/models lists them, comma-separated, "
+                              "the first is the default").split(",") if m.strip()]
+        size = ask("context window in tokens (blank: pi's 128000)").strip()
+        if size:
+            if not size.isdigit():
+                warn("a number of tokens, like 131072")
+                return
+            spec["context_window"] = int(size)
+    problem = llm_problem(name, spec)
+    if problem:
+        warn(problem)
+        return
+    if not provider:
+        host = llm_url(spec)[1]
+        ca = ask("the CA certificate that signed its certificate, as a PEM file "
+                 "(blank if publicly trusted)").strip()
+        if ca:
+            spec["ca_cert"] = os.path.realpath(os.path.expanduser(ca))
+        if confirm(f"does {host} resolve to a PRIVATE (LAN) address?"):
+            note("msb drops such answers as DNS-rebind protection, so sandboxes using it")
+            note("get allow_private_dns — msbctl sets it for them automatically.")
+            spec["private_dns"] = True
+        problem = llm_problem(name, spec)
+        if problem:
+            warn(problem)
+            return
+    for key, value in spec.items():
+        set_toml_key(CONFIG_FILE, key, value, table=f"llm.{name}")
+    note(f"saved [llm.{name}] in {tilde(CONFIG_FILE)} (compat, api, max_tokens and reasoning "
+         "are there for hand-editing)")
+    _store_llm_key(name)
+    default = list(config.get("defaults", {}).get("llm", []))
+    if name not in default and confirm(f"give {name} to every NEW sandbox with pi?"):
+        set_toml_key(CONFIG_FILE, "llm", default + [name], table="defaults")
+
+
+def _store_llm_key(name):
+    var = llm_key_var(name)
+    value = read_secret_hidden(f"its API key, stored as {var}")
+    if not value:
+        note("no key stored — right only for a server that wants none")
+        return
+    if any(c.isspace() for c in value):
+        warn("that key has whitespace in it — nothing was stored")
+        return
+    set_env_file_value(GLOBAL_ENV, var, value)
+    note(f"stored {var}; a running sandbox picks it up on its next start")
+
+
 SETUP_SECTIONS = [
     ("Git identities", section_identities, _summary_identities),
     ("Claude login", section_login, _summary_login),
+    ("Model endpoints", section_llms, _summary_llms),
     ("Your network", section_network, _summary_network),
     ("New-sandbox defaults", section_defaults, _summary_defaults),
 ]
@@ -5010,7 +5488,7 @@ SETUP_SECTIONS = [
 WELCOME_TEXT = """\
 msbctl runs each project in its own microVM: egress is deny-by-default, and your
 tokens never enter the VM — the sandbox holds a placeholder and the real value is
-substituted on the way out. Four one-time settings make it yours. Every one is
+substituted on the way out. Five one-time settings make it yours. Every one is
 optional, and `msbctl setup` brings you back to any of them later."""
 
 
@@ -5259,6 +5737,8 @@ def section_features(box, config, ctx):
         set_toml_key(project, "bun", plan["bun"], table="bootstrap"),
         set_toml_key(project, "gitleaks", plan["gitleaks"], table="bootstrap"),
         set_toml_key(project, "claude", "claude" in plan["agents"], table="bootstrap"),
+        # Absent is off, so a project that never had pi is not rewritten.
+        set_toml_key(project, "pi", True if "pi" in plan["agents"] else None, table="bootstrap"),
     ]
     private = config.get("defaults", {}).get("private_dns_groups", [])
     if any(g in private for g in portable) and not box.allow_private_dns:
@@ -5269,6 +5749,8 @@ def section_features(box, config, ctx):
             changed.append(True)
     if any(changed):
         ctx["rebuild"].add("features, egress groups and packages")
+    if "pi" in plan["agents"] and not box.wants_component("pi"):
+        section_llm(Sandbox(box.name, config), config, ctx)
     if "podman" in plan["features"] and not (box.containers_disk or boot_cfg(box).get("containers_storage")):
         note("podman has no image storage yet — see 'Container storage'")
     for key in plan["features"]:
@@ -5733,6 +6215,42 @@ def section_files(box, config, ctx):
                 warn(f"{tilde(path)} no longer parses: {exc} — fix it before anything else reads it")
 
 
+def _summary_llm(box):
+    if not box.wants_component("pi"):
+        return "pi is off"
+    return (", ".join(box.llm_names) or "none") + ("" if box.llm_pinned is not None else
+                                                   " (the default)")
+
+
+def pick_llms(config, current):
+    """Which [llm] endpoints, the first being pi's default. None if there are
+    none to pick from (it says how to add one)."""
+    names = list(llm_endpoints(config))
+    if not names:
+        note("no model endpoints on this machine yet — `msbctl setup` → Model endpoints")
+        return None
+    picked = toggle_list("endpoints", names, [n for n in current if n in names])
+    # toggle_list keeps the list's order; keep the current default first.
+    return sorted(picked, key=lambda n: (current.index(n) if n in current else len(current)))
+
+
+def section_llm(box, config, ctx):
+    """Which model endpoints pi gets. Each brings an egress rule and a key
+    binding, both fixed at create time, so a change is a rebuild."""
+    say("Models for pi")
+    if not box.wants_component("pi"):
+        note("pi is not on — turn it on under 'Features & agents' first")
+        return
+    picked = pick_llms(config, box.llm_names)
+    if picked is None:
+        return
+    value = None if picked == list(config.get("defaults", {}).get("llm", [])) else picked
+    if value == box.llm_pinned:
+        return
+    if set_toml_key(registry_path(box), "llm", value):
+        ctx["rebuild"].add("pi's model endpoints")
+
+
 EDIT_SECTIONS = [
     ("Name & folder", section_place, _summary_place),
     ("Features & agents", section_features, _summary_features),
@@ -5745,6 +6263,7 @@ EDIT_SECTIONS = [
     ("SSH keys", section_keys, _summary_keys),
     ("Git push", section_git_push, _summary_git_push),
     ("Claude token", section_claude_token, _summary_claude_token),
+    ("Models for pi", section_llm, _summary_llm),
     ("GitHub token", section_github, _summary_github),
     ("Secrets", section_secrets, _summary_secrets),
     ("Identity & autostart", section_identity, _summary_identity),
@@ -6092,6 +6611,25 @@ def version_lines(box, info):
     return lines
 
 
+def llm_rows(box):
+    """pi's endpoints for display: name, base_url, whether a key is stored.
+    Never the key. A broken [llm] table is shown, not fatal."""
+    if not box.wants_component("pi"):
+        return []
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
+    shared = read_env_file(GLOBAL_ENV)
+    table = llm_endpoints(box.config)
+    rows = []
+    for name in box.llm_names:
+        spec = table.get(name)
+        problem = "not defined in config.toml" if spec is None else llm_problem(name, spec)
+        var = llm_key_var(name)
+        rows.append({"name": name, "base_url": "" if problem else llm_url(spec)[0],
+                     "key_stored": bool(own.get(var) or shared.get(var)),
+                     "problem": problem})
+    return rows
+
+
 def show_data(box, table=None):
     """`show --json`: what one sandbox resolves to. Says whether each secret is
     STORED, never what it is: no value is ever put in here. For a Kandev
@@ -6125,6 +6663,8 @@ def show_data(box, table=None):
         "github_token_stored": bool(own.get("GH_TOKEN")),
         "git_push": box.git_push,
         "secrets": secrets,
+        "agents": [key for key, _, _ in AGENTS if box.wants_component(key)],
+        "llm": llm_rows(box),
     }
     if box.is_repo:
         data["commit"] = box.repo_meta.get("sha", "")
@@ -6174,6 +6714,9 @@ def cmd_show(args, config):
     note(f"image      {box.image}")
     note(f"resources  {box.cpus} cpu, {box.memory} ceiling, {box.root_disk} disk")
     note(f"autostart  {'yes' if box.autostart else 'no'}")
+    for row in llm_rows(box):
+        note(f"pi model   {row['name']:<10} {row['problem'] or row['base_url']}  "
+             f"{'key stored' if row['key_stored'] else 'no key'}")
     if box.containers_disk:
         note(f"containers {box.containers_disk} disk at /var/lib/containers")
     vols = msb_volumes()
@@ -6393,6 +6936,7 @@ def available_digest(image):
 # component -> (how to read it in the guest, how to parse that output)
 GUEST_PROBES = {
     "claude":   ("claude --version", r"([0-9]+\.[0-9]+\.[0-9]+)"),
+    "pi":       ("pi --version", r"([0-9]+\.[0-9]+\.[0-9]+)"),
     "node":     ("node --version", r"v?([0-9][0-9.]*)"),
     "gitleaks": ("gitleaks version", r"([0-9][0-9.]*)"),
     "gh":       ("gh --version", r"gh version ([0-9][0-9.]*)"),
@@ -6447,6 +6991,8 @@ def refresh_versions(names, config, cache):
         upstream["gitleaks"] = available_release("gitleaks/gitleaks", token)
     if needed("claude"):
         upstream["claude"] = available_npm("@anthropic-ai/claude-code")
+    if needed("pi"):
+        upstream["pi"] = available_npm(PI_PACKAGE)
     if needed("bun"):
         upstream["bun"] = available_release("oven-sh/bun", token)
     stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -6489,6 +7035,7 @@ UPDATERS = {
     "claude": ("npm install -g @anthropic-ai/claude-code@latest "
                "@agentclientprotocol/claude-agent-acp@latest >/dev/null "
                "&& claude --version"),
+    "pi": f"npm install -g {PI_PACKAGE}@latest >/dev/null && pi --version",
     "apt": "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y -qq upgrade",
 }
 
@@ -6515,7 +7062,7 @@ def cmd_update(args, config):
             script = UPDATERS[comp]
         else:
             die(f"nothing knows how to update {comp!r}. "
-                f"Known: claude, gh, gitleaks, bun, apt, image")
+                f"Known: claude, pi, gh, gitleaks, bun, apt, image")
 
         proc = run(["msb", "exec", box.name, "--no-tty", "--", "bash", "-c", script],
                    check=False, capture=True)
@@ -6533,6 +7080,9 @@ def cmd_update(args, config):
         elif comp == "claude":
             note("claude-code and claude-agent-acp are installed unpinned, so a rebuild picks up "
                  "whatever is latest then — nothing to record")
+        elif comp == "pi":
+            note("pi is installed unpinned, so a rebuild picks up whatever is latest then — "
+                 "nothing to record")
 
 
 def installer_script(comp, version):
@@ -7123,8 +7673,8 @@ FEATURES = [
 
 # Coding agents: a second, separate list because "which agent runs here" is a
 # different question from "which toolchains it can fetch". Each installs its own
-# agent and opens its own egress. Only claude exists so far; opencode and the
-# like get a row here plus an installer step in bootstrap.sh. Preselected,
+# agent and opens its own egress. A new one gets a row here plus an installer
+# step in bootstrap.sh (and a GUEST_PROBES/UPDATERS row). Preselected,
 # because this manager exists to run agents — but unticking all is valid, and
 # then nothing agent-shaped is installed. `requires` names FEATURES the agent
 # cannot work without; the wizard asks for agents first and locks those on.
@@ -7132,6 +7682,10 @@ AGENTS = [
     # Installed with npm, from a node that comes from deb.nodesource.com — both
     # in the `npm` group — so it cannot be off while claude is on.
     ("claude", "Claude Code", {"groups": ["claude"], "requires": ["npm"]}),
+    # No group: its egress is the [llm] endpoints it is given (see PI_PACKAGE).
+    # Opt-in, preselected only once [defaults] llm names an endpoint.
+    ("pi", "pi, for your own models or any provider",
+     {"groups": [], "requires": ["npm"], "opt_in": True}),
 ]
 
 
@@ -7225,7 +7779,10 @@ def pick_features(groups, default_groups, repo="", config=None, current=None):
 
     say("Coding agents")
     alabels = {f"{key:<8} {desc}": (key, spec) for key, desc, spec in AGENTS}
-    agent_on = [l for l, (k, _) in alabels.items() if not current or k in current["agents"]]
+    has_llm = bool((config or {}).get("defaults", {}).get("llm"))
+    agent_on = [l for l, (k, spec) in alabels.items()
+                if (k in current["agents"] if current
+                    else not spec.get("opt_in") or (k == "pi" and has_llm))]
     agents = [alabels[label] for label in toggle_list("agents", list(alabels), agent_on)]
     plan["agents"] = [key for key, _ in agents]
     for key, spec in agents:
@@ -7489,6 +8046,13 @@ def cmd_add(args, config):
     groups = sorted(g for g in config.get("rules", {}) if g != "base")
     default_groups = config.get("defaults", {}).get("rule_groups", [])
     plan = pick_features(groups, default_groups, repo, config)
+    llm = None                       # follow [defaults] llm
+    if "pi" in plan["agents"]:
+        say("Models for pi")
+        default_llm = list(config.get("defaults", {}).get("llm", []))
+        picked = pick_llms(config, default_llm)
+        if picked is not None and picked != default_llm:
+            llm = picked
     pick_resources(plan, config)
     pick_disks(plan, config)
     pick_caches(plan)
@@ -7537,6 +8101,8 @@ def cmd_add(args, config):
                         GUEST_PATH=guest_path,
                         REPO=repo, DATE=today, IDENTITY=identity,
                         GIT_PUSH=git_push, CLAUDE_TOKEN=claude_token,
+                        LLM=(f"llm = {json.dumps(llm)}" if llm is not None
+                             else '# llm = ["qwen"]'),
                         SSH_KEYS=format_ssh_keys(ssh_keys),
                         MOUNTS=format_list("mounts", mounts, '# mounts = ["~/reference:/mnt/reference:ro"]'),
                         EXTRA_RULE_GROUPS=format_list("extra_rule_groups", local_groups,
@@ -7593,6 +8159,7 @@ def cmd_add(args, config):
                             BUN="true" if plan["bun"] else "false",
                             GITLEAKS="true" if plan["gitleaks"] else "false",
                             CLAUDE="true" if "claude" in plan["agents"] else "false",
+                            PI="true" if "pi" in plan["agents"] else "false",
                             CONTAINERS_DISK=(f'containers_disk = "{containers_disk}"'
                                              if containers_disk else
                                              '# containers_disk = "20G"'),
@@ -11595,7 +12162,7 @@ def build_parser():
     p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
     p.add_argument("-c", "--components", nargs="+", default=["claude"],
                    metavar="component",
-                   help="claude (default), gh, gitleaks, bun, apt")
+                   help="claude (default), pi, gh, gitleaks, bun, apt")
     p.set_defaults(func=cmd_update)
 
     return parser

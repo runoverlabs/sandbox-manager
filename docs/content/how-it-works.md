@@ -107,7 +107,7 @@ collects the rest into a single rebuild offer when you're done.
    them;
 3. installs node from NodeSource, verifying the signing key's fingerprint, then
    Claude Code and its ACP adapter (`claude-agent-acp`), unless the project
-   turned it off;
+   turned it off, and [pi](models.md) if it turned that on;
 4. installs `gh`, and `bun` and `gitleaks` if asked for, from pinned,
    checksum-verified GitHub releases;
 5. marks the project folder as a git `safe.directory`, then runs the project's own setup

@@ -55,6 +55,13 @@ token stored before names existed is the one called `main`.
 > your real credentials and every project's transcripts in every VM. It's a
 > fallback for when `spikes/07-claude-token-secret.sh` fails, not a preference.
 
+### Model endpoints
+
+A key for one of pi's [model endpoints](models.md) is stored as
+`LLM_KEY_<NAME>` in `secrets/global.env` (or the sandbox's own file, which
+wins) and bound to that endpoint's host alone, like the Claude token. The
+endpoint must be HTTPS for the key to stay outside.
+
 ### GitHub
 
 One fine-grained token per project, scoped to that one repository (see
@@ -126,7 +133,8 @@ killed, which Claude Code reports as `API Error: Connection dropped
 (ECONNRESET)`.
 
 msbctl prevents this by adding `passthrough=` for the agent's own API hosts to
-every binding it emits. Passthrough lets the harmless *placeholder* travel to
+every binding it emits: Anthropic's, and in a sandbox with pi, each of its
+model endpoints. Passthrough lets the harmless *placeholder* travel to
 those hosts and never substitutes the real value, so the real token still goes
 only into headers, only to its own hosts.
 
