@@ -2333,8 +2333,8 @@ def ensure_profile(box):
 def _write_private(path, text):
     """Replace a file under a sandbox's state dir in one step."""
     tmp = path + ".tmp"
-    with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w",
-              encoding="utf-8") as fh:
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(text)
     os.replace(tmp, path)
 
