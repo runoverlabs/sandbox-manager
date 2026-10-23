@@ -2443,16 +2443,25 @@ def assemble_profile():
 
 def sandbox_profile_section(box):
     """A few lines appended to THIS sandbox's copy of CLAUDE.md naming its
-    features, so the agent knows podman is there before it goes looking, and how
-    git pushes, so it does not "fix" a remote that git rewrites anyway. From the
-    current config, so after an edit that still needs a rebuild it is ahead of the VM."""
+    features, so the agent knows podman is there before it goes looking, how
+    git pushes, so it does not "fix" a remote that git rewrites anyway, and where
+    its project is. The last one matters because this text lives OUTSIDE the
+    project (the guest's ~/.claude, ~/.pi/agent): a project that points at its
+    own `.agents/skills/` — the progressive-disclosure detail behind its
+    AGENTS.md — would otherwise be pointing at nothing for an agent whose cwd is
+    anywhere else. From the current config, so after an edit that still needs a
+    rebuild it is ahead of the VM."""
     feats = current_features(box)
     lines = ["## This sandbox", ""]
     if feats:
         lines += [f"`{box.name}` was set up with these features, each installed and its egress allowed:", ""]
         lines += [f"- **{key}**: {desc}" for key, desc, _ in FEATURES if key in feats]
         lines += [""]
-    lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push]]
+    lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push],
+              "",
+              f"Your project folder here is **{box.guest_project}**. If it ships agent "
+              f"skills they are in `{box.guest_project}/.agents/skills/` — plain files, "
+              "readable by any agent, not only the ones that load them by name."]
     return "\n".join(lines)
 
 

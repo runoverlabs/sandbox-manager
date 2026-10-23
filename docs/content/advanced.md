@@ -249,10 +249,14 @@ Editing the copy *inside* a sandbox does nothing: it's overwritten on the next
 start.
 
 Each sandbox's copy also ends with a short "This sandbox" section, written by
-msbctl: one line per feature it has (podman, python, …). It's built from the current config on every start, so after
-an edit that still needs a rebuild it describes the sandbox you'll get, not yet
-the one that's running. `msbctl edit <name>` → "View the CLAUDE.md it gets"
-shows the whole file as that sandbox will receive it.
+msbctl: one line per feature it has (podman, python, …), how git reaches
+GitHub, and where the project is mounted — including its `.agents/skills/`
+folder, because this file lives in the agent's home and a project that splits
+its instructions across skill files has to be pointed at them by absolute path.
+It's built from the current config on every start, so after an edit that still
+needs a rebuild it describes the sandbox you'll get, not yet the one that's
+running. `msbctl edit <name>` → "View the CLAUDE.md it gets" shows the whole
+file as that sandbox will receive it.
 
 ## Autostart
 
