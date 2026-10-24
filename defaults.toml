@@ -487,7 +487,11 @@ rust = [
 # refused" on production.cloudfront.docker.com. Codeberg's registry is
 # codeberg.org itself (Forgejo serves its packages and their blobs from the
 # same host). mcr.microsoft.com is where the devcontainers images (the default
-# image) come from. Add quay.io etc. as you need.
+# image) come from, and it has the same trap as Docker Hub: it answers the
+# registry API itself but 307-redirects every layer blob to a regional host,
+# <region>.data.mcr.microsoft.com (eastus.… when this was found; the region is
+# MCR's choice, so it is a wildcard). Without it the pull fails at the first blob with
+# an error naming only mcr.microsoft.com. Add quay.io etc. as you need.
 containers = [
     "allow@registry-1.docker.io:tcp:443",
     "allow@auth.docker.io:tcp:443",
@@ -497,6 +501,7 @@ containers = [
     "allow@pkg-containers.githubusercontent.com:tcp:443",
     "allow@codeberg.org:tcp:443",
     "allow@mcr.microsoft.com:tcp:443",
+    "allow@*.data.mcr.microsoft.com:tcp:443",
 ]
 
 go = [
