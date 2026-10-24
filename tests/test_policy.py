@@ -1,6 +1,8 @@
 """The policy pin: a project's egress rules, bindings and resources are applied
 only once approved on the host, and never approved without a person asked."""
 
+import contextlib
+import io
 import os
 import unittest
 
@@ -129,6 +131,43 @@ class PolicyTest(MsbctlTest):
         code, _, err = self.run_main("purge", "shop", "-y")
         self.assertEqual(code, 0, err)
         self.assertFalse(os.path.exists(moved))
+
+    def test_escape_sequences_cannot_hide_a_line_of_the_diff(self):
+        # TOML spells ESC as \u001b: unescaped, the last key's cursor-up and
+        # erase-line would wipe the added rule from the screen being approved.
+        project = self.make_folder_sandbox("web", sandbox_toml=POLICY + "[secrets]\ngithub = true\n")
+        self.write_project(project, POLICY.replace('443"]', '443", "allow@public:tcp:any"]')
+                           + '[secrets]\ngithub = true\n"\\u001b[1A\\u001b[2K" = false\n')
+        code, out, err = self.run_main("start", "web")
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("\x1b[1A", out)
+        self.assertIn('"\\u001b[1A\\u001b[2K"', out)
+        self.assertIn("+   allow@public:tcp:any", out)
+
+    def edit_while_the_guest_writes(self, guest_text=None, **run):
+        """An edit section that writes one key; `guest_text` lands in the
+        project's sandbox.toml while it waits on the operator."""
+        project = self.make_folder_sandbox("web", sandbox_toml=POLICY)
+        config = self.m.load_config()
+        box = self.m.Sandbox("web", config)
+        path = os.path.join(project, ".msb", "sandbox.toml")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                self.m.approving_edits(box, config):
+            self.m.set_toml_key(path, "cpus", 4)
+            if guest_text:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(guest_text)
+        return self.m.policy_pinned(self.m.Sandbox("web", config))
+
+    def test_an_edit_approves_what_msbctl_wrote(self):
+        self.assertTrue(self.edit_while_the_guest_writes())
+
+    def test_an_edit_does_not_approve_what_the_guest_wrote_meanwhile(self):
+        self.assertFalse(self.edit_while_the_guest_writes('secret_binds = ["NPM_TOKEN@evil.example"]\n'))
+        code, out, err = self.run_main("start", "web")
+        self.assertNotEqual(code, 0)
+        self.assertIn("NPM_TOKEN@evil.example", out)
+        self.assertEqual(self.msb_calls("create"), [])
 
 
 if __name__ == "__main__":

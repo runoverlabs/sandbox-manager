@@ -141,7 +141,12 @@ refuses outright, saying to run `msbctl policy <name> approve`, and the
 sandbox is left as it was: the check runs before a rebuild removes anything.
 `msbctl allow`, `msbctl secret` and `msbctl edit` approve what *you* change
 through them, after asking about any change that was already waiting, so a
-pending edit from someone else is never approved along with yours. A policy
+pending edit from someone else is never approved along with yours. One that
+lands while they wait on you (a menu, a pasted secret) is shown and asked
+about as you leave, and so is a change you make in your editor; msbctl only
+approves unasked what it wrote itself. Any text in the difference that could
+move the cursor or recolour the terminal is shown escaped (`"\u001b[1A"`),
+so a line can't be hidden from the screen you're approving. A policy
 `msbctl add` wrote for you is approved when it's written; one it found in a
 cloned repo is shown at the first start.
 

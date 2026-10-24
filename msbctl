@@ -3638,8 +3638,18 @@ def policy_pinned(box):
     return box.entry.get("policy_pin") == policy_digest(project_policy(box))
 
 
+def shown(value):
+    """A value read from a project, as it may reach the terminal: a printable
+    string as is, anything else JSON-escaped. sandbox.toml is writable from the
+    guest and TOML spells ESC as \\u001b, so a raw value could move the cursor
+    and erase the lines of the very diff the operator is approving."""
+    if isinstance(value, str) and value.isprintable():
+        return value
+    return json.dumps(value)
+
+
 def _policy_value(value):
-    return json.dumps(value) if not isinstance(value, str) else f'"{value}"'
+    return f'"{value}"' if isinstance(value, str) and value.isprintable() else json.dumps(value)
 
 
 def policy_diff(old, new):
@@ -3659,16 +3669,16 @@ def policy_diff(old, new):
             lines.append(f"- {key} = {_policy_value(before)}")
         elif isinstance(before, list) and isinstance(after, list):
             lines.append(f"  {key}:")
-            lines += [f"+   {item}" for item in after if item not in before]
-            lines += [f"-   {item}" for item in before if item not in after]
+            lines += [f"+   {shown(item)}" for item in after if item not in before]
+            lines += [f"-   {shown(item)}" for item in before if item not in after]
         elif isinstance(before, dict) and isinstance(after, dict):
             lines.append(f"  [{key}]")
             for sub in sorted(set(before) | set(after)):
                 if before.get(sub) != after.get(sub):
                     if sub in before:
-                        lines.append(f"-   {sub} = {_policy_value(before[sub])}")
+                        lines.append(f"-   {shown(sub)} = {_policy_value(before[sub])}")
                     if sub in after:
-                        lines.append(f"+   {sub} = {_policy_value(after[sub])}")
+                        lines.append(f"+   {shown(sub)} = {_policy_value(after[sub])}")
         else:
             lines.append(f"  {key}: {_policy_value(before)} -> {_policy_value(after)}")
     return lines
@@ -4610,11 +4620,34 @@ def _toml_assignment(lines, start, end, key):
     return None
 
 
+# What msbctl itself last wrote to a project's sandbox.toml while approving_edits
+# is open, by real path, or None once the file was found holding something else.
+# The guest can write that file at any moment, so leaving the section may only
+# approve, unasked, what msbctl wrote; see approving_edits.
+_OWN_WRITES = {}
+
+
+def _read_tracked(path):
+    with open(path, encoding="utf-8") as fh:
+        text = fh.read()
+    key = os.path.realpath(path)
+    if _OWN_WRITES.get(key, text) != text:
+        _OWN_WRITES[key] = None
+    return text
+
+
+def _write_tracked(path, text):
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    key = os.path.realpath(path)
+    if _OWN_WRITES.get(key) is not None:
+        _OWN_WRITES[key] = text
+
+
 def set_toml_key(path, key, value, table=None):
     """Set `key` (top level, or inside [table]) to `value` in the file at `path`;
     value None removes it. Returns True if the file changed."""
-    with open(path, encoding="utf-8") as fh:
-        before = fh.read()
+    before = _read_tracked(path)
     lines = before.splitlines()
     new = [] if value is None else f"{key} = {toml_literal(value)}".splitlines()
     region = _toml_region(lines, table)
@@ -4642,15 +4675,13 @@ def set_toml_key(path, key, value, table=None):
         tomllib.loads(after)
     except tomllib.TOMLDecodeError as exc:
         die(f"refusing to write {tilde(path)}: {key} would leave it invalid ({exc})")
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(after)
+    _write_tracked(path, after)
     return True
 
 
 def remove_toml_table(path, table):
     """Delete `[table]` and its keys from a TOML file, in place. True if it existed."""
-    with open(path, encoding="utf-8") as fh:
-        before = fh.read()
+    before = _read_tracked(path)
     lines = before.splitlines()
     region = _toml_region(lines, table)
     if region is None:
@@ -4662,8 +4693,7 @@ def remove_toml_table(path, table):
         del lines[start - 1]                       # collapse the gap it leaves
     after = "\n".join(lines) + "\n"
     tomllib.loads(after)
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(after)
+    _write_tracked(path, after)
     return True
 
 
@@ -4770,8 +4800,7 @@ def append_toml_list(path, key, items, after_key=None):
     """Add `items` to the top-level list `key` in a TOML file, in place, keeping
     the rest of the file (comments included) untouched. Returns the items that
     were actually new. The assignment is rewritten one entry per line."""
-    with open(path, encoding="utf-8") as fh:
-        text = fh.read()
+    text = _read_tracked(path)
     current = list(tomllib.loads(text).get(key, []))
     new = [i for i in items if i not in current]
     if not new:
@@ -4796,8 +4825,7 @@ def append_toml_list(path, key, items, after_key=None):
         out[anchor:anchor] = [""]
         at = anchor + 1
     out[at:at] = block
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(out) + "\n")
+    _write_tracked(path, "\n".join(out) + "\n")
     return new
 
 
@@ -4830,9 +4858,8 @@ def cmd_allow(args, config):
         target = sandbox_toml
     # Before writing: a change someone else made to the project's policy is
     # shown and asked about on its own, not approved along with this one.
-    check_policy(box, "adding rules")
-    added = append_toml_list(target, "extra_rules", fresh, after_key="rule_groups")
-    approve_policy(Sandbox(box.name, config))
+    with approving_edits(box, config, "adding rules"):
+        added = append_toml_list(target, "extra_rules", fresh, after_key="rule_groups")
     for rule in added:
         note(f"allowed: {rule}")
     note(f"written to {tilde(target)}")
@@ -5590,9 +5617,8 @@ def secret_set(box, config, args):
         return
     if github_off:
         project = require_project_file(box)
-        check_policy(box, "binding GitHub")
-        set_toml_key(project, "github", True, table="secrets")
-        approve_policy(Sandbox(box.name, config))
+        with approving_edits(box, config, "binding GitHub"):
+            set_toml_key(project, "github", True, table="secrets")
     bind_secret_live(box, config, GH_SPEC, args.restart)
 
 
@@ -5621,9 +5647,8 @@ def cmd_secret(args, config):
             die(f"{box.name} has no secret {args.var!r} (`msbctl secret ls {box.name}`)")
         if box.is_repo and spec not in box.registry_binds:
             require_project_file(box)       # the repo's own binding: it says where to change it
-        check_policy(box, "removing a secret")
-        remove_from_toml_list(target, "secret_binds", spec)
-        approve_policy(Sandbox(box.name, config))
+        with approving_edits(box, config, "removing a secret"):
+            remove_from_toml_list(target, "secret_binds", spec)
         state = state_of(box.name)
         if state != "absent":
             _, secret_vars = box.secret_env()
@@ -5643,18 +5668,18 @@ def cmd_secret(args, config):
     spec, preset = picked
     if is_reserved_var(secret_var(spec)):
         die(f"{secret_var(spec)} has a fixed binding and cannot be bound again")
-    check_policy(box, "adding a secret")
-    if preset:
-        note(f"create it at {preset.get('help', '(see the provider)')}")
-        if preset.get("usage"):
-            note(f"use it:  {preset['usage']}")
-    value = read_secret_hidden(f"paste the {secret_var(spec)} value")
-    if not value:
-        note("skipped")
-        return
-    store_secret_value(box.name, secret_var(spec), value)
-    append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
-    approve_policy(Sandbox(box.name, config))
+    # Held open across the paste: the guest can write sandbox.toml meanwhile.
+    with approving_edits(box, config, "adding a secret"):
+        if preset:
+            note(f"create it at {preset.get('help', '(see the provider)')}")
+            if preset.get("usage"):
+                note(f"use it:  {preset['usage']}")
+        value = read_secret_hidden(f"paste the {secret_var(spec)} value")
+        if not value:
+            note("skipped")
+            return
+        store_secret_value(box.name, secret_var(spec), value)
+        append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
         return
@@ -5670,8 +5695,7 @@ def cmd_secret(args, config):
 
 def remove_from_toml_list(path, key, item):
     """Remove one item from a top-level list in a TOML file, in place."""
-    with open(path, encoding="utf-8") as fh:
-        text = fh.read()
+    text = _read_tracked(path)
     current = [i for i in tomllib.loads(text).get(key, []) if i != item]
     lines, out, at, i = text.splitlines(), [], None, 0
     while i < len(lines):
@@ -5685,8 +5709,7 @@ def remove_from_toml_list(path, key, item):
         i += 1
     if at is not None:
         out[at:at] = ([f"{key} = ["] + [f"    {json.dumps(x)}," for x in current] + ["]"]) if current else [f"{key} = []"]
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(out) + "\n")
+    _write_tracked(path, "\n".join(out) + "\n")
 
 
 def cmd_cache(args, config):
@@ -7389,21 +7412,61 @@ POLICY_SECTIONS = (section_features, section_resources, section_caches,
 
 
 class approving_edits:
-    """Around an edit section that writes the project's policy: a pending
-    change made by someone else is asked about first, on its own, and what the
-    operator then chooses in the menu is approved as they leave it."""
+    """Around anything that writes the project's policy: a pending change made
+    by someone else is asked about first, on its own, and what msbctl then
+    writes is approved as it leaves.
 
-    def __init__(self, box, config):
-        self.box, self.config = box, config
+    The guest can write sandbox.toml while the section waits on the operator,
+    so leaving approves unasked only if the file still holds exactly what msbctl
+    wrote last (_OWN_WRITES). Otherwise — the guest, or the operator in an
+    editor — the change is shown and asked about, and where nobody may be asked
+    it stays unapproved for the next start to ask."""
+
+    def __init__(self, box, config, why="editing"):
+        self.box, self.config, self.why = box, config, why
 
     def __enter__(self):
-        check_policy(self.box, "editing")
+        # Read before checking: a write in between then reads as foreign.
+        self.path = os.path.realpath(project_path(self.box))
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                _OWN_WRITES[self.path] = fh.read()
+        except OSError:
+            _OWN_WRITES[self.path] = None
+        try:
+            check_policy(Sandbox(self.box.name, self.config), self.why)
+        except BaseException:
+            _OWN_WRITES.pop(self.path, None)
+            raise
+        return self
 
     def __exit__(self, kind, exc, tb):
+        own = _OWN_WRITES.pop(self.path, None)
         try:
-            approve_policy(Sandbox(self.box.name, self.config))
+            box = Sandbox(self.box.name, self.config)
+            with open(self.path, encoding="utf-8") as fh:
+                current = fh.read()
+        except OSError:
+            current = None
         except SystemExit:
-            pass        # the file no longer parses; _recover_broken handles that
+            return False    # the file no longer parses; _recover_broken handles that
+        if policy_pinned(box):
+            return False
+        if own is not None and current == own:
+            try:
+                box.project_cfg = tomllib.loads(own)    # the text compared, not a later read
+                approve_policy(box)
+                return False
+            except tomllib.TOMLDecodeError:
+                pass
+
+        try:
+            policy = project_policy(box)
+            ask_approval(box, policy, "applying it", tilde(project_path(box)))
+            approve_policy(box, policy)
+            note("approved")
+        except SystemExit as stop:
+            warn(f"{str(stop.code or '').replace('msbctl: ', '', 1)} — the next start asks again")
         return False
 
 
@@ -9408,16 +9471,16 @@ def cmd_add_repo(args, config):
         say("What the repo asks for")
         note(f"commit       {meta['sha'][:12]}  ({meta['branch'] or ref or 'detached'})"
              f"{'  private' if meta['private'] else ''}")
-        note(f"rule groups  base + {', '.join(cfg.get('rule_groups', defaults.get('rule_groups', []))) or '(none)'}")
+        note(f"rule groups  base + {', '.join(map(shown, cfg.get('rule_groups', defaults.get('rule_groups', [])))) or '(none)'}")
         for rule in cfg.get("extra_rules", []):
-            note(f"extra rule   {rule}")
+            note(f"extra rule   {shown(rule)}")
         for spec in cfg.get("secret_binds", []):
-            note(f"secret       {spec}")
+            note(f"secret       {shown(spec)}")
         for key in ("cpus", "memory", "root_disk", "containers_disk", "workspace_disk"):
             if key in cfg:
-                note(f"{key:<12} {cfg[key]}")
+                note(f"{key:<12} {shown(cfg[key])}")
         image = conf_image(os.path.join(tmp, ".msb", "dev.yaml"))
-        note(f"image        {image or defaults.get('image', '?') + '  (the default)'}")
+        note(f"image        {shown(image) if image else defaults.get('image', '?') + '  (the default)'}")
         if not os.path.isfile(os.path.join(tmp, ".msb", "sandbox.toml")):
             note("(no .msb/sandbox.toml in the repo: the machine's defaults apply)")
         if restricted():

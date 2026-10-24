@@ -15,6 +15,8 @@ release notes.
 - pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 
 ### Fixed
+- A policy change can no longer hide in the approval prompt: text from `.msb/sandbox.toml` that would move the cursor or recolour the terminal is shown escaped, so an `\u001b` sequence can't erase the added rule or secret binding from the screen you are approving.
+- `msbctl edit`, `allow` and `secret` no longer approve a change the sandbox wrote to `.msb/sandbox.toml` while they waited on you: only what msbctl itself wrote is approved unasked, and anything else (including your own edit in "Edit the files") is shown and asked about as you leave.
 - The `containers` rule group now allows `*.data.mcr.microsoft.com`, where Microsoft's registry actually serves image layers from, so pulling an `mcr.microsoft.com` image inside a sandbox no longer fails at the first layer; rebuild a sandbox with `containers` to pick it up.
 - pi no longer stops at a startup question nobody is there to answer. The sandbox's project folder (and `/tmp`) are trusted on every start, which also fixes the project's own `.agents/skills/` loading nothing when pi is started without a terminal (`msbctl exec . -- pi …`), where pi answered its own trust prompt with "no"; and the "What's New" block pi prints after it updates is switched off — `/changelog` still shows it. Both are pi's own settings under `~/.pi/agent/`, rewritten on every start, so nothing needs a rebuild.
 

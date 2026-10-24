@@ -27,6 +27,17 @@ instead. A reproduction against a throwaway sandbox is ideal.
   If msb-manager's use of it is what makes the problem reachable, report it here.
 - Anything that needs the attacker to already control the host account.
 
+## Reviews
+
+Whole-project reviews, so the next one can start from the diff since the last
+baseline (`git diff <commit>..main`) instead of from scratch. What they found
+and fixed is in `CHANGELOG.md`; anything still open is tracked privately until
+it is fixed.
+
+| Date | Baseline commit | Scope | How |
+|---|---|---|---|
+| 2026-10-24 | `3756a66` | `msbctl`, `msb-picker`, `bootstrap.sh`, installers, workflows | Split by attack surface: guest and untrusted repo → host, egress and secrets, remotes and Kandev, supply chain, command execution. Every finding was then challenged by an independent reviewer, and the high-severity ones were reproduced against msb 0.7.7. |
+
 ## Supported versions
 
 Only the latest release is supported. Release assets carry a build-provenance
