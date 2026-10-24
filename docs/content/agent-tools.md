@@ -86,8 +86,8 @@ From those three files, on every `msbctl start`:
 | TLS | interception on any port other than 443, or the rules are silent denies |
 | environment | the `[env]` table, as ordinary `--env` variables |
 | pi | the extension at `~/.pi/agent/extensions/msb-web.ts`, discovered by pi itself |
-| Claude Code | the skill at `~/.claude/skills/web/SKILL.md` |
-| the agent's context | the bundle's `description` in the "This sandbox" section of its `CLAUDE.md` / `AGENTS.md` |
+| Claude Code | the skill at `~/.claude/skills/msb-web/SKILL.md` |
+| the agent's context | the bundle's `description` in the "This sandbox" section of its `CLAUDE.md` / `AGENTS.md` — only for an agent the bundle has an adapter for |
 
 Nothing is mounted for it and nothing runs in the guest to install it: the
 adapters are copied into state directories that are already mounted, which is
@@ -103,7 +103,11 @@ how pi's model config and the managed `CLAUDE.md` arrive too.
 | attaching or detaching a bundle | a rebuild, for the same reason |
 
 `msbctl show <name>` lists the bundles, their hosts and which agents they have
-adapters for; `msbctl show <name> --json` puts the same under `tools`.
+adapters for; `msbctl show <name> --json` puts the same under `tools`. A bundle
+that is missing or broken is flagged there with what to fix (`problem` in the
+JSON), and `msbctl start` refuses that sandbox until it is fixed. A broken
+bundle no sandbox names stops nothing: `msbctl setup` → Agent tools shows it
+with its error.
 
 ## Rules worth knowing
 

@@ -23,13 +23,6 @@ PI_TS = "export default function (pi) { pi.registerTool({ name: 'websearch' }) }
 SKILL = "---\nname: web\n---\n\ncurl \"$WEB_SEARCH_URL\" -G --data-urlencode \"q=$1\"\n"
 
 
-def scripts_of(case):
-    """The shell text of every `msb exec` the run made — the script only, not
-    the arguments that follow it."""
-    return [c["argv"][c["argv"].index("-c") + 1] for c in case.msb_calls("exec")
-            if "-c" in c["argv"]]
-
-
 class BundleBase(MsbctlTest):
     def bundle(self, name="web", toml=WEB, pi=PI_TS, claude=SKILL):
         folder = os.path.join(self.m.TOOLS_DIR, name)
@@ -110,10 +103,37 @@ class BundleModelTest(BundleBase):
     def test_unknown_bundle_name_is_named_with_its_folder(self):
         self.default_tools("web")
         self.make_folder_sandbox("web")
-        code, _out, err = self.run_main("show", "web")
+        code, _out, err = self.run_main("start", "web")
         self.assertEqual(code, 1)
         self.assertIn("tool bundle 'web'", err)
         self.assertIn("holds nothing yet", err)
+
+    def test_show_flags_a_missing_bundle_instead_of_failing(self):
+        self.default_tools("web")
+        self.make_folder_sandbox("web")
+        code, _out, err = self.run_main("show", "web")
+        self.assertEqual(code, 0, err)
+        self.assertIn("holds nothing yet", err)
+        code, out, err = self.run_main("show", "web", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("holds nothing yet", json.loads(out)["tools"][0]["problem"])
+
+    def test_a_broken_bundle_stops_only_the_sandboxes_naming_it(self):
+        self.bundle()
+        self.bundle("draft", toml='description = "half-written\n')
+        self.default_tools("web")
+        self.make_folder_sandbox("web")
+        self.start()
+        self.assertIn("does not parse", self.m.available_bundles()["draft"][1])
+        self.m.set_toml_key(self.entry_path("web"), "tools", ["draft"])
+        code, _out, err = self.run_main("start", "web")
+        self.assertEqual(code, 1)
+        self.assertIn("does not parse", err)
+
+    def test_hosts_match_urls_whatever_their_case(self):
+        good = self.m.read_toml(os.path.join(self.bundle(), "bundle.toml"))
+        self.assertIsNone(self.m.bundle_problem("web", {
+            **good, "hosts": ["Search.Test"], "env": {"U": "https://search.TEST/q"}}))
 
     def test_name_must_be_a_slug(self):
         folder = self.bundle("Web_Tool", toml='description = "x"\nhosts = ["a.test"]\n',
@@ -198,28 +218,36 @@ class BundleAdapterTest(BundleBase):
         self.assertFalse(os.path.exists(self.extension()))
         self.assertTrue(os.path.exists(mine))
 
-    def test_claude_skill_seeded_as_an_argument(self):
-        self.bundle()
-        self.default_tools("web")
-        self.make_folder_sandbox("web")
-        self.start()
-        scripts = scripts_of(self)
-        self.assertIn("'/root/.claude/skills/web'", "\n".join(scripts))
-        # The text arrives as ONE argument, never spliced into the script line:
-        # a skill is prose, and prose with a quote in it must not be code.
-        args = [a for c in self.msb_calls("exec") for a in c["argv"]]
-        self.assertIn(SKILL, args)
-        self.assertNotIn(SKILL, "\n".join(scripts))
-        self.assertIn(r'''printf '%s\n' "${3}"''', "\n".join(scripts))
+    def skill(self, name="msb-web", sandbox="web"):
+        return os.path.join(self.m.STATE_DIR, "claude", sandbox, "skills", name, "SKILL.md")
 
-    def test_claude_skill_removed_with_the_bundle(self):
+    def test_claude_skill_written_on_the_host(self):
         self.bundle()
         self.default_tools("web")
         self.make_folder_sandbox("web")
         self.start()
+        with open(self.skill(), encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), SKILL)
+        # Never through the exec: no skill text in any script or argument.
+        self.assertNotIn(SKILL, [a for c in self.msb_calls("exec") for a in c["argv"]])
+
+    def test_claude_skill_removed_with_the_bundle_and_yours_kept(self):
+        self.bundle()
+        self.default_tools("web")
+        self.make_folder_sandbox("web")
+        self.start()
+        # A skill of the operator's under the bundle's own name: the prefix
+        # keeps the bundle off it, both while enabled and on the way out.
+        mine = self.skill("web")
+        os.makedirs(os.path.dirname(mine))
+        with open(mine, "w", encoding="utf-8") as fh:
+            fh.write("mine\n")
         self.m.set_toml_key(self.entry_path("web"), "tools", [])
         self.start()
-        self.assertIn("rm -rf '/root/.claude/skills/web'", "\n".join(scripts_of(self)))
+        self.assertFalse(os.path.exists(os.path.dirname(self.skill())))
+        self.assertTrue(os.path.exists(mine))
+        self.assertEqual(self.m.read_json(os.path.join(
+            self.m.TOOLS_STATE_DIR, "web.json")).get("claude"), [])
 
     def test_bundle_with_only_one_adapter(self):
         self.bundle(claude=None)
@@ -227,7 +255,7 @@ class BundleAdapterTest(BundleBase):
         self.make_folder_sandbox("web", sandbox_toml="[bootstrap]\npi = true\n")
         self.start()
         self.assertTrue(os.path.exists(self.extension()))
-        self.assertNotIn("/root/.claude/skills/web", "\n".join(scripts_of(self)))
+        self.assertFalse(os.path.exists(self.skill()))
 
 
 class BundleSurfaceTest(BundleBase):
@@ -251,6 +279,14 @@ class BundleSurfaceTest(BundleBase):
         box = self.m.Sandbox("web", self.m.load_config())
         text = self.m.sandbox_profile_section(box)
         self.assertIn("**web**: search the web and read what it returns", text)
+
+    def test_profile_names_a_bundle_only_to_its_harness(self):
+        self.bundle(claude=None)
+        self.default_tools("web")
+        self.make_folder_sandbox("web")
+        box = self.m.Sandbox("web", self.m.load_config())
+        self.assertIn("search the web", self.m.sandbox_profile_section(box, "pi"))
+        self.assertNotIn("search the web", self.m.sandbox_profile_section(box, "claude"))
 
     def test_profile_says_nothing_without_one(self):
         self.bundle()

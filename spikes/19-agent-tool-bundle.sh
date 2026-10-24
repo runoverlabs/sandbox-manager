@@ -151,7 +151,7 @@ else
   done
   guest() { msb exec "$SPIKE_SANDBOX" --no-tty -- sh -c "$1" 2>&1; }
   name="$(basename "$BUNDLE")"
-  for f in "/root/.pi/agent/extensions/msb-$name.ts" "/root/.claude/skills/$name/SKILL.md"; do
+  for f in "/root/.pi/agent/extensions/msb-$name.ts" "/root/.claude/skills/msb-$name/SKILL.md"; do
     if [ "$(guest "[ -f $f ] && echo yes")" = "yes" ]; then
       note "ok    $f"
     else

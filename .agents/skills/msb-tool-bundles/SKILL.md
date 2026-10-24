@@ -1,6 +1,6 @@
 ---
 name: msb-tool-bundles
-description: "Agent tool bundles: ~/.config/msb/tools/<name>/ with bundle.toml (description, hosts, [env], validated by bundle_problem()/bundle_host()), pi.ts and claude/SKILL.md; Sandbox.bundles from the registry's tools or [defaults] tools and never the project, its allow@host:tcp:port rules in net_rules() as source tools:<name>, its ports in --tls-intercept-port, bundle_env() under every [env], is_reserved_var() and the MSB_ prefix refused, apply_pi_bundles() copying msb-<name>.ts into STATE_DIR/pi/<name>/agent/extensions, ensure_profile() writing and removing /root/.claude/skills/<name>/SKILL.md through its exec, the STATE_DIR/tools/<name>.json marker that makes a disable take the adapter away, kandev getting none, section_tools/section_agent_tools, and spike 19. Use when changing how a capability reaches an agent, or when a tool an agent should have is missing or its endpoint is refused."
+description: "Agent tool bundles: ~/.config/msb/tools/<name>/ with bundle.toml (description, hosts, [env], validated by bundle_problem()/bundle_host()), pi.ts and claude/SKILL.md; Sandbox.bundles from the registry's tools or [defaults] tools and never the project, its allow@host:tcp:port rules in net_rules() as source tools:<name>, its ports in --tls-intercept-port, bundle_env() under every [env], is_reserved_var() and the MSB_ prefix refused, apply_pi_bundles() copying msb-<name>.ts into STATE_DIR/pi/<name>/agent/extensions, apply_claude_bundles() copying skills/msb-<name>/SKILL.md into STATE_DIR/claude/<name> (the guest's ~/.claude), the STATE_DIR/tools/<name>.json marker that makes a disable take the adapter away, kandev getting none, section_tools/section_agent_tools, and spike 19. Use when changing how a capability reaches an agent, or when a tool an agent should have is missing or its endpoint is refused."
 ---
 
 # Agent Tool Bundles
@@ -17,8 +17,15 @@ shipped**: a bundle points at endpoints the operator runs, so shipping one
 would aim every clone at someone else's server — the same reasoning as
 `machine_only_groups`, and the reason `Sandbox.bundles_pinned` reads `tools`
 from the registry entry only, falling back to `[defaults] tools`, and never
-from a project's `sandbox.toml`. `load_bundles()` refuses an unknown name or an
-invalid spec with the file named, at every start.
+from a project's `sandbox.toml`. `available_bundles()` parses every folder but
+never dies — a bundle that does not parse is `({}, "does not parse: …")` — so a
+half-written draft stops only the sandboxes that name it. `bundle_status()` /
+`Sandbox.bundle_status` give each named bundle's problem (unknown name, parse
+error, `bundle_problem()`) with the file named; `Sandbox.bundles` dies on the
+first one and is what every path that APPLIES a bundle reads (rules, env,
+adapters), at every start. `show`/`show --json` read `bundle_status` and flag
+the problem instead (a `problem` key per `tools` row). Both are
+`functools.cached_property`: one start reads them half a dozen times.
 
 `bundle_problem()` is the whole validation: slug folder name, no unknown keys,
 one-line `description` (it is what the agent is told it has), non-empty `hosts`
@@ -28,7 +35,8 @@ shell identifiers, are not `is_reserved_var()`, and do not start `MSB_` (msb's
 placeholder for a bound secret is the literal `$MSB_<VAR>` — spike 13 — and a
 bundle's env reaches the guest VERBATIM, so a mention in a body the interceptor
 cannot substitute is a refused request). An env value that parses as a URL must
-be https and its `host:port` must be in `hosts`, or the tool would be handed a
+be https and its `host:port` must be in `hosts` (compared lowercased, as
+`urlsplit().hostname` is), or the tool would be handed a
 call egress denies — which from inside the guest reads as an outage, not as a
 rule.
 
@@ -47,14 +55,18 @@ tool.
 Delivery is host-side, into mounts that already exist — no new mount, no
 `npm install`, nothing runs in the guest to install it.
 `apply_pi_bundles(box, agent)` copies each adapter to
-`STATE_DIR/pi/<name>/agent/extensions/msb-<name>.ts` (`PI_BUNDLE_PREFIX`), which
-pi discovers as `~/.pi/agent/extensions/`; `ensure_profile()` writes each
-Claude skill through its existing `msb exec`, the text as `${3}`-style quoted
-arguments and never spliced into the script. Which ones msbctl wrote is recorded
+`STATE_DIR/pi/<name>/agent/extensions/msb-<name>.ts` (`BUNDLE_PREFIX`), which
+pi discovers as `~/.pi/agent/extensions/`; `apply_claude_bundles(box)` (from
+`ensure_profile()`, secret mode only) copies each Claude skill to
+`STATE_DIR/claude/<name>/skills/msb-<name>/SKILL.md`, the guest's `~/.claude`.
+The prefix on both keeps a bundle off a skill or extension the operator has
+under the bundle's own name. A stale adapter whose removal fails stays in the
+marker and is retried next start. Which ones msbctl wrote is recorded
 in `STATE_DIR/tools/<name>.json` (`bundles_applied()`/`bundles_record()`), so a
 disable deletes exactly those and leaves an extension or skill the operator put
 there by hand; `rename_sandbox()` moves that marker and `purge` unlinks it.
-`sandbox_profile_section()` announces each bundle's `description`, because an
+`sandbox_profile_section(box, harness)` announces each bundle's `description`
+— only to the harness it ships an adapter for — because an
 agent that does not know a bundle exists reaches for the built-in web tools and
 hits the deny.
 

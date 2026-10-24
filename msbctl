@@ -65,6 +65,7 @@ import errno
 import fcntl
 import hashlib
 import hmac
+import functools
 import io
 import ipaddress
 import json
@@ -284,11 +285,11 @@ CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com,platform.claude.com"
 
 PI_PACKAGE = "@mariozechner/pi-coding-agent"
 GUEST_PI_DIR = "/root/.pi"
-# Claude Code's personal skills, seeded per boot like CLAUDE.md is.
-GUEST_CLAUDE_SKILLS = "/root/.claude/skills"
-# pi auto-discovers every top-level *.ts in its extensions dir, so msbctl's copy
-# of a bundle is prefixed: it is a plain file msbctl owns and may delete again.
-PI_BUNDLE_PREFIX = "msb-"
+# msbctl's copy of a bundle adapter is prefixed — pi's extensions/msb-<name>.ts,
+# Claude's skills/msb-<name>/ — so it is a file msbctl owns and may delete again,
+# never one the operator put there under the bundle's name. pi auto-discovers
+# every top-level *.ts in its extensions dir; Claude, every skills/*/SKILL.md.
+BUNDLE_PREFIX = "msb-"
 PI_BUNDLE_FILE = "pi.ts"
 CLAUDE_BUNDLE_FILE = os.path.join("claude", "SKILL.md")
 LLM_KEY_PREFIX = "LLM_KEY_"
@@ -419,7 +420,7 @@ def llm_default_model(spec):
 #
 #   bundle.toml        description, the hosts egress must allow, [env]
 #   pi.ts              a pi extension, copied into ~/.pi/agent/extensions/
-#   claude/SKILL.md    a Claude Code skill, copied into ~/.claude/skills/
+#   claude/SKILL.md    a Claude Code skill, copied into ~/.claude/skills/msb-<name>/
 #
 # Why machine-local and never a project's `tools` key: a bundle names the
 # operator's own endpoints, so a committed bundle name would die on every other
@@ -469,9 +470,12 @@ def bundle_toml(name):
 
 
 def available_bundles():
-    """{name: spec} for every ~/.config/msb/tools/<name>/bundle.toml that parses.
-    A folder without one is not a bundle and is passed over: that is where an
-    operator starts one."""
+    """{name: (spec, problem)} for every ~/.config/msb/tools/<name>/bundle.toml,
+    problem None when the bundle is usable. A folder without one is not a bundle
+    and is passed over: that is where an operator starts one. A bundle that does
+    not parse is reported, never fatal here: one half-written draft must not stop
+    every sandbox, including the ones that never name it — and `msbctl setup` →
+    Agent tools is where the operator goes to find out which file is at fault."""
     out = {}
     try:
         names = sorted(os.listdir(TOOLS_DIR))
@@ -479,8 +483,15 @@ def available_bundles():
         return out
     for name in names:
         path = bundle_toml(name)
-        if os.path.isfile(path):
-            out[name] = read_toml(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "rb") as fh:
+                spec = tomllib.load(fh)
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            out[name] = ({}, f"does not parse: {exc}")
+            continue
+        out[name] = (spec, bundle_problem(name, spec))
     return out
 
 
@@ -559,7 +570,9 @@ def bundle_problem(name, spec):
         problem = rule_problem(bundle_rule(*parsed))
         if problem:
             return f"host {entry!r}: {problem}"
-        routes.add(parsed)
+        # urlsplit() lowercases .hostname, so the routes it is checked against
+        # are compared lowercased too: DNS names are case-blind, and so is msb.
+        routes.add((parsed[0].lower(), parsed[1]))
     env = spec.get("env", {})
     if not isinstance(env, dict):
         return "env must be a table of NAME = \"value\""
@@ -600,21 +613,21 @@ def bundle_problem(name, spec):
     return None
 
 
-def load_bundles(names, where):
-    """[(name, spec, folder)] for the bundles a sandbox names, every refusal
-    naming the file. Loud on purpose: a tool an agent was promised and does not
-    have arrives as a mysterious absence, which is the failure this repo can
-    least absorb."""
+def bundle_status(names):
+    """[(name, spec, folder, problem)] for the bundles a sandbox names, problem
+    None when it is usable and otherwise naming the file. Reports rather than
+    dies, so `show` can flag a bundle deleted or broken after create; the paths
+    that apply one go through Sandbox.bundles, which does die."""
     table = available_bundles()
     out = []
     for name in names:
-        if name not in table:
-            die(f"tool bundle {name!r} (from {where}) has no {tilde(bundle_toml(name))} — "
-                f"{tilde(TOOLS_DIR)} holds {', '.join(table) or 'nothing yet'}")
-        problem = bundle_problem(name, table[name])
-        if problem:
-            die(f"tool bundle {name!r} in {tilde(bundle_toml(name))}: {problem}")
-        out.append((name, table[name], os.path.join(TOOLS_DIR, name)))
+        if name in table:
+            spec, problem = table[name]
+            problem = problem and f"in {tilde(bundle_toml(name))}: {problem}"
+        else:
+            spec, problem = {}, (f"has no {tilde(bundle_toml(name))} — {tilde(TOOLS_DIR)} "
+                                 f"holds {', '.join(table) or 'nothing yet'}")
+        out.append((name, spec, os.path.join(TOOLS_DIR, name), problem))
     return out
 
 
@@ -1200,17 +1213,28 @@ class Sandbox:
             names = self.config.get("defaults", {}).get("tools", [])
         return [names] if isinstance(names, str) else list(names)
 
-    @property
+    @functools.cached_property
+    def bundle_status(self):
+        """(name, spec, folder, problem) for each tool bundle this sandbox names.
+        Empty for a Kandev sandbox, which is provisioned by its own path with its
+        own egress and gets none of the per-boot seeding a bundle needs — say so
+        in the docs page rather than half-applying one. Cached: one start reads
+        it from the rules, the env, both profiles and both adapters."""
+        return [] if self.is_kandev else bundle_status(self.bundle_names)
+
+    @functools.cached_property
     def bundles(self):
         """(name, spec, folder) for each tool bundle: its rules, its [env] and its
-        adapters. Empty for a Kandev sandbox, which is provisioned by its own
-        path with its own egress and gets none of the per-boot seeding a bundle
-        needs — say so in the docs page rather than half-applying one."""
-        if self.is_kandev:
-            return []
+        adapters. Loud on purpose: a tool an agent was promised and does not
+        have arrives as a mysterious absence, which is the failure this repo can
+        least absorb. Only what applies a bundle reads this; `show` reads
+        bundle_status and flags the problem instead."""
         where = (tilde(registry_path(self)) if self.bundles_pinned is not None
                  else f"[defaults] in {tilde(CONFIG_FILE)}")
-        return load_bundles(self.bundle_names, where)
+        for name, _, _, problem in self.bundle_status:
+            if problem:
+                die(f"tool bundle {name!r} (from {where}) {problem}")
+        return [(name, spec, folder) for name, spec, folder, _ in self.bundle_status]
 
     @property
     def llms(self):
@@ -2710,7 +2734,7 @@ def assemble_profile():
     return True
 
 
-def sandbox_profile_section(box):
+def sandbox_profile_section(box, harness="claude"):
     """A few lines appended to THIS sandbox's copy of CLAUDE.md naming its
     features, so the agent knows podman is there before it goes looking, how
     git pushes, so it does not "fix" a remote that git rewrites anyway, and where
@@ -2719,20 +2743,28 @@ def sandbox_profile_section(box):
     own `.agents/skills/` — the progressive-disclosure detail behind its
     AGENTS.md — would otherwise be pointing at nothing for an agent whose cwd is
     anywhere else. From the current config, so after an edit that still needs a
-    rebuild it is ahead of the VM."""
+    rebuild it is ahead of the VM. `harness` is whose copy this is ("claude",
+    "pi"): a tool bundle is named only to the agent it ships an adapter for."""
     feats = current_features(box)
     lines = ["## This sandbox", ""]
     if feats:
         lines += [f"`{box.name}` was set up with these features, each installed and its egress allowed:", ""]
         lines += [f"- **{key}**: {desc}" for key, desc, _ in FEATURES if key in feats]
         lines += [""]
-    if box.bundles:
+    # Only the bundles this harness has an adapter for: the text is per agent,
+    # and naming a tool the agent was never given sends it looking for one that
+    # is not registered, or to its built-in web tools and the egress wall.
+    # bundle_status rather than bundles, so the read-only CLAUDE.md view in
+    # `msbctl edit` still opens with a broken bundle; a start dies on it first.
+    tools = [(name, spec) for name, spec, folder, problem in box.bundle_status
+             if not problem and harness in bundle_adapters(folder)]
+    if tools:
         # Named here because nothing else tells the agent they exist: a bundle's
         # adapter sits outside the project, and an agent that does not know one
         # is available reaches for the built-in web tools and hits the wall.
         lines += [f"These agent tools are attached to `{box.name}` — this machine's, not the "
                   "project's, and they reach sites the sandbox itself cannot:", ""]
-        lines += [f"- **{name}**: {spec['description']}" for name, spec, _ in box.bundles]
+        lines += [f"- **{name}**: {spec['description']}" for name, spec in tools]
         lines += [""]
     lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push],
               "",
@@ -2761,13 +2793,13 @@ def ensure_profile(box):
                   comes back. The project is yours and the VM is the boundary,
                   so the prompt guards nothing here.
 
-    skills/<name>/  OVERWRITTEN per boot for each tool bundle with a Claude
-                  adapter, and REMOVED when the bundle goes: a skill is the
-                  cheap way to hand Claude the same endpoints a pi extension
-                  uses, and one left behind would tell an agent about a route
-                  egress no longer allows. Written through this exec rather
-                  than from the host because ~/.claude is the sandbox's own
-                  directory mount, and no new mount is worth it for a file.
+    skills/msb-<name>/  OVERWRITTEN per boot for each tool bundle with a
+                  Claude adapter, and REMOVED when the bundle goes: a skill is
+                  the cheap way to hand Claude the same endpoints a pi
+                  extension uses, and one left behind would tell an agent about
+                  a route egress no longer allows. Written on THIS side, into
+                  the state dir that is the guest's ~/.claude, like pi's
+                  extensions (see apply_claude_bundles).
     """
     if box.claude_auth != "secret":
         return      # "mount" puts the host's real files in place; nothing to do
@@ -2798,26 +2830,9 @@ def ensure_profile(box):
                   f"else [ -f {GUEST_CLAUDE_JSON} ] || "
                   f"printf '%s\\n' {shq(onboarded_json(*trusted))} > {GUEST_CLAUDE_JSON}; fi")
 
-    # One argument per bundle skill, $3 up: the text comes from a folder only
-    # this machine owns, but it still goes in as an argument rather than being
-    # spliced into the script, which is the rule for everything here.
-    skills = bundle_skills(box)
-    applied = bundles_applied(box)
-    for stale in sorted(set(applied.get("claude", [])) - set(skills)):
-        script.append(f"rm -rf {shq(os.path.join(GUEST_CLAUDE_SKILLS, stale))}")
-    args = ["_", MERGE_CLAUDE_JSON, sandbox_profile_section(box)]
-    for n, (name, text) in enumerate(sorted(skills.items())):
-        folder = shq(os.path.join(GUEST_CLAUDE_SKILLS, name))
-        # Quoted, and in ${3} form rather than $3: a skill is multi-line prose,
-        # and an unquoted expansion word-splits it (and globs it) before printf.
-        script.append(f"mkdir -p {folder} && printf '%s\\n' "
-                      f'"${{{3 + n}}}" > {folder}/SKILL.md')
-        args.append(text)
+    apply_claude_bundles(box)
     run(["msb", "exec", box.name, "--no-tty", "--", "sh", "-c", " ; ".join(script),
-         *args], check=False, quiet=True)
-    if sorted(skills) != applied.get("claude"):
-        applied["claude"] = sorted(skills)
-        bundles_record(box, applied)
+         "_", MERGE_CLAUDE_JSON, sandbox_profile_section(box)], check=False, quiet=True)
 
 
 def _write_private(path, text):
@@ -2874,13 +2889,38 @@ def apply_pi_bundles(box, agent):
     os.makedirs(dest, mode=0o700, exist_ok=True)
     for stale in set(applied.get("pi", [])) - set(want):
         try:
-            os.unlink(os.path.join(dest, f"{PI_BUNDLE_PREFIX}{stale}.ts"))
+            os.unlink(os.path.join(dest, f"{BUNDLE_PREFIX}{stale}.ts"))
         except OSError:
             pass    # removed by hand, which is the outcome wanted anyway
     for name, text in want.items():
-        _write_private(os.path.join(dest, f"{PI_BUNDLE_PREFIX}{name}.ts"), text)
+        _write_private(os.path.join(dest, f"{BUNDLE_PREFIX}{name}.ts"), text)
     if sorted(want) != applied.get("pi"):
         applied["pi"] = sorted(want)
+        bundles_record(box, applied)
+
+
+def apply_claude_bundles(box):
+    """Copy each bundle's Claude skill into the state dir mounted as the guest's
+    ~/.claude, as skills/msb-<name>/SKILL.md, and remove the ones whose bundle
+    went. Host-side like apply_pi_bundles, so the removal either happens or
+    stays in the marker to be tried again — never recorded and skipped. The
+    msb- prefix keeps a bundle off a skill the operator installed under the
+    same name, which a removal would otherwise delete."""
+    want = bundle_skills(box)
+    applied = bundles_applied(box)
+    dest = os.path.join(box.state, "skills")
+    left = []
+    for stale in set(applied.get("claude", [])) - set(want):
+        folder = os.path.join(dest, f"{BUNDLE_PREFIX}{stale}")
+        shutil.rmtree(folder, ignore_errors=True)
+        if os.path.exists(folder):
+            left.append(stale)      # still there: keep it in the marker, retry next start
+    for name, text in want.items():
+        os.makedirs(os.path.join(dest, f"{BUNDLE_PREFIX}{name}"), mode=0o700, exist_ok=True)
+        _write_private(os.path.join(dest, f"{BUNDLE_PREFIX}{name}", "SKILL.md"), text)
+    record = sorted({*want, *left})
+    if record != applied.get("claude"):
+        applied["claude"] = record
         bundles_record(box, applied)
 
 
@@ -2970,7 +3010,7 @@ def ensure_pi(box):
         with open(os.path.join(PROFILE_DIR, "CLAUDE.md"), encoding="utf-8") as fh:
             text = fh.read()
         _write_private(os.path.join(agent, "AGENTS.md"),
-                       text.rstrip("\n") + "\n\n" + sandbox_profile_section(box) + "\n")
+                       text.rstrip("\n") + "\n\n" + sandbox_profile_section(box, "pi") + "\n")
     apply_pi_bundles(box, agent)
     if not resolved:
         warn(f"{box.name}: pi has no model endpoint — `msbctl setup` → Model endpoints, "
@@ -5945,14 +5985,13 @@ def section_tools(config, ctx):
                 note(line)
             return
         note("")
-        for name, spec in table.items():
+        for name, (spec, problem) in table.items():
             folder = os.path.join(TOOLS_DIR, name)
             adapters = sorted(bundle_adapters(folder))
             note(f"  {name:<12} {spec.get('description', '')}"
                  f"{' default' if name in default else ''}")
             note(f"  {'':<12} {' '.join(bundle_rules(spec))}  "
                  f"for {', '.join(adapters) if adapters else 'no agent: add pi.ts or claude/SKILL.md'}")
-            problem = bundle_problem(name, spec)
             if problem:
                 warn(f"{tilde(bundle_toml(name))}: {problem}")
         action = choose_one("agent tools", ["choose the defaults for new sandboxes",
@@ -7030,11 +7069,12 @@ def section_agent_tools(box, config, ctx):
         note("bundle; `msbctl setup` → Agent tools shows the shape")
         return
     picked = toggle_list("bundles for this sandbox", list(table), box.bundle_names)
-    if picked is None:
+    # As sets: toggle_list hands back the table's order, and the same bundles in
+    # another order are the same sandbox, not a pin and a rebuild.
+    if set(picked) == set(box.bundle_names):
         return
-    value = None if picked == list(config.get("defaults", {}).get("tools", [])) else picked
-    if value == box.bundles_pinned:
-        return
+    default = config.get("defaults", {}).get("tools", [])
+    value = None if set(picked) == set([default] if isinstance(default, str) else default) else picked
     if set_toml_key(registry_path(box), "tools", value):
         ctx["rebuild"].add("agent tool bundles")
 
@@ -7472,11 +7512,14 @@ def show_data(box, table=None):
         "secrets": secrets,
         "agents": [key for key, _, _ in AGENTS if box.wants_component(key)],
         "llm": llm_rows(box),
-        "tools": [{"name": name, "description": spec["description"],
-                   "hosts": [f"{h}:{p}" for h, p in bundle_hosts(spec)],
-                   "env": sorted(bundle_env(spec)),
-                   "adapters": sorted(bundle_adapters(folder))}
-                  for name, spec, folder in box.bundles],
+        # bundle_status, not bundles: a bundle deleted or broken since create is
+        # a row with its problem, not a `show --json` that fails for ls fan-out.
+        "tools": [{"name": name, "description": "" if problem else spec["description"],
+                   "hosts": [] if problem else [f"{h}:{p}" for h, p in bundle_hosts(spec)],
+                   "env": [] if problem else sorted(bundle_env(spec)),
+                   "adapters": sorted(bundle_adapters(folder)),
+                   "problem": problem}
+                  for name, spec, folder, problem in box.bundle_status],
     }
     if box.is_repo:
         data["commit"] = box.repo_meta.get("sha", "")
@@ -7530,11 +7573,19 @@ def cmd_show(args, config):
         note(f"pi model   {row['name']:<10} {row['problem'] or row['base_url']}  "
              f"{row['model'] or '(first served)'}  "
              f"{'key stored' if row['key_stored'] else 'no key'}")
-    for name, spec, folder in box.bundles:
+    for name, spec, folder, problem in box.bundle_status:
+        if problem:
+            warn(f"tool       {name}: {problem} — `msbctl start` refuses until it is fixed")
+            continue
         adapters = sorted(bundle_adapters(folder))
         note(f"tool       {name:<10} {spec['description']}  "
              f"{', '.join(f'{h}:{p}' for h, p in bundle_hosts(spec))}  "
              f"{'for ' + ', '.join(adapters) if adapters else 'NO ADAPTER — nothing to install'}")
+    # The env and rules below without a broken bundle, flagged just above:
+    # Sandbox.bundles would die on it, and `show` is where the operator comes
+    # to find out why.
+    box.bundles = [(name, spec, folder) for name, spec, folder, problem
+                   in box.bundle_status if not problem]
     if box.containers_disk:
         note(f"containers {box.containers_disk} disk at /var/lib/containers")
     vols = msb_volumes()
