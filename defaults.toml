@@ -102,6 +102,14 @@ private_dns_groups = []
 # default. `msbctl setup` → Model endpoints sets both.
 llm = []
 
+# The agent tool bundles (~/.config/msb/tools/<name>/, see
+# docs/content/agent-tools.md) every new sandbox gets. Ship empty on purpose:
+# a bundle names endpoints the operator runs and opens egress to them, so one
+# committed here would point every clone at someone else's server. Each brings
+# `allow@host:tcp:port` rules and its [env]; a registry entry overrides with
+# `tools = [...]`, and `msbctl setup` → Agent tools sets this.
+tools = []
+
 # "secret" — bind CLAUDE_CODE_OAUTH_TOKEN with --secret and give the sandbox
 #            its own ~/.claude. The real credential never enters the VM.
 # "mount"  — bind-mount the host's ~/.claude and ~/.claude.json. Shared

@@ -15,6 +15,12 @@ secrets/
 # Release builds from scripts/package.sh.
 dist/
 
+# What this MACHINE owns and the repo must not carry, staged in the checkout
+# because a dev sandbox mounts nothing else: agent tool bundles point at the
+# operator's own endpoints, so they live in ~/.config/msb/tools/ and never here.
+# See docs/content/agent-tools.md.
+/local/
+
 # The documentation site, built by docs/build.py.
 docs/_site/
 
