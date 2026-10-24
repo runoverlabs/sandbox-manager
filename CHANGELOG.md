@@ -10,6 +10,7 @@ release notes.
 
 ### Added
 - Agent tools: a capability your own endpoints back (web search, page reading, anything else), attached to sandboxes from one folder — `~/.config/msb/tools/<name>/` with a `bundle.toml`, a pi extension and a Claude Code skill. Its egress rules and environment are emitted from the bundle, the adapters are installed at every start and removed when it goes, and `msbctl setup` → Agent tools turns them on for new sandboxes (`msbctl edit` for one). Nothing belongs in the project; see the docs site's "Agent tools" page.
+- A tool bundle can give pi a published pi package (`pi_package = "name"` or `"name@1.2.3"` in `bundle.toml`), such as `billion-context-pi`: msbctl declares it in pi's settings and pi installs it inside the sandbox on the next start, onto the mount that survives a rebuild; `msbctl update <name> -c pi` now also updates pi's packages (a pinned one stays).
 - Each sandbox now tells its agent where its project is mounted and where the project's own `.agents/skills/` folder is, so those files are reachable from outside it; nothing to do, it lands on the next start.
 - pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 

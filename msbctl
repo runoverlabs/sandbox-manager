@@ -474,8 +474,16 @@ def llm_default_model(spec):
 #
 # msb-manager ships NO bundle, because it cannot know your endpoints. The format
 # and a worked example are in docs/content/agent-tools.md.
+#
+# `pi_package` hands pi a published pi package instead of (or beside) a pi.ts:
+# "name" or "name@1.2.3", an npm name and nothing else. It is installed by pi
+# INSIDE the guest (`pi install npm:<spec>`), into ~/.pi/agent/npm/, which is on
+# the /root/.pi mount — so it outlives a rebuild, and this side can tell whether
+# it is there by reading its package.json. See sync_pi_packages(). msbctl never
+# fetches a package itself, never resolves a dependency and names none: what
+# goes in is what the operator wrote here.
 
-TOOL_KEYS = ("description", "hosts", "env")
+TOOL_KEYS = ("description", "hosts", "env", "pi_package")
 TOOL_VAR_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 # Shown where there is nothing to pick yet, because a bundle is written rather
 # than configured: no picker can guess an endpoint.
@@ -577,6 +585,35 @@ def bundle_env(spec):
     return dict(spec.get("env", {}))
 
 
+# An npm package name, optionally scoped, then an optional exact version. No
+# range and no dist-tag: a pin is a version, and anything else is "unpinned",
+# which `msbctl update -c pi` moves (pi's own rule: `npm:name@x.y.z` is pinned).
+PI_PACKAGE_NAME = re.compile(r"(@[a-z0-9][a-z0-9._~-]*/)?[a-z0-9][a-z0-9._~-]*\Z")
+PI_PACKAGE_VERSION = re.compile(r"\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?\Z")
+
+
+def split_pi_package(text):
+    """("name", "1.2.3" or None) of a `pi_package` value. The scope's own @ is
+    not a version separator."""
+    name, sep, version = text[1:].partition("@") if text.startswith("@") else text.partition("@")
+    return (("@" + name) if text.startswith("@") else name), (version if sep else None)
+
+
+def pi_package_problem(text):
+    if not isinstance(text, str) or not text:
+        return "pi_package must be an npm package name, optionally @<exact version>"
+    if ":" in text or text.startswith((".", "/", "~")):
+        return (f"pi_package {text!r} must be a bare npm name — no npm:, git:, URL or path "
+                "source: msbctl delivers a published package and nothing else")
+    name, version = split_pi_package(text)
+    if not PI_PACKAGE_NAME.match(name) or len(name) > 214:
+        return f"pi_package {text!r}: {name!r} is not an npm package name"
+    if version is not None and not PI_PACKAGE_VERSION.match(version):
+        return (f"pi_package {text!r}: pin an exact version (1.2.3) or none at all — "
+                "a range or a tag would move without `msbctl update` moving it")
+    return None
+
+
 def bundle_problem(name, spec):
     """Why a bundle cannot be used, or None. Each refusal names what to fix."""
     if not NAME_SLUG.fullmatch(name):
@@ -592,8 +629,16 @@ def bundle_problem(name, spec):
         return "description is required: it is what an agent inside the sandbox is told it has"
     if "\n" in desc:
         return "description must be one line"
+    if "pi_package" in spec:
+        problem = pi_package_problem(spec["pi_package"])
+        if problem:
+            return problem
     hosts = spec.get("hosts")
-    if not isinstance(hosts, list) or not hosts:
+    # A package that only talks to the sandbox's own [llm] endpoint (already
+    # routed) has no endpoint of its own, so `hosts` may be left out for it.
+    if hosts is None and "pi_package" in spec:
+        hosts = []
+    elif not isinstance(hosts, list) or not hosts:
         return ("hosts is required (HOST or HOST:PORT): the egress rules are emitted from "
                 "it, so a sandbox can never have the tool without the route")
     routes = set()
@@ -668,13 +713,18 @@ def bundle_status(names):
     return out
 
 
-def bundle_adapters(folder):
+def bundle_adapters(folder, spec=None):
     """{harness: path} of the adapters a bundle actually ships. Derived from the
-    files rather than from a key, so the key cannot lie about them."""
-    return {harness: os.path.join(folder, part)
-            for harness, part in (("pi", PI_BUNDLE_FILE),
-                                  ("claude", CLAUDE_BUNDLE_FILE))
-            if os.path.isfile(os.path.join(folder, part))}
+    files rather than from a key, so the key cannot lie about them — except
+    `pi_package`, which is pi's adapter by declaration (its value stands in
+    for the path) and is installed rather than copied."""
+    out = {harness: os.path.join(folder, part)
+           for harness, part in (("pi", PI_BUNDLE_FILE),
+                                 ("claude", CLAUDE_BUNDLE_FILE))
+           if os.path.isfile(os.path.join(folder, part))}
+    if (spec or {}).get("pi_package") and "pi" not in out:
+        out["pi"] = "npm:" + spec["pi_package"]
+    return out
 
 
 # ------------------------------------------------------- what a server serves
@@ -2794,7 +2844,7 @@ def sandbox_profile_section(box, harness="claude"):
     # bundle_status rather than bundles, so the read-only CLAUDE.md view in
     # `msbctl edit` still opens with a broken bundle; a start dies on it first.
     tools = [(name, spec) for name, spec, folder, problem in box.bundle_status
-             if not problem and harness in bundle_adapters(folder)]
+             if not problem and harness in bundle_adapters(folder, spec)]
     if tools:
         # Named here because nothing else tells the agent they exist: a bundle's
         # adapter sits outside the project, and an agent that does not know one
@@ -2936,6 +2986,112 @@ def apply_pi_bundles(box, agent):
         bundles_record(box, applied)
 
 
+# Where pi installs a user-scope npm package: <agent dir>/npm/node_modules/<name>
+# (getNpmInstallRoot() in pi's package-manager.js, 1.4). Under GUEST_PI_DIR, so
+# on the mount, so readable from this side as box.pi_state/agent/npm/...
+PI_NPM_ROOT = "npm"
+
+
+def pi_package_installed(box, name):
+    """The version of npm package `name` pi has installed in this sandbox, read
+    from the mount on THIS side, or None. No exec: this is what lets a start
+    run nothing in the guest unless something is actually missing."""
+    data = read_json(os.path.join(box.pi_state, "agent", PI_NPM_ROOT, "node_modules",
+                                  *name.split("/"), "package.json"))
+    version = data.get("version") if isinstance(data, dict) else None
+    return version if isinstance(version, str) else None
+
+
+def pi_package_source_name(entry):
+    """The npm name a settings.json `packages` entry is for, or None for a
+    git/local source. pi's own identity rule (getPackageIdentity): an npm
+    source is the same package whatever its version."""
+    source = entry.get("source") if isinstance(entry, dict) else entry
+    if not isinstance(source, str) or not source.startswith("npm:"):
+        return None
+    return split_pi_package(source[4:])[0]
+
+
+def plan_pi_packages(box, settings):
+    """Merge the bundles' pi packages into settings.json's `packages` (MERGED,
+    like the rest of that file) and say what the guest has to do about it.
+
+    msbctl's entries are the ones its marker lists; a package the operator added
+    with `pi install` is left exactly where it is. A detached bundle's entry is
+    dropped HERE, which is what stops pi loading it whether or not the guest-side
+    uninstall then works. Returns (install, remove): specs not installed (or off
+    their pin) and names msbctl declared that no bundle wants any more."""
+    want = {}
+    for _, spec, _ in box.bundles:
+        if spec.get("pi_package"):
+            name, _ = split_pi_package(spec["pi_package"])
+            want[name] = spec["pi_package"]
+    owned = set(bundles_applied(box).get("pi_packages", []))
+    packages = settings.get("packages")
+    packages = packages if isinstance(packages, list) else []
+    kept = [p for p in packages if pi_package_source_name(p) not in owned | set(want)]
+    settings["packages"] = kept + [f"npm:{spec}" for spec in want.values()]
+    if not settings["packages"]:
+        del settings["packages"]
+    install = []
+    for name, spec in want.items():
+        have = pi_package_installed(box, name)
+        pin = split_pi_package(spec)[1]
+        if have is None or (pin and have != pin):
+            install.append(spec)
+    remove = sorted(n for n in owned - set(want) if pi_package_installed(box, n))
+    return install, remove
+
+
+def sync_pi_packages(box, install, remove):
+    """Install and uninstall the bundles' pi packages INSIDE the guest, with
+    the guest's own npm — the host never fetches one. Runs only when
+    plan_pi_packages() found work, so an ordinary start execs nothing.
+
+    PI_OFFLINE=0 for these commands alone: [agent_env.pi]'s PI_OFFLINE=1 is
+    what stops pi installing a missing `packages` entry by itself at startup
+    (installMissing() returns early on it), which is why msbctl does it here.
+    The removal is npm's uninstall in pi's npm root, not `pi remove`, because
+    the settings entry is already gone (see plan_pi_packages) and `pi remove`
+    exits non-zero on a source it cannot find in settings.
+
+    Success is read back from the mount, not from the exit status: a package
+    that did not land is a warning naming it, the start carries on (pi simply
+    lacks it), and the next start tries again."""
+    npm_root = f"{GUEST_PI_DIR}/agent/{PI_NPM_ROOT}"
+    steps = []
+    if remove:
+        steps.append((f"removing pi package {', '.join(remove)}",
+                      f'npm uninstall --legacy-peer-deps --prefix {npm_root} "$@"',
+                      remove))
+    if install:
+        steps.append((f"installing pi package {', '.join(install)}",
+                      'rc=0; for s; do PI_OFFLINE=0 pi install "npm:$s" || rc=1; done; exit $rc',
+                      install))
+    for what, script, args in steps:
+        # stderr: `msbctl exec` hands its stdout to the command it runs.
+        print(f"   {box.name}: {what} (in the guest)", file=sys.stderr)
+        proc = run(["msb", "exec", box.name, "--no-tty", "--", "sh", "-c", script, "_", *args],
+                   check=False, capture=True)
+        if proc.returncode != 0:
+            detail = " ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-3:])
+            warn(f"{box.name}: {what} failed ({proc.returncode}): {detail[:300]}")
+    applied = bundles_applied(box)
+    still = [n for n in remove if pi_package_installed(box, n)]
+    want = [split_pi_package(spec["pi_package"])[0] for _, spec, _ in box.bundles
+            if spec.get("pi_package")]
+    for spec in install:
+        name, pin = split_pi_package(spec)
+        have = pi_package_installed(box, name)
+        if have is None or (pin and have != pin):
+            warn(f"{box.name}: pi package {spec} is not installed — pi starts without it; "
+                 "the next start tries again")
+    record = sorted({*want, *still})
+    if record != applied.get("pi_packages", []):
+        applied["pi_packages"] = record
+        bundles_record(box, applied)
+
+
 def apply_claude_bundles(box):
     """Copy each bundle's Claude skill into the state dir mounted as the guest's
     ~/.claude, as skills/msb-<name>/SKILL.md, and remove the ones whose bundle
@@ -2963,8 +3119,9 @@ def apply_claude_bundles(box):
 
 def ensure_pi(box):
     """Write pi's config into its state dir on THIS side, before every start.
-    The dir is the guest's ~/.pi, mounted, so no `msb exec` is involved and an
-    edit to config.toml lands on the next start. Three files, three rules:
+    The dir is the guest's ~/.pi, mounted, so no `msb exec` is involved (but for
+    a pi package that needs installing) and an edit to config.toml lands on the
+    next start. Three files, three rules:
 
     agent/models.json    OVERWRITTEN: the sandbox's [llm] endpoints and, for a
                          server of yours, the models it serves NOW (asked from
@@ -2988,6 +3145,11 @@ def ensure_pi(box):
                          adapter, added and removed by the marker (see
                          apply_pi_bundles). Anything else in there is the
                          operator's and stays untouched.
+    agent/npm/           a bundle's `pi_package`, declared in settings.json's
+                         `packages` and installed by pi in the guest. The one
+                         thing here that may `msb exec`, and only when a
+                         package is missing, off its pin or detached (see
+                         sync_pi_packages).
     """
     if not box.wants_component("pi"):
         return
@@ -3037,6 +3199,7 @@ def ensure_pi(box):
     # less risk. The changelog goes quiet through PI_CHANGELOG_SEEN, above.
     settings["defaultProjectTrust"] = "always"
     settings["lastChangelogVersion"] = PI_CHANGELOG_SEEN
+    install, remove = plan_pi_packages(box, settings)
     marker = os.path.join(agent, ".msbctl.json")
     if effective:
         pid = next(iter(effective))
@@ -3077,6 +3240,7 @@ def ensure_pi(box):
         _write_private(os.path.join(agent, "AGENTS.md"),
                        text.rstrip("\n") + "\n\n" + sandbox_profile_section(box, "pi") + "\n")
     apply_pi_bundles(box, agent)
+    sync_pi_packages(box, install, remove)
     if not resolved:
         warn(f"{box.name}: pi has no model endpoint — `msbctl setup` → Model endpoints, "
              f"then `msbctl edit {box.name}` → Models for pi")
@@ -6053,10 +6217,13 @@ def section_tools(config, ctx):
         note("")
         for name, (spec, problem) in table.items():
             folder = os.path.join(TOOLS_DIR, name)
-            adapters = sorted(bundle_adapters(folder))
+            adapters = sorted(bundle_adapters(folder, spec))
             note(f"  {name:<12} {spec.get('description', '')}"
                  f"{' default' if name in default else ''}")
-            note(f"  {'':<12} {' '.join(bundle_rules(spec))}  "
+            what = bundle_rules(spec)
+            if isinstance(spec.get("pi_package"), str):
+                what.append(f"pi package {spec['pi_package']}")
+            note(f"  {'':<12} {' '.join(what)}  "
                  f"for {', '.join(adapters) if adapters else 'no agent: add pi.ts or claude/SKILL.md'}")
             if problem:
                 warn(f"{tilde(bundle_toml(name))}: {problem}")
@@ -7583,7 +7750,10 @@ def show_data(box, table=None):
         "tools": [{"name": name, "description": "" if problem else spec["description"],
                    "hosts": [] if problem else [f"{h}:{p}" for h, p in bundle_hosts(spec)],
                    "env": [] if problem else sorted(bundle_env(spec)),
-                   "adapters": sorted(bundle_adapters(folder)),
+                   "adapters": sorted(bundle_adapters(folder, spec)),
+                   "pi_package": "" if problem else spec.get("pi_package", ""),
+                   "installed": (pi_package_installed(box, split_pi_package(spec["pi_package"])[0])
+                                 if not problem and spec.get("pi_package") else None),
                    "problem": problem}
                   for name, spec, folder, problem in box.bundle_status],
     }
@@ -7643,10 +7813,15 @@ def cmd_show(args, config):
         if problem:
             warn(f"tool       {name}: {problem} — `msbctl start` refuses until it is fixed")
             continue
-        adapters = sorted(bundle_adapters(folder))
+        adapters = sorted(bundle_adapters(folder, spec))
         note(f"tool       {name:<10} {spec['description']}  "
              f"{', '.join(f'{h}:{p}' for h, p in bundle_hosts(spec))}  "
              f"{'for ' + ', '.join(adapters) if adapters else 'NO ADAPTER — nothing to install'}")
+        if spec.get("pi_package"):
+            have = pi_package_installed(box, split_pi_package(spec["pi_package"])[0])
+            line = (f"tool       {'':<10} pi package {spec['pi_package']}: "
+                    + (f"{have} installed" if have else "not installed yet — the next start installs it"))
+            (note if have else warn)(line)
     # The env and rules below without a broken bundle, flagged just above:
     # Sandbox.bundles would die on it, and `show` is where the operator comes
     # to find out why.
@@ -7970,7 +8145,11 @@ UPDATERS = {
     "claude": ("npm install -g @anthropic-ai/claude-code@latest "
                "@agentclientprotocol/claude-agent-acp@latest >/dev/null "
                "&& claude --version"),
-    "pi": f"npm install -g {PI_PACKAGE}@latest >/dev/null && pi --version",
+    # Then pi's own packages (a bundle's `pi_package`, and any the operator
+    # installed with `pi install`): an unpinned one moves to latest, a pinned
+    # `name@x.y.z` stays. PI_OFFLINE=0 for that command alone, or pi skips it.
+    "pi": (f"npm install -g {PI_PACKAGE}@latest >/dev/null "
+           "&& PI_OFFLINE=0 pi update --extensions && pi --version"),
     "apt": "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y -qq upgrade",
 }
 
@@ -8018,6 +8197,12 @@ def cmd_update(args, config):
         elif comp == "pi":
             note("pi is installed unpinned, so a rebuild picks up whatever is latest then — "
                  "nothing to record")
+            # pi's packages are on the mount, so a rebuild keeps them where this
+            # left them; only a bundle's pin, in bundle.toml, holds one back.
+            for name, spec, _ in box.bundles:
+                if spec.get("pi_package"):
+                    pkg = split_pi_package(spec["pi_package"])[0]
+                    note(f"pi package {pkg}: {pi_package_installed(box, pkg) or 'not installed'}")
 
 
 def installer_script(comp, version):

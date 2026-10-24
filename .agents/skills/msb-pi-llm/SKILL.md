@@ -39,3 +39,8 @@ a 401 that names it; rebuild it.
 `ripgrep` from GitHub releases for its grep and find tools, which refuse outright
 with neither a download nor a system binary. Harmless — both are in
 `bootstrap.sh`'s base package list.
+
+**Third-party pi packages** come from a tool bundle's `pi_package`, installed by
+pi inside the guest into `~/.pi/agent/npm/` (on the mount) — `msb-tool-bundles`
+has the mechanism. `UPDATERS["pi"]` runs `PI_OFFLINE=0 pi update --extensions`
+after the npm install, so `msbctl update -c pi` moves unpinned packages too.

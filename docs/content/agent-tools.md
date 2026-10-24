@@ -94,7 +94,52 @@ From those three files, on every `msbctl start`:
 
 Nothing is mounted for it and nothing runs in the guest to install it: the
 adapters are copied into state directories that are already mounted, which is
-how pi's model config and the managed `CLAUDE.md` arrive too.
+how pi's model config and the managed `CLAUDE.md` arrive too. The one exception
+is a published pi package, below.
+
+## A published pi package
+
+Some tools for pi already exist as an npm package — pi calls them pi packages.
+A bundle can hand one to pi with `pi_package`, in place of a `pi.ts` or beside
+one. The first one wanted here is
+[`billion-context-pi`](https://www.npmjs.com/package/billion-context-pi), which
+lets the model manage its own context in long sessions:
+
+```toml
+# ~/.config/msb/tools/bili/bundle.toml
+description = "`compress`, `search_context`, `acp_status`: manage your own context in long sessions"
+pi_package = "billion-context-pi@0.1.83"   # or just "billion-context-pi"
+
+[env]
+ACP_AUTO_UPDATE = "0"   # its own self-updater off: updates come from msbctl update
+```
+
+No `hosts`: it talks only to the sandbox's model endpoint, which is already
+allowed. On each start msbctl adds `npm:billion-context-pi@0.1.83` to the
+`packages` in pi's `~/.pi/agent/settings.json`. If the package isn't installed
+yet, or isn't at its pin, msbctl runs `pi install` for it **inside the
+sandbox**, with the sandbox's own npm. The host never downloads it, and no
+egress rule is added for it: the pi feature already allows the npm registry.
+pi installs it under `~/.pi/agent/npm/`, which is on the same mount as the
+rest of pi's config, so it survives a rebuild and an ordinary start runs
+nothing. If the install fails, the start warns and carries on without it, and
+the next start tries again.
+
+`msbctl update <name> -c pi` updates pi and then runs `pi update --extensions`,
+which moves an unpinned package to its latest version and leaves a pinned one
+where it is. To move a pin, edit it in `bundle.toml` and start the sandbox.
+`msbctl show <name>` prints the version installed (`installed` in the JSON).
+
+Two things to know before reaching for one:
+
+- **It is third-party code running in your agent.** msbctl ships no package,
+  names none and resolves nothing. What reaches pi is exactly what you wrote in
+  `bundle.toml`, and pi and npm install it, with its own dependencies.
+- **Read what it does to pi.** `billion-context-pi` takes over pi's context
+  handling and its built-in compaction, and expects to be the only such plugin
+  in a session. It also updates itself unless told not to, which is what
+  `ACP_AUTO_UPDATE = "0"` is for: a self-update would rewrite pi's
+  `settings.json` behind msbctl's back.
 
 ## What is derived, and when
 
@@ -103,6 +148,7 @@ how pi's model config and the managed `CLAUDE.md` arrive too.
 | an adapter file (`pi.ts`, `SKILL.md`) | the next start — or immediately, on pi's `/reload` |
 | the bundle's `description` | the next start |
 | `hosts` or `[env]` | a rebuild: rules and environment variables are fixed at create |
+| `pi_package` (or its pin) | the next start, which installs it in the guest |
 | attaching or detaching a bundle | a rebuild, for the same reason |
 
 `msbctl show <name>` lists the bundles, their hosts and which agents they have
@@ -132,8 +178,9 @@ into the agent's context verbatim, so it is the place to name the tools, what
 they are for, and what the endpoints cannot do.
 
 **An adapter is one file.** msbctl copies it and nothing beside it, so a
-relative import dangles, and no `npm install` ever runs in the guest: use pi's
-aliases, node builtins and globals, or nothing.
+relative import dangles, and nothing is installed for it: use pi's aliases,
+node builtins and globals, or nothing. Anything with dependencies is a
+`pi_package` instead.
 
 **A bundle is validated before anything is created.** A missing folder, a
 missing `description`, an `env` URL that `hosts` does not list, a port-80 host:
@@ -149,3 +196,5 @@ own egress and none of the per-boot seeding a bundle needs.
 Untick the bundle and rebuild. The rules and the variables go with it, and
 msbctl removes the adapter files it wrote — it remembers what it installed, so
 an extension or a skill you put in those directories yourself is never touched.
+A `pi_package` leaves pi's `settings.json` on the next start and is uninstalled
+in the guest; a package you added yourself with `pi install` stays.

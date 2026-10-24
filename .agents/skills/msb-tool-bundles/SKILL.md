@@ -1,6 +1,6 @@
 ---
 name: msb-tool-bundles
-description: "Agent tool bundles: ~/.config/msb/tools/<name>/ with bundle.toml (description, hosts, [env], validated by bundle_problem()/bundle_host()), pi.ts and claude/SKILL.md; Sandbox.bundles from the registry's tools or [defaults] tools and never the project, its allow@host:tcp:port rules in net_rules() as source tools:<name>, its ports in --tls-intercept-port, bundle_env() under every [env], is_reserved_var() and the MSB_ prefix refused, apply_pi_bundles() copying msb-<name>.ts into STATE_DIR/pi/<name>/agent/extensions, apply_claude_bundles() copying skills/msb-<name>/SKILL.md into STATE_DIR/claude/<name> (the guest's ~/.claude), the STATE_DIR/tools/<name>.json marker that makes a disable take the adapter away, kandev getting none, section_tools/section_agent_tools, and spike 19. Use when changing how a capability reaches an agent, or when a tool an agent should have is missing or its endpoint is refused."
+description: "Agent tool bundles: ~/.config/msb/tools/<name>/ with bundle.toml (description, hosts, [env], pi_package — a pi package installed by pi in the guest via plan_pi_packages()/sync_pi_packages(), validated by bundle_problem()/bundle_host()), pi.ts and claude/SKILL.md; Sandbox.bundles from the registry's tools or [defaults] tools and never the project, its allow@host:tcp:port rules in net_rules() as source tools:<name>, its ports in --tls-intercept-port, bundle_env() under every [env], is_reserved_var() and the MSB_ prefix refused, apply_pi_bundles() copying msb-<name>.ts into STATE_DIR/pi/<name>/agent/extensions, apply_claude_bundles() copying skills/msb-<name>/SKILL.md into STATE_DIR/claude/<name> (the guest's ~/.claude), the STATE_DIR/tools/<name>.json marker that makes a disable take the adapter away, kandev getting none, section_tools/section_agent_tools, and spike 19. Use when changing how a capability reaches an agent, or when a tool an agent should have is missing or its endpoint is refused."
 ---
 
 # Agent Tool Bundles
@@ -70,13 +70,35 @@ there by hand; `rename_sandbox()` moves that marker and `purge` unlinks it.
 agent that does not know a bundle exists reaches for the built-in web tools and
 hits the deny.
 
-An adapter is **one self-contained file**: msbctl copies it and nothing beside
+A `pi.ts` adapter is **one self-contained file**: msbctl copies it and nothing beside
 it, so a relative import dangles, and only pi's aliased imports
 (`@earendil-works/pi-coding-agent`, which pi also aliases under the
 `@mariozechner` name it used to have, and `typebox`), node builtins and
 globals are available. Endpoints come from `[env]` at call time, never written into the
 adapter, so the same copy serves every sandbox and a URL in the file cannot
 hide from the rule list.
+
+**`pi_package`** (`pi_package_problem()`: a bare npm name, optionally
+`@<exact version>`; no range, tag or `npm:`/`git:`/path source) is the one
+exception to "nothing runs in the guest". `plan_pi_packages()` merges
+`npm:<spec>` into settings.json's `packages` (marker key `pi_packages` lists the
+npm names msbctl declared, so a `pi install` of the operator's is never
+touched) and drops a detached one HERE, so pi stops loading it whatever the
+guest does. `sync_pi_packages()` then `msb exec`s only for real work: `PI_OFFLINE=0
+pi install npm:<spec>` for one missing or off its pin, `npm uninstall
+--prefix ~/.pi/agent/npm` for a detached one still there (not `pi remove`, which
+exits 1 once the settings entry is gone). Installed-or-not is read from the
+mount (`pi_package_installed()`: `agent/npm/node_modules/<name>/package.json`,
+pi 1.4's `getNpmInstallRoot()`), never from an exit status; a miss warns and the
+start carries on. `PI_OFFLINE=1` stays in `[agent_env.pi]` — it is exactly what
+stops pi's own `installMissing()` and `updateConfiguredSources()` — so the
+install and `UPDATERS["pi"]`'s `pi update --extensions` lift it for one command.
+A `pi_package` counts as a pi adapter (`bundle_adapters(folder, spec)`), so the
+bundle is announced to pi only, and `hosts` may be omitted for it. msbctl names
+no package, fetches none on the host and resolves no dependency: that is the
+line that keeps this from becoming a plugin manager. Package-specific switches
+belong in the bundle's `[env]` (bili: `ACP_AUTO_UPDATE=0`, read by its
+`checkForUpdate()` in 0.1.83).
 
 UI: setup section "Agent tools" (`section_tools`, `_summary_tools`,
 `BUNDLE_SKELETON` when `TOOLS_DIR` is empty — there is no TOML writer and no

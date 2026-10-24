@@ -148,7 +148,8 @@ pi's state, including its sessions, is kept on the host at
 where the guest can read it.
 
 pi's update check and install ping are off (`PI_OFFLINE = "1"` in
-`[agent_env.pi]`). `msbctl update <name> -c pi` installs the latest version.
+`[agent_env.pi]`). `msbctl update <name> -c pi` installs the latest version,
+then updates pi's packages (see [Agent tools](agent-tools.md#a-published-pi-package)).
 
 pi comes from `@earendil-works/pi-coding-agent`. The `@mariozechner` package it
 used to live in is deprecated on npm and stops at 0.73.1, so a sandbox created
