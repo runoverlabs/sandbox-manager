@@ -8199,7 +8199,7 @@ def cmd_update(args, config):
                  "nothing to record")
             # pi's packages are on the mount, so a rebuild keeps them where this
             # left them; only a bundle's pin, in bundle.toml, holds one back.
-            for name, spec, _ in box.bundles:
+            for _, spec, _ in box.bundles:
                 if spec.get("pi_package"):
                     pkg = split_pi_package(spec["pi_package"])[0]
                     note(f"pi package {pkg}: {pi_package_installed(box, pkg) or 'not installed'}")
