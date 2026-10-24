@@ -9,4 +9,32 @@ Detail carved out of `AGENTS.md`, which keeps only what has to hold in
 every session. Repo-specific throughout; the facts here are verified against
 msb 0.7.6 and re-checked on 0.7.7.
 
-`pi` (`[bootstrap] pi`, `PI_PACKAGE`) talks to `[llm.<name>]` tables in `config.toml` (`llm_problem()` validates: `base_url` HTTPS-only and `models`, or `provider` from `PI_PROVIDERS`), chosen per sandbox by `llm` in the registry entry, else `[defaults] llm` — machine-local only, never the project. `Sandbox.llms` turns each into an `allow@host:tcp:port` rule after the groups, `--tls-intercept-port` for a non-443 port (443 ALWAYS restated: one such flag replaces msb's default — spike 17), `--tls-upstream-ca-cert-for host=ca_cert`, `allow_private_dns` from `private_dns`, and a `LLM_KEY_<NAME>@host` binding (own env file, else `global.env`; `is_reserved_var()` reserves the prefix). Every binding's passthrough is `Sandbox.transcript_hosts` (Anthropic's plus each endpoint), not the bare constant. `ensure_pi()` writes `models.json` (names the variable, never the value), merges `settings.json` and copies the profile as `AGENTS.md` into `STATE_DIR/pi/<name>/agent/` on the HOST, which is the guest's `/root/.pi`; no `msb exec`. Models are never a stored list by default: `served_models()` asks each custom endpoint on every start (`fetch_llm_models()`, host-side, real key, its `ca_cert`; cached in `STATE_DIR/llm/` as the fallback), `default_model` is the start model, and a stale one warns and falls back to the first served. `settings.json`'s default is set when msbctl's choice changed since `agent/.msbctl.json` recorded it, or when pi's names something gone; a switch made inside pi is otherwise kept. Setup section "Model endpoints" (`section_llms`: `_add_llm()` probes with `probe_llm_server()` — OpenAI `/v1/models`, `/models`, then Anthropic — and picks from the list with `pick_model()`; "choose a model" is `_choose_llm_model()`, no rebuild), edit section "Models for pi" (`section_llm`, a rebuild).
+`pi` (`[bootstrap] pi`, `PI_PACKAGE`) talks to `[llm.<name>]` tables in
+`config.toml` (`llm_problem()` validates: `base_url` HTTPS-only and `models`, or `provider` from `PI_PROVIDERS`), chosen per sandbox by `llm` in the registry entry, else `[defaults] llm` — machine-local only, never the project. `Sandbox.llms` turns each into an `allow@host:tcp:port` rule after the groups, `--tls-intercept-port` for a non-443 port (443 ALWAYS restated: one such flag replaces msb's default — spike 17), `--tls-upstream-ca-cert-for host=ca_cert`, `allow_private_dns` from `private_dns`, and a `LLM_KEY_<NAME>@host` binding (own env file, else `global.env`; `is_reserved_var()` reserves the prefix). Every binding's passthrough is `Sandbox.transcript_hosts` (Anthropic's plus each endpoint), not the bare constant. `ensure_pi()` writes `models.json` (a `$`-reference to the variable, never the value; see `llm_key_ref()`), merges `settings.json` and copies the profile as `AGENTS.md` into `STATE_DIR/pi/<name>/agent/` on the HOST, which is the guest's `/root/.pi`; no `msb exec`. Models are never a stored list by default: `served_models()` asks each custom endpoint on every start (`fetch_llm_models()`, host-side, real key, its `ca_cert`; cached in `STATE_DIR/llm/` as the fallback), `default_model` is the start model, and a stale one warns and falls back to the first served. `settings.json`'s default is set when msbctl's choice changed since `agent/.msbctl.json` recorded it, or when pi's names something gone; a switch made inside pi is otherwise kept. Setup section "Model endpoints" (`section_llms`: `_add_llm()` probes with `probe_llm_server()` — OpenAI `/v1/models`, `/models`, then Anthropic — and picks from the list with `pick_model()`; "choose a model" is `_choose_llm_model()`, no rebuild), edit section "Models for pi" (`section_llm`, a rebuild).
+
+**The scope.** `PI_PACKAGE` is `@earendil-works/pi-coding-agent`: pi moved out of
+the `@mariozechner` scope, which npm deprecates and which is frozen at 0.73.1, so
+`@latest` there never moves. `bootstrap.sh`'s `do_pi` installs the same name, and
+`UPDATERS["pi"]` uninstalls the old one (`PI_PACKAGE_OLD`) before installing the
+new — two installs would mean two `pi` bins claiming one symlink, and that
+uninstall is the whole migration, because `do_pi`'s `command -v pi` early return
+leaves an existing guest's install alone. Check any third-party pi package against
+this before promising it: pi resolves an extension's imports through an alias map
+of the scopes it bundles itself (`dist/core/extensions/loader.js`), 0.73 aliases
+only `@mariozechner/*` while 1.x aliases both, so a package compiled against
+`@earendil-works/*` cannot load on 0.73 and a `pi.ts` bundle adapter loads either
+way. Same map is why `msb-<name>.ts` never had to change.
+
+**The one silent break that came with it: `models.json`'s `apiKey` must be
+`$LLM_KEY_<NAME>`** (`llm_key_ref()`). pi >=1.0 interpolates `$NAME`/`${NAME}` and
+takes anything else as a literal key, where 0.73 looked a bare name up in the
+environment — verified by running each version's `resolveConfigValue()`. No
+spelling satisfies both; `!printenv NAME` does, at the cost of a shell per request
+out of a config file, which is exactly the config-as-code this repo keeps out of
+the guest. A guest left on 0.73 therefore sends the literal `$LLM_KEY_…` and gets
+a 401 that names it.
+
+**`PI_OFFLINE` earns its keep past 0.73:** it stops pi fetching `fd` and
+`ripgrep` from GitHub releases for its grep and find tools, which refuse outright
+with neither a download nor a system binary. Harmless — both are in
+`bootstrap.sh`'s base package list.

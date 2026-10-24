@@ -209,6 +209,12 @@ IS_SANDBOX = "1"
 # refused check only costs a startup delay. `msbctl update -c pi` is the
 # update path, as for Claude. msbctl also sets enableInstallTelemetry = false
 # in pi's settings.json.
+#
+# Since pi 1.x this also stops it fetching `fd` and `ripgrep` from GitHub
+# releases into ~/.pi/agent/bin when its grep and find tools cannot find them on
+# PATH — and those two tools refuse outright with neither a download nor a system
+# binary. Harmless here: both are in bootstrap.sh's base package list, which is
+# why pi's own downloader is not needed and can stay off.
 PI_OFFLINE = "1"
 
 # ---------------------------------------------------------------------------

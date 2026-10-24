@@ -119,7 +119,7 @@ class PiTest(PiBase):
         self.assertFalse(any("llm.home.example" in a for a in argv))
         models = self.agent_json("web", "models.json")
         self.assertEqual(models, {"providers": {"openrouter": {
-            "baseUrl": "https://openrouter.ai/api/v1", "apiKey": "LLM_KEY_ROUTER"}}})
+            "baseUrl": "https://openrouter.ai/api/v1", "apiKey": "$LLM_KEY_ROUTER"}}})
         settings = self.agent_json("web", "settings.json")
         self.assertEqual(settings["defaultProvider"], "openrouter")
         self.assertNotIn("defaultModel", settings)
@@ -136,7 +136,9 @@ class PiTest(PiBase):
         self.assertNotIn(KEY, text)
         qwen = json.loads(text)["providers"]["qwen"]
         self.assertEqual(qwen["baseUrl"], "https://llm.home.example:8443/v1")
-        self.assertEqual(qwen["apiKey"], "LLM_KEY_QWEN")
+        # The `$` is what makes pi resolve it: pi >=1.0 interpolates $NAME and
+        # takes a bare name as a literal key (0.73 was the other way round).
+        self.assertEqual(qwen["apiKey"], "$LLM_KEY_QWEN")
         self.assertEqual(qwen["api"], "openai-completions")
         self.assertFalse(qwen["compat"]["supportsDeveloperRole"])
         self.assertEqual(qwen["models"][0], {"id": "qwen-coder", "contextWindow": 131072})
@@ -282,7 +284,10 @@ class PiTest(PiBase):
         code, _, err = self.run_main("update", "web", "-c", "pi")
         self.assertEqual(code, 0, err)
         scripts = [c["argv"][-1] for c in self.msb_calls("exec")]
-        self.assertIn("npm install -g @mariozechner/pi-coding-agent@latest", scripts[-1])
+        self.assertIn(f"npm install -g {self.m.PI_PACKAGE}@latest", scripts[-1])
+        # A guest from before the scope move must not keep the deprecated package
+        # alongside it: two installs, two `pi` bins for one symlink.
+        self.assertIn(f"npm uninstall -g {self.m.PI_PACKAGE_OLD}", scripts[-1])
 
 
 

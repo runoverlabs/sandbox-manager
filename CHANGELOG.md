@@ -13,6 +13,9 @@ release notes.
 - Each sandbox now tells its agent where its project is mounted and where the project's own `.agents/skills/` folder is, so those files are reachable from outside it; nothing to do, it lands on the next start.
 - pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 
+### Changed
+- pi installs from `@earendil-works/pi-coding-agent`: the `@mariozechner` package pi used to live in is deprecated on npm and stops at 0.73.1, so run `msbctl update <name> -c pi` on a sandbox that already has pi, which takes the old package out as it puts the new one in; a rebuild gets there from a clean root.
+
 ## [0.7.0] - 2026-10-22
 
 ### Added

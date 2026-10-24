@@ -218,6 +218,12 @@ do_claude_acp() {
 # every start, not here). Unpinned for the same reason as claude: `msbctl
 # update <name> -c pi` tracks latest. Pure npm, `engines: node >=20.6`,
 # registry.npmjs.org only (checked by installing it under deny-by-default).
+#
+# The scope is @earendil-works, not the @mariozechner one pi used to live in:
+# that is deprecated on npm and frozen at 0.73.1, so @latest there never moves.
+# Keep it in step with PI_PACKAGE in msbctl. A guest that already has pi is left
+# alone by the early return below, which is what `msbctl update -c pi` (also
+# taking out the old package) is for.
 do_pi() {
 	command -v pi >/dev/null && { pi --version; return 0; }
 	if ! command -v npm >/dev/null; then
@@ -225,7 +231,7 @@ do_pi() {
 		echo "   fix that first; this failure follows from it" >&2
 		return 1
 	fi
-	npm install -g @mariozechner/pi-coding-agent || return 1
+	npm install -g @earendil-works/pi-coding-agent || return 1
 	pi --version
 }
 

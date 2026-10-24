@@ -53,10 +53,13 @@ WEB_FETCH_URL = "https://fetch.example.com/fetch"
 ```
 
 `pi.ts` registers the two tools with pi — self-contained, importing only what
-pi's loader aliases (`typebox`, pi's own packages) and what node provides:
+pi's loader aliases (`typebox`, pi's own packages) and what node provides. Pi
+lives in the `@earendil-works` scope — import that one, though pi's alias map
+still resolves the `@mariozechner` names it used to have, so nothing written
+against those breaks:
 
 ```ts
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent"
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent"
 import { Type } from "typebox"
 
 export default function (pi: ExtensionAPI) {

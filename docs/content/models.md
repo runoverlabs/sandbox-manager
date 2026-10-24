@@ -139,3 +139,10 @@ where the guest can read it.
 
 pi's update check and install ping are off (`PI_OFFLINE = "1"` in
 `[agent_env.pi]`). `msbctl update <name> -c pi` installs the latest version.
+
+pi comes from `@earendil-works/pi-coding-agent`. The `@mariozechner` package it
+used to live in is deprecated on npm and stops at 0.73.1, so a sandbox created
+before the move is pinned to a pi that cannot grow and that cannot load anything
+from the current package ecosystem: run `msbctl update <name> -c pi`, which takes
+the old package out as it puts the new one in. Endpoints and keys are unaffected —
+msbctl rewrites `~/.pi/agent/models.json` on every start.

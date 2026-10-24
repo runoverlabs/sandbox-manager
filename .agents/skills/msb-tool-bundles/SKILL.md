@@ -72,8 +72,9 @@ hits the deny.
 
 An adapter is **one self-contained file**: msbctl copies it and nothing beside
 it, so a relative import dangles, and only pi's aliased imports
-(`@mariozechner/pi-coding-agent`, `typebox`, …), node builtins and globals are
-available. Endpoints come from `[env]` at call time, never written into the
+(`@earendil-works/pi-coding-agent`, which pi also aliases under the
+`@mariozechner` name it used to have, and `typebox`), node builtins and
+globals are available. Endpoints come from `[env]` at call time, never written into the
 adapter, so the same copy serves every sandbox and a URL in the file cannot
 hide from the rule list.
 
