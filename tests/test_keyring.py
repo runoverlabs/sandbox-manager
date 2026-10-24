@@ -10,7 +10,7 @@ import io
 import json
 import os
 import unittest
-from unittest import mock
+import unittest.mock
 
 from tests.harness import MsbctlTest
 
@@ -55,7 +55,7 @@ class KeyringTest(MsbctlTest):
         self.assertEqual(code, 0, err)
         self.assertIn("NPM_TOKEN=@keyring", self.env_text(path))
         self.assertNotIn(SECRET, self.env_text(path))
-        self.assertEqual([i["secret"] for i in self.keyring_items()], [SECRET])
+        self.assertEqual([i["value"] for i in self.keyring_items()], [SECRET])
         self.assertIn("stored in the keyring", out)
         self.assert_not_in_output(SECRET, out, err)
         self.assert_not_in_argv(SECRET)
@@ -123,7 +123,7 @@ class KeyringTest(MsbctlTest):
         self.assertEqual(code, 0, err)
         self.assert_prompted()
         self.assertIn("NPM_TOKEN=@keyring", self.env_text(path))
-        self.assertEqual([i["secret"] for i in self.keyring_items()], [SECRET])
+        self.assertEqual([i["value"] for i in self.keyring_items()], [SECRET])
 
     def test_a_dismissed_prompt_writes_nothing(self):
         path = self.npm_sandbox()
@@ -162,7 +162,7 @@ class KeyringTest(MsbctlTest):
         self.store_secret(path, "NPM_TOKEN", SECRET)
         self.assertTrue(self.m.keyring_in_use())
         err = io.StringIO()
-        with contextlib.redirect_stderr(err), mock.patch("builtins.input") as asked:
+        with contextlib.redirect_stderr(err), unittest.mock.patch("builtins.input") as asked:
             self.assertTrue(self.m.autostart_keyring_ok(False))
         asked.assert_not_called()
         self.assertIn("SKIPS", err.getvalue())
