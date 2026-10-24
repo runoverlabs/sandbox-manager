@@ -13,6 +13,9 @@ release notes.
 - Each sandbox now tells its agent where its project is mounted and where the project's own `.agents/skills/` folder is, so those files are reachable from outside it; nothing to do, it lands on the next start.
 - pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 
+### Fixed
+- pi no longer stops at a startup question nobody is there to answer. The sandbox's project folder (and `/tmp`) are trusted on every start, which also fixes the project's own `.agents/skills/` loading nothing when pi is started without a terminal (`msbctl exec . -- pi …`), where pi answered its own trust prompt with "no"; and the "What's New" block pi prints after it updates is switched off — `/changelog` still shows it. Both are pi's own settings under `~/.pi/agent/`, rewritten on every start, so nothing needs a rebuild.
+
 ### Changed
 - pi installs from `@earendil-works/pi-coding-agent`: the `@mariozechner` package pi used to live in is deprecated on npm and stops at 0.73.1, so rebuild a sandbox that already has pi: its key stops working until then, because `models.json` now uses the key spelling only the new pi understands.
 

@@ -29,6 +29,16 @@ Then rebuild and run `pi` inside, or `msbctl exec . -- pi -p "…" </dev/null`
 endpoint's model is pi's default; `/model` (or Ctrl+L) switches between
 everything the endpoints serve.
 
+pi starts without asking, because there may be nobody there to answer. On its
+own it opens by asking whether to trust the working folder, and prints a "What's
+New" block after every update. In a sandbox the folder is trusted up front and
+that block is switched off: a run started with `msbctl exec` has no terminal to
+answer on, and pi then settles the trust question by itself — as *no*, which
+quietly drops the project's own `.agents/skills/`. `/changelog` still shows the
+notes whenever you want them. Both are pi's own settings, written into
+`~/.pi/agent/` (the sandbox's state dir on this machine) on every start: the VM
+and its egress policy are the boundary here, not the folder pi runs in.
+
 ## Your own server
 
 "Add a model source" → "your own server" asks for its URL, in whatever form

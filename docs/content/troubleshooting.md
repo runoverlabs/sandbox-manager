@@ -73,6 +73,17 @@ uses and flags it as NOT STORED. Run `msbctl setup` → "Claude login" to add it
 (or `claude setup-token` on the host and paste the result), or pick a token you
 have with `msbctl edit <name>` → "Claude token", then restart the sandbox.
 
+## pi asks "Trust project folder?", or opens with "What's New"
+
+Both are questions for a person, and an unattended run stops at the first one.
+Worse, started by `msbctl exec` with no terminal, pi answers the trust question
+by itself — as *no* — so the project's own `.agents/skills/` load nothing. Update
+the manager and start the sandbox once (`msbctl stop` then `msbctl start`): every
+start now trusts the project folder and `/tmp` in `~/.pi/agent/trust.json`, and
+sets `defaultProjectTrust` and a changelog marker in `~/.pi/agent/settings.json`.
+`/changelog` still shows the notes when asked. See
+[pi, the agent for any model](models.md#pi-the-agent-for-any-model).
+
 ## A name on my LAN returns NXDOMAIN
 
 msb drops DNS answers that point at private addresses (DNS rebind protection),

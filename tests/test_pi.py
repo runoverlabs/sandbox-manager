@@ -162,7 +162,31 @@ class PiTest(PiBase):
         self.start()
         self.assertEqual(self.agent_json("web", "settings.json"),
                          {"defaultProvider": "qwen", "defaultModel": "qwen-coder",
-                          "theme": "light", "enableInstallTelemetry": False})
+                          "theme": "light", "enableInstallTelemetry": False,
+                          "defaultProjectTrust": "always",
+                          "lastChangelogVersion": self.m.PI_CHANGELOG_SEEN})
+
+    def test_pi_starts_without_asking_or_announcing(self):
+        # Nothing inside a sandbox answers a startup question: a `msbctl exec`
+        # driven session (ACP, a script) stops at pi's trust prompt, and a
+        # changelog banner pushes the prompt out of view.
+        self.config(QWEN)
+        self.make_folder_sandbox("web", sandbox_toml=PI_ON)
+        os.makedirs(os.path.dirname(self.agent_file("web", "trust.json")))
+        with open(self.agent_file("web", "trust.json"), "w", encoding="utf-8") as fh:
+            json.dump({"/opt/elsewhere": False, "junk": 1}, fh)
+        self.start()
+        settings = self.agent_json("web", "settings.json")
+        self.assertEqual(settings["defaultProjectTrust"], "always")
+        # A version newer than any release, so pi finds no new entries whatever
+        # it installs in the guest and never rewrites the marker to show one.
+        self.assertEqual(settings["lastChangelogVersion"], self.m.PI_CHANGELOG_SEEN)
+        # A saved decision outranks the default, so the folders are trusted in
+        # the store as well: /work covers everything under the project, /tmp the
+        # scratch space Claude is given too. A refusal elsewhere survives; a
+        # value pi would refuse to load does not.
+        self.assertEqual(self.agent_json("web", "trust.json"),
+                         {"/opt/elsewhere": False, "/tmp": True, "/work": True})
         # You switch models inside pi; the next start leaves that alone.
         settings = self.agent_json("web", "settings.json")
         settings["defaultModel"] = "qwen-small"
