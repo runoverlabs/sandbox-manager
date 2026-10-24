@@ -215,6 +215,19 @@ class KeyringTest(MsbctlTest):
                 self.assertEqual("skipped" in err, not started)
                 self.assertEqual([c for c in self.keyring_calls() if "PROMPTED" in c], [])
 
+    def test_a_boot_still_starts_the_rest_past_a_broken_entry(self):
+        self.make_folder_sandbox("plain", entry_extra="autostart = true")
+        self.make_folder_sandbox("broken", entry_extra='autostart = true\nsource = "bogus"',
+                                 approve=False)
+        self.set_store("keyring")
+        self.use_keyring("unlocked")
+        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_LAN", SECRET)
+        self.use_keyring("locked")
+        code, _, err = self.run_main("start", "--autostart")
+        self.assertNotEqual(code, 0)
+        self.assertIn("bogus", err)
+        self.assertEqual([c["argv"][2] for c in self.msb_calls("create")], ["plain"])
+
     def test_the_picker_on_a_terminal_starts_them_and_asks(self):
         path = self.npm_sandbox(entry_extra="autostart = true")
         self.set_store("keyring")
@@ -280,6 +293,84 @@ class KeyringTest(MsbctlTest):
                 self.assertEqual(code, 0, err)
                 self.assertEqual(len([c for c in self.keyring_calls() if "PROMPTED" in c]), prompts)
                 self.assertEqual(err.count("dismissed"), 3 if prompt else 0)
+
+    def test_a_start_reads_each_env_file_once(self):
+        self.make_folder_sandbox("web", sandbox_toml="[secrets]\ngithub = true\n")
+        path = self.secrets_file("web")
+        self.set_store("keyring")
+        self.use_keyring("unlocked")
+        self.store_secret(path, "GH_TOKEN", SECRET)
+        self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-planted")
+        for env_file in (path, self.m.GLOBAL_ENV):
+            os.chmod(env_file, 0o644)
+        code, _, err = self.run_main("start", "web")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("expected 0600"), 2)     # once per file
+
+    def test_a_missing_item_on_a_locked_keyring_is_missing_not_refused(self):
+        # libsecret prompts only for an item that matched: a lookup of one
+        # deleted outside msbctl fails at once, and must not stop the others.
+        path = self.stored_then("unlocked")
+        self.store_secret(path, "GH_TOKEN", "planted-gh-value")
+        self.forget_item("web", "NPM_TOKEN")
+        self.use_keyring("locked")
+        self.assertIsNone(self.m.keyring_get(path, "NPM_TOKEN"))
+        self.assertEqual(self.m.keyring_why(path, "NPM_TOKEN")[0], "missing")
+        self.assertEqual(self.m.keyring_get(path, "GH_TOKEN"), "planted-gh-value")
+        self.assert_prompted()
+
+    def test_over_ssh_a_locked_keyring_says_where_its_prompt_is(self):
+        path = self.stored_then("locked")
+        os.environ["SSH_CONNECTION"] = "192.0.2.1 50000 192.0.2.2 22"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self.m.keyring_get(path, "NPM_TOKEN"), SECRET)
+        self.assertIn("desktop screen", err.getvalue())
+        os.environ["DISPLAY"] = ":0"      # forwarded, or a local terminal: nothing to say
+        self.use_keyring("locked")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.m.keyring_get(path, "NPM_TOKEN")
+        self.assertNotIn("desktop screen", err.getvalue())
+
+    def test_a_token_lookup_reads_only_gh_token(self):
+        self.make_folder_sandbox("web")
+        self.set_store("keyring")
+        self.use_keyring("unlocked")
+        self.store_secret(self.m.GLOBAL_ENV, "GH_TOKEN", "planted-gh-value")
+        self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", SECRET)
+        self.use_keyring("unlocked")
+        before = len(self.keyring_calls())
+        self.assertEqual(self.m.repo_token("web"), "planted-gh-value")
+        looked_up = [c["argv"] for c in self.keyring_calls()[before:] if c.get("argv", [""])[0] == "lookup"]
+        self.assertEqual([a[a.index("var") + 1] for a in looked_up], ["GH_TOKEN"])
+
+    def test_the_edit_menu_counts_a_keyring_token_only_while_its_item_is_there(self):
+        self.make_folder_sandbox("web", sandbox_toml="[secrets]\ngithub = true\n")
+        path = self.secrets_file("web")
+        self.set_store("keyring")
+        self.use_keyring("unlocked")
+        self.store_secret(path, "GH_TOKEN", SECRET)
+        box = self.m.Sandbox("web", self.m.load_config())
+        self.use_keyring("locked")
+        self.assertTrue(box.github_token_bound)
+        self.forget_item("web", "GH_TOKEN")
+        self.assertFalse(box.github_token_bound)
+        self.use_keyring(None)
+        self.assertFalse(box.github_token_bound)
+        self.assert_never_prompted()
+
+    def test_a_refused_token_in_add_is_a_skip(self):
+        self.make_folder_sandbox("web")
+        self.set_store("keyring")
+        self.use_keyring("locked")
+        os.environ["FAKE_KEYRING_PROMPT"] = "dismiss"
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), \
+                unittest.mock.patch.object(self.m, "read_secret_hidden", return_value=SECRET):
+            self.assertFalse(self.m.capture_token("web"))
+        self.assertIn("add it later", err.getvalue())
+        self.assertFalse(os.path.exists(self.secrets_file("web")))
 
     def test_listing_what_is_stored_never_asks_the_keyring(self):
         path = self.stored_then("locked")
@@ -443,6 +534,15 @@ class KeyringTest(MsbctlTest):
         self.assertTrue(os.path.exists(self.entry_path("web")))
         self.assertEqual([i["attrs"]["file"] for i in self.keyring_items()], ["web"])
 
+    def test_rename_takes_back_its_copies_when_the_old_one_stays(self):
+        self.stored_then("unlocked")
+        box = self.m.Sandbox("web", self.m.load_config())
+        with unittest.mock.patch.object(self.m, "state_of", return_value="stopped"), \
+                self.assertRaises(SystemExit) as ctx:
+            self.m.rename_sandbox(box, "shop")
+        self.assertIn("could not remove", str(ctx.exception.code))
+        self.assertEqual([i["attrs"]["file"] for i in self.keyring_items()], ["web"])
+
     def test_rename_carries_a_marker_with_no_item_and_says_so(self):
         self.stored_then("unlocked")
         self.forget_item("web", "NPM_TOKEN")
@@ -477,6 +577,24 @@ class KeyringTest(MsbctlTest):
         self.assertTrue(os.path.exists(path))
         self.assertTrue(os.path.exists(self.entry_path("web")))
         self.assertEqual(len(self.keyring_items()), 1)
+
+    def test_purge_puts_back_what_it_cleared_when_a_later_clear_fails(self):
+        path = self.stored_then("unlocked")
+        self.store_secret(path, "GH_TOKEN", "planted-gh-value")
+        os.environ["FAKE_KEYRING_FAIL"] = "clear:GH_TOKEN"     # the second: NPM_TOKEN is gone by then
+        code, _, err = self.run_main("purge", "web", "-y")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been purged", err)
+        self.assertEqual(sorted((i["attrs"]["var"], i["value"]) for i in self.keyring_items()),
+                         [("GH_TOKEN", "planted-gh-value"), ("NPM_TOKEN", SECRET)])
+        self.assertTrue(os.path.exists(path))
+
+    def test_purge_with_a_marker_whose_item_is_gone(self):
+        path = self.stored_then("unlocked")
+        self.forget_item("web", "NPM_TOKEN")
+        code, _, err = self.run_main("purge", "web", "-y")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(os.path.exists(path))
 
     def test_removing_a_value_clears_its_item(self):
         path = self.npm_sandbox()

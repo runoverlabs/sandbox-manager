@@ -306,6 +306,9 @@ use_global_token = true
 #              a Kandev host or an ssh session usually has no Secret Service,
 #              and gets the file; one that has a keyring must keep it unlocked
 #              (or without a password), as nobody is there to answer the prompt.
+#              An ssh session into a machine whose desktop you are logged in to
+#              reaches THAT keyring: locked, its prompt shows on the desktop's
+#              screen (msbctl says so), not in the ssh terminal.
 # With autostart: a boot finds nobody to answer that prompt either, so while
 # the keyring is still locked `start --autostart` (run without a terminal, by
 # the boot unit) SKIPS each sandbox that needs a value from it. Turning

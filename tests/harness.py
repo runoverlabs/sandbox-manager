@@ -80,7 +80,7 @@ class MsbctlTest(TestCase):
                     # No keyring unless a test sets one up: the fake busctl
                     # answers "absent" and the fake secret-tool fails loudly.
                     "FAKE_KEYRING", "FAKE_KEYRING_FAIL", "FAKE_KEYRING_PROMPT",
-                    "DBUS_SESSION_BUS_ADDRESS"):
+                    "DBUS_SESSION_BUS_ADDRESS", "SSH_CONNECTION", "DISPLAY", "WAYLAND_DISPLAY"):
             os.environ.pop(var, None)
         self.m = self.load_msbctl()
         if self.follows_store_env and os.environ.get("MSB_TEST_SECRET_STORE") == "keyring":

@@ -65,7 +65,9 @@ it reads. If you dismiss it, nothing else prompts during that command: a sandbox
 starts without the secrets kept there, with a warning naming each one, exactly
 as if they had never been stored. Storing a value, `migrate`, `rename` and
 `purge` stop instead, and change nothing. Listing what is stored (`secret ls`,
-`ls`, `show`, the `edit` menu) reads only the file, so it never prompts. Before any of that, msbctl asks D-Bus whether a Secret
+`ls`, `show`, the `edit` menu) reads only the file, so it never prompts; the
+menu's GitHub token line also checks the item is still there, which doesn't
+unlock anything. Before any of that, msbctl asks D-Bus whether a Secret
 Service exists at all (`busctl`, or `gdbus`), so on a machine without one it
 never calls `secret-tool`. `msbctl host check` shows the store, whether the
 keyring is there and unlocked, and how many values are in it.
@@ -87,12 +89,14 @@ while the keyring is locked.
 A remote host, a Kandev host or an ssh session usually has no Secret Service at
 all, and `"auto"` keeps the file there. If a headless machine does run one, keep
 it unlocked or without a password, since an unlock prompt there has nobody to
-answer it. For a server, `"file"` on an encrypted disk is the recommendation
+answer it. An ssh session into a machine where you are also logged in to the
+desktop reaches *that* desktop's keyring: when it's locked, msbctl says so, and
+the unlock prompt appears on the desktop's screen, not in your ssh terminal. For a server, `"file"` on an encrypted disk is the recommendation
 (`msbctl host check` looks for one).
 
 Renaming a sandbox moves its keyring values with it, and purging it deletes
 them, before anything else. If the keyring refuses, nothing is renamed or
-purged. With no Secret Service on that machine at all, `purge` goes ahead and
+purged, and values already copied or cleared are put back. With no Secret Service on that machine at all, `purge` goes ahead and
 prints the `secret-tool clear` command for wherever the values are. Each value is one keyring item labelled `msb-manager: VAR (file)`, so
 your keyring's own tool shows them too.
 

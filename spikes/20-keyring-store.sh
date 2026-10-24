@@ -25,7 +25,11 @@
 #      after the failed lookup.
 #   4  Still locked, two values read twice each: secret-tool is called ONCE
 #      (the refused prompt latches for the run, after the bus still says
-#      Locked), and keyring_why() says "refused".
+#      Locked and `search` still lists the item), and keyring_why() says
+#      "refused".
+#   4b Still locked, a marker whose item was deleted: its lookup fails WITHOUT
+#      a prompt (libsecret unlocks only what matched), `search` lists nothing,
+#      and it reads as "missing" with nothing latched.
 #
 # PASS is all of it. Needs: dbus-run-session, gnome-keyring-daemon,
 # secret-tool, busctl (Debian/Ubuntu: dbus-daemon gnome-keyring libsecret-tools).
@@ -79,7 +83,6 @@ case "$out" in *"$VALUE"*) bad "migrate printed the value" ;; *) pass "migrate p
 got=$(secret-tool lookup service msb-manager file global var GH_TOKEN)
 [ "$got" = "$VALUE" ] && pass "the keyring holds the value" || bad "the keyring does not hold it"
 
-printf 'spike-password' | busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
 # 2b ------------------------------- an item deleted behind msbctl's back
 # OTHER's marker points at no item: a failed lookup, then the bus says unlocked.
 (umask 077 && printf 'GH_TOKEN=@keyring\nOTHER=@keyring\n' >"$env_file")
@@ -99,7 +102,7 @@ busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
 	org.freedesktop.Secret.Service Lock ao 1 /org/freedesktop/secrets/aliases/default >/dev/null
 # Wrap secret-tool to count the calls: each one now is an unlock prompt.
 mkdir -p "$HOME/bin"
-printf '#!/bin/sh\necho called >>"%s/secret-tool.calls"\nexec %s "$@"\n' "$HOME" "$(command -v secret-tool)" >"$HOME/bin/secret-tool"
+printf '#!/bin/sh\necho "$1" >>"%s/secret-tool.calls"\nexec %s "$@"\n' "$HOME" "$(command -v secret-tool)" >"$HOME/bin/secret-tool"
 chmod +x "$HOME/bin/secret-tool"
 export PATH="$HOME/bin:$PATH"
 check=$("$MSBCTL" host check --json 2>/dev/null)
@@ -132,10 +135,26 @@ for _ in range(2):
 print(m.keyring_why(m.GLOBAL_ENV, "GH_TOKEN")[0])
 PY
 )
-calls=$(wc -l <"$HOME/secret-tool.calls" 2>/dev/null || echo 0)
-[ "$calls" -eq 1 ] && pass "locked: one secret-tool call for two values read twice" \
-	|| bad "locked: $calls secret-tool calls"
+# `search` never prompts (it is how a missing item is told from a refusal).
+calls=$(grep -vc '^search$' "$HOME/secret-tool.calls" 2>/dev/null || echo 0)
+[ "$calls" -eq 1 ] && pass "locked: one secret-tool lookup for two values read twice" \
+	|| bad "locked: $calls secret-tool calls besides search"
 [ "$why" = refused ] && pass "and it reads as refused" || bad "it reads as '$why'"
+
+# 4b ----------------------------- locked, and an item deleted behind msbctl's back
+# libsecret prompts only for an item that matched: OTHER's lookup fails at
+# once, and must read as missing, leaving the next value free to prompt.
+why=$(python3 -I - "$MSBCTL" <<'PY' 2>/dev/null
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("msbctl", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("msbctl", loader))
+loader.exec_module(m)
+print(m.keyring_status()[0], m.keyring_get(m.GLOBAL_ENV, "OTHER"), m.keyring_why(m.GLOBAL_ENV, "OTHER")[0],
+      bool(m._KEYRING_REFUSED))
+PY
+)
+[ "$why" = "locked None missing False" ] && pass "locked, item deleted: reads as missing, not refused" \
+	|| bad "locked, item deleted: '$why'"
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail

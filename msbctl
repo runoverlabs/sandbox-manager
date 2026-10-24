@@ -1185,6 +1185,8 @@ def _secret_tool(argv, value=""):
     where the unlock prompt appears."""
     if not keyring_usable() or _KEYRING_REFUSED:
         return None
+    if argv[:1] != ["search"]:
+        _note_remote_prompt()
     try:
         return subprocess.run(["secret-tool"] + argv, input=value, capture_output=True,
                               text=True, timeout=KEYRING_TIMEOUT)
@@ -1192,26 +1194,56 @@ def _secret_tool(argv, value=""):
         return None
 
 
+def _note_remote_prompt():
+    """Over ssh, a bus at /run/user/<uid>/bus is the desktop session's: a
+    locked keyring's prompt then shows on THAT screen, not in this terminal,
+    and the call waits for it (up to KEYRING_TIMEOUT). Said once per run."""
+    if (os.environ.get("SSH_CONNECTION") and not os.environ.get("DISPLAY")
+            and not os.environ.get("WAYLAND_DISPLAY") and keyring_status()[0] == "locked"
+            and "ssh" not in _KEYRING_WARNED):
+        _KEYRING_WARNED.add("ssh")
+        warn("the keyring is locked: its unlock prompt shows on this machine's desktop "
+             "screen, not in this ssh session — unlock it there, or this waits and fails")
+
+
+def keyring_clear_hint(path, var):
+    """The command that clears one item by hand."""
+    return f"`secret-tool clear {shlex.join(_keyring_attrs(path, var))}`"
+
+
 def _keyring_key(path, var):
     return os.path.realpath(path), var
 
 
-def _keyring_failed(proc):
+def _keyring_has(path, var):
+    """Whether the keyring holds an item for it, asked WITHOUT unlocking:
+    `search` lists a locked item too (its secret unread) and never prompts.
+    True when it cannot tell, so a doubt reads as refused, not as gone."""
+    proc = _secret_tool(["search"] + _keyring_attrs(path, var))
+    return not (proc and proc.returncode == 0) or proc.stdout.lstrip().startswith("[")
+
+
+def _keyring_failed(proc, path=None, var=None):
     """After a call that failed: was it the keyring refusing (a dismissed or
     unanswered prompt, no answer at all), rather than the call itself? Then
     no other call this run prompts again. Asked of the bus, not the exit
-    code, which is the same for "no such item"."""
-    if _KEYRING_REFUSED or keyring_status()[0] == "absent":
-        return
-    if proc is None or keyring_status(fresh=True)[0] == "locked":
-        _KEYRING_REFUSED.append("the unlock prompt was dismissed, or not answered")
+    code, which is the same for "no such item". A lookup or a clear of an
+    item that does not exist fails WITHOUT prompting even while the keyring
+    is locked (libsecret only unlocks what matched), so for those (`path`,
+    `var`) a locked keyring counts as refusing only if the item is there.
+    True if the keyring cannot be used (absent, or refused) this run."""
+    if not _KEYRING_REFUSED and keyring_status()[0] != "absent":
+        if proc is None or (keyring_status(fresh=True)[0] == "locked"
+                            and (path is None or _keyring_has(path, var))):
+            _KEYRING_REFUSED.append("the unlock prompt was dismissed, or not answered")
+    return bool(_KEYRING_REFUSED) or keyring_status()[0] == "absent"
 
 
 def _keyring_lookup(path, var):
     proc = _secret_tool(["lookup"] + _keyring_attrs(path, var))
     if proc and proc.returncode == 0 and proc.stdout:
         return proc.stdout
-    _keyring_failed(proc)
+    _keyring_failed(proc, path, var)
     return None
 
 
@@ -1249,9 +1281,11 @@ def keyring_put(path, var, value):
 
 
 def keyring_clear(path, var):
+    """True once the keyring holds no item for it: cleared now, or already
+    gone (secret-tool fails a clear that matched nothing)."""
     proc = _secret_tool(["clear"] + _keyring_attrs(path, var))
-    if not (proc and proc.returncode == 0):
-        _keyring_failed(proc)
+    if not (proc and proc.returncode == 0) and (
+            _keyring_failed(proc, path, var) or _keyring_has(path, var)):
         return False
     _KEYRING_READ[_keyring_key(path, var)] = None
     return True
@@ -1349,6 +1383,16 @@ def autostart_needs_keyring(box):
     one of the global.env values it uses (Sandbox.global_secret_vars())."""
     return bool(keyring_vars(os.path.join(SECRETS_DIR, f"{box.name}.env"))
                 or set(keyring_vars(GLOBAL_ENV)) & box.global_secret_vars())
+
+
+def autostart_blocked(name, config):
+    """autostart_needs_keyring() by name, for the boot's skip. An entry that
+    cannot even be read is not skipped here: its own start says what is
+    wrong with it, and the rest of the set still starts."""
+    try:
+        return autostart_needs_keyring(Sandbox(name, config))
+    except SystemExit:
+        return False
 
 
 def write_store():
@@ -2007,6 +2051,8 @@ class Sandbox:
         at launch.
         """
         flags, env = [], {}
+        own = read_env_file(os.path.join(SECRETS_DIR, f"{self.name}.env"))
+        shared = read_env_file(GLOBAL_ENV, only=self.global_secret_vars())
         # A repo sandbox always binds its token when one is stored: it is how
         # the clone authenticates and how its work gets pushed (there is no
         # agent to forward), and the binding is the fixed one, to GitHub only.
@@ -2014,8 +2060,7 @@ class Sandbox:
             "github", bool(self.repo))
 
         if self.claude_auth == "secret":
-            token = claude_tokens(read_env_file(GLOBAL_ENV, only=self.global_secret_vars())) \
-                .get(self.claude_token)
+            token = claude_tokens(shared).get(self.claude_token)
             if token:
                 env[CLAUDE_TOKEN_VAR] = token
                 # Both hosts: Claude Code talks to api.anthropic.com for
@@ -2042,8 +2087,7 @@ class Sandbox:
                      "`msbctl setup` → Claude login.")
 
         if wants_github:
-            token = read_env_file(os.path.join(SECRETS_DIR, f"{self.name}.env")) \
-                .get("GH_TOKEN")
+            token = own.get("GH_TOKEN")
             if token:
                 env["GH_TOKEN"] = token
                 flags += ["--secret", with_transcript_passthrough(
@@ -2070,8 +2114,6 @@ class Sandbox:
         # a project binding resolves from this sandbox's own env file only; the
         # fallback to the shared file is for bindings in the registry entry.
         # The reserved variables are never bound this way, from any layer.
-        own = read_env_file(os.path.join(SECRETS_DIR, f"{self.name}.env"))
-        shared = read_env_file(GLOBAL_ENV, only=self.global_secret_vars())
         for spec in self.secret_binds:
             var = secret_var(spec)
             if is_reserved_var(var):
@@ -2381,10 +2423,16 @@ class Sandbox:
     @property
     def github_token_bound(self):
         """Whether GH_TOKEN reaches the guest as a placeholder: the same test
-        secret_env() applies, without emitting anything."""
+        secret_env() applies, without emitting anything. A value in the
+        keyring counts only while an item is there, asked without unlocking
+        (so this never prompts): no Secret Service, or an item deleted
+        outside msbctl, binds nothing at start."""
         wants = self.is_repo or self.project_cfg.get("secrets", {}).get("github", bool(self.repo))
-        return bool(wants and stored_env(
-            os.path.join(SECRETS_DIR, f"{self.name}.env")).get("GH_TOKEN"))
+        path = os.path.join(SECRETS_DIR, f"{self.name}.env")
+        stored = stored_env(path).get("GH_TOKEN")
+        if stored == KEYRING_MARKER:
+            return bool(wants) and keyring_usable() and _keyring_has(path, "GH_TOKEN")
+        return bool(wants and stored)
 
     def env_vars(self):
         """Guest environment: [agent_env.<agent>] for each agent this sandbox
@@ -4146,10 +4194,10 @@ def repo_token(name):
     except under `host serve`, where `add --repo` is allowed: a 200 against a
     404 for a repo named by the caller would tell it which private repos the
     operator's token can read."""
-    own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env")).get("GH_TOKEN")
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{name}.env"), only={"GH_TOKEN"}).get("GH_TOKEN")
     if own or restricted():
         return own or None
-    return read_env_file(GLOBAL_ENV).get("GH_TOKEN") or None
+    return read_env_file(GLOBAL_ENV, only={"GH_TOKEN"}).get("GH_TOKEN") or None
 
 
 def _api_die(repo, ref, status):
@@ -4554,16 +4602,29 @@ def cmd_purge(args, config):
     # The keyring first: its items are found by the env file's name, so once
     # that file is gone nothing would ever clear them. A keyring that refuses
     # (a dismissed prompt) stops it with nothing purged; one that is not here
-    # at all never will, and is only said.
+    # at all never will, and is only said. Every value is read before any is
+    # cleared (that read is where a locked keyring prompts), so a clear that
+    # still fails part-way can put back the ones already gone.
+    held, cleared = {}, []
+    for var in keyring_vars(secret):
+        value = keyring_get(secret, var)
+        if value is not None:
+            held[var] = value
+        elif keyring_why(secret, var)[0] == "refused":
+            die(f"{var} could not be read from the keyring ({keyring_why(secret, var)[1]}) — "
+                "nothing has been purged; run it again")
     for var in keyring_vars(secret):
         if keyring_clear(secret, var):
+            cleared += [var] if var in held else []
             continue
         kind, why = keyring_why(secret, var)
         if kind != "absent":
+            lost = [v for v in cleared if not keyring_put(secret, v, held[v])]
             die(f"{var} could not be cleared from the keyring ({why}) — nothing has been "
-                f"purged; run it again")
+                "purged; run it again" + (f" (and {', '.join(lost)} could not be put back: "
+                                         f"`msbctl secret set {box.name}` each)" if lost else ""))
         warn(f"{var} stays in the keyring ({why}): "
-             f"`secret-tool clear {shlex.join(_keyring_attrs(secret, var))}` where it is")
+             f"{keyring_clear_hint(secret, var)} where it is")
 
     run(["msb", "stop", box.name], check=False, quiet=True)
     run(["msb", "rm", box.name], check=False, quiet=True)
@@ -4692,20 +4753,27 @@ def rename_sandbox(box, new):
         else:
             held[var] = value
     copied = []
-    for var, value in held.items():
-        if not keyring_put(new_env, var, value):
-            for done in copied:
-                keyring_clear(new_env, done)
-            die(f"the keyring did not take {var} under {new} — nothing has been renamed")
-        copied.append(var)
+    try:
+        for var, value in held.items():
+            if not keyring_put(new_env, var, value):
+                die(f"the keyring did not take {var} under {new} — nothing has been renamed")
+            copied.append(var)
 
-    existed = state_of(old) != "absent"
-    if existed:
-        run(["msb", "stop", old], check=False, quiet=True)
-        run(["msb", "rm", old], check=False, quiet=True)
-        if state_of(old) != "absent":
-            die(f"could not remove the sandbox {old} — nothing has been renamed")
-    stop_agent_filter(box)
+        existed = state_of(old) != "absent"
+        if existed:
+            run(["msb", "stop", old], check=False, quiet=True)
+            run(["msb", "rm", old], check=False, quiet=True)
+            if state_of(old) != "absent":
+                die(f"could not remove the sandbox {old} — nothing has been renamed")
+        stop_agent_filter(box)
+    except BaseException:
+        # Nothing has moved yet: the copies would be orphans under a name
+        # nothing uses, readable by whatever is named that next.
+        for done in copied:
+            if not keyring_clear(new_env, done):
+                warn(f"the copy of {done} under {new} is still in the keyring: "
+                     + keyring_clear_hint(new_env, done))
+        raise
 
     entry = registry_path_for(new)
     os.replace(registry_path(box), entry)
@@ -4722,7 +4790,7 @@ def rename_sandbox(box, new):
     for var in copied:
         if not keyring_clear(old_env, var):
             warn(f"{old}'s copy of {var} is still in the keyring (it could not be cleared): "
-                 f"`secret-tool clear {shlex.join(_keyring_attrs(old_env, var))}`")
+                 + keyring_clear_hint(old_env, var))
     cache = read_json(VERSIONS_CACHE)
     if old in cache:
         cache[new] = cache.pop(old)
@@ -5802,14 +5870,6 @@ def secret_var(spec):
     return spec.split("@", 1)[0].split(":", 1)[0]
 
 
-def store_secret_value(name, var, value):
-    """Set VAR=value for this sandbox, keeping its other secrets. Never echoed
-    and never in argv."""
-    path = os.path.join(SECRETS_DIR, f"{name}.env")
-    set_env_file_value(path, var, value)
-    return path
-
-
 def read_secret_hidden(prompt):
     import getpass
     try:
@@ -6114,7 +6174,7 @@ def cmd_secret(args, config):
              "placeholder until its next restart)")
         own_path = os.path.join(SECRETS_DIR, box.name + ".env")
         note(f"its value is still in {stored_where(own_path, args.var)} — " + (
-            f"`secret-tool clear {shlex.join(_keyring_attrs(own_path, args.var))}` and delete "
+            f"{keyring_clear_hint(own_path, args.var)} and delete "
             "the line if you want it gone" if args.var in keyring_vars(own_path) else
             "delete the line if you want it gone"))
         return
@@ -6134,7 +6194,7 @@ def cmd_secret(args, config):
         if not value:
             note("skipped")
             return
-        store_secret_value(box.name, secret_var(spec), value)
+        set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), secret_var(spec), value)
         append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
@@ -6283,7 +6343,7 @@ def try_set_env_file_value(path, var, value):
     _write_env_lines(path, lines)
     if was_keyring and store != "keyring" and not keyring_clear(path, var):
         warn(f"the old {var} is still in the keyring (it could not be cleared): "
-             f"`secret-tool clear {shlex.join(_keyring_attrs(path, var))}`")
+             + keyring_clear_hint(path, var))
     return True
 
 
@@ -8650,7 +8710,7 @@ def refresh_versions(names, config, cache):
     table = msb_table()
     token = None
     if config.get("version_check", {}).get("use_global_token", True):
-        token = read_env_file(os.path.join(SECRETS_DIR, "global.env")).get("GH_TOKEN")
+        token = read_env_file(GLOBAL_ENV, only={"GH_TOKEN"}).get("GH_TOKEN")
 
     # Upstream lookups are per-component, not per-sandbox: three sandboxes on
     # the same gitleaks pin must not cost three calls against an anonymous
@@ -9390,7 +9450,7 @@ def github_languages(repo, config):
     # Same optional token the version probe uses. Without one this is the
     # anonymous 60/hour, and a private repo simply reads as "no languages".
     if config.get("version_check", {}).get("use_global_token", True):
-        token = read_env_file(os.path.join(SECRETS_DIR, "global.env")).get("GH_TOKEN")
+        token = read_env_file(GLOBAL_ENV, only={"GH_TOKEN"}).get("GH_TOKEN")
         if token:
             headers["Authorization"] = f"Bearer {token}"
     data = http_json(f"https://api.github.com/repos/{repo}/languages", headers)
@@ -9805,9 +9865,12 @@ def cmd_add(args, config):
         warn(f"{var} is bound to {host}, but no egress rule allows it — "
              f"`msbctl allow {name} {host}` (then rebuild), or it can never be used")
     for spec, value in secrets:
-        if value:
-            store_secret_value(name, secret_var(spec), value)
-        else:
+        # The entry is written: a keyring that refuses a value now only warns.
+        if value and not try_set_env_file_value(os.path.join(SECRETS_DIR, f"{name}.env"),
+                                                secret_var(spec), value):
+            warn(f"the keyring did not take {secret_var(spec)} — "
+                 f"`msbctl secret set {name} {secret_var(spec)} --stdin` stores it")
+        elif not value:
             note(f"no value for {secret_var(spec)} — `msbctl secret add {name}` when you have it")
 
     msb_dir = os.path.join(project, ".msb")
@@ -10037,7 +10100,11 @@ def capture_token(name):
         note("skipped — the sandbox will have no GitHub API access.")
         note(f"Add it later: msbctl edit {name}  ->  GitHub token")
         return False
-    set_env_file_value(path, "GH_TOKEN", token)
+    # A refused unlock prompt is a skip, not the end of the whole add.
+    if not try_set_env_file_value(path, "GH_TOKEN", token):
+        warn(f"the keyring did not take the token ({keyring_why(path, 'GH_TOKEN')[1]}) — "
+             f"add it later: msbctl edit {name}  ->  GitHub token")
+        return False
     note(f"stored in {stored_where(path, 'GH_TOKEN')}")
     return True
 
@@ -13979,7 +14046,7 @@ def main():
             # At boot nobody can answer an unlock prompt (AUTOSTART_KEYRING_CAVEAT);
             # on a terminal (the picker) you can, so there it is asked as usual.
             if not sys.stdin.isatty() and keyring_status()[0] != "unlocked":
-                blocked = [n for n in args.names if autostart_needs_keyring(Sandbox(n, config))]
+                blocked = [n for n in args.names if autostart_blocked(n, config)]
                 if blocked:
                     warn(f"skipped, their secrets are in the keyring and {keyring_status()[1]}: "
                          f"{', '.join(blocked)} — unlock it and `msbctl start {' '.join(blocked)}`")
