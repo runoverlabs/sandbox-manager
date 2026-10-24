@@ -4796,6 +4796,32 @@ def parse_allow_target(raw):
     return rule
 
 
+def _rewrite_toml_list(text, key, values, after_key=None):
+    """`text` with the top-level list `key` set to `values`, one entry per line.
+    The assignment's extent comes from _toml_assignment(), which counts brackets
+    outside strings: a list spans lines, and an IPv6 rule carries its own `]`.
+    A new key goes after the WHOLE `after_key` assignment, not its first line —
+    once it landed inside a multi-line extra_rules and left the file invalid."""
+    lines = text.splitlines()
+    _, top = _toml_region(lines, None)
+    block = [f"{key} = ["] + [f"    {json.dumps(v)}," for v in values] + ["]"] if values \
+        else [f"{key} = []"]
+    found = _toml_assignment(lines, 0, top, key)
+    if found:
+        lines[found[0]:found[1] + 1] = block
+    else:
+        anchor = _toml_assignment(lines, 0, top, after_key) if after_key else None
+        at = anchor[1] + 1 if anchor else top
+        lines[at:at] = [""] + block
+    after = "\n".join(lines) + "\n"
+    try:
+        if tomllib.loads(after).get(key) != values:
+            raise tomllib.TOMLDecodeError(f"{key} did not read back as written")
+    except tomllib.TOMLDecodeError as exc:
+        die(f"refusing to write: setting {key} would leave the file invalid ({exc})")
+    return after
+
+
 def append_toml_list(path, key, items, after_key=None):
     """Add `items` to the top-level list `key` in a TOML file, in place, keeping
     the rest of the file (comments included) untouched. Returns the items that
@@ -4805,27 +4831,7 @@ def append_toml_list(path, key, items, after_key=None):
     new = [i for i in items if i not in current]
     if not new:
         return []
-    block = [f"{key} = ["] + [f"    {json.dumps(i)}," for i in current + new] + ["]"]
-    lines, out, at, i = text.splitlines(), [], None, 0
-    while i < len(lines):
-        if re.match(rf"^\s*{re.escape(key)}\s*=", lines[i]):
-            at = len(out)
-            while i < len(lines) and "]" not in lines[i].split("#")[0]:
-                i += 1
-            i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    if at is None:
-        anchor = next((j + 1 for j, line in enumerate(out) if after_key and
-                       re.match(rf"^\s*{re.escape(after_key)}\s*=", line)), None)
-        if anchor is None:
-            anchor = next((j for j, line in enumerate(out)
-                           if line.lstrip().startswith("[")), len(out))
-        out[anchor:anchor] = [""]
-        at = anchor + 1
-    out[at:at] = block
-    _write_tracked(path, "\n".join(out) + "\n")
+    _write_tracked(path, _rewrite_toml_list(text, key, current + new, after_key))
     return new
 
 
@@ -5696,20 +5702,11 @@ def cmd_secret(args, config):
 def remove_from_toml_list(path, key, item):
     """Remove one item from a top-level list in a TOML file, in place."""
     text = _read_tracked(path)
-    current = [i for i in tomllib.loads(text).get(key, []) if i != item]
-    lines, out, at, i = text.splitlines(), [], None, 0
-    while i < len(lines):
-        if re.match(rf"^\s*{re.escape(key)}\s*=", lines[i]):
-            at = len(out)
-            while i < len(lines) and "]" not in lines[i].split("#")[0]:
-                i += 1
-            i += 1
-            continue
-        out.append(lines[i])
-        i += 1
-    if at is not None:
-        out[at:at] = ([f"{key} = ["] + [f"    {json.dumps(x)}," for x in current] + ["]"]) if current else [f"{key} = []"]
-    _write_tracked(path, "\n".join(out) + "\n")
+    data = tomllib.loads(text)
+    if key not in data:
+        return
+    current = [i for i in data[key] if i != item]
+    _write_tracked(path, _rewrite_toml_list(text, key, current))
 
 
 def cmd_cache(args, config):
