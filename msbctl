@@ -4323,6 +4323,41 @@ def port_label(bind, host, guest, proto):
     return label
 
 
+def port_url(bind, host, proto):
+    """The `http://` URL that reaches a published tcp port, or None for udp.
+
+    The default bind is 127.0.0.1, so the URL names that. A port bound to every
+    interface (0.0.0.0 / ::) also answers on loopback, and one bound to a
+    specific address is reached there — the URL names whichever of those the
+    host is. No proxy and no preview hostname: it is still the plain bind the
+    port already is."""
+    if proto != "tcp":
+        return None
+    addr = bind
+    if ipaddress.ip_address(bind).is_unspecified:
+        addr = "::1" if ":" in bind else LOOPBACK_BIND
+    shown = f"[{addr}]" if ":" in addr else addr
+    return f"http://{shown}:{host}/"
+
+
+def port_link(bind, host, proto):
+    """A published tcp port's URL, for display: an OSC 8 hyperlink when stdout
+    is a terminal, the plain URL otherwise. udp ports have no URL ("")."""
+    url = port_url(bind, host, proto)
+    if url is None:
+        return ""
+    if sys.stdout.isatty():
+        return f"\033]8;;{url}\033\\{url}\033]8;;\033\\"
+    return url
+
+
+def port_display(bind, host, guest, proto):
+    """A published port as a listing shows it: the mapping, then its URL for
+    tcp ports (an OSC 8 hyperlink on a terminal, the plain URL otherwise)."""
+    link = port_link(bind, host, proto)
+    return port_label(bind, host, guest, proto) + (f"  {link}" if link else "")
+
+
 def port_conflict(name, bind, host, proto):
     """The other registered sandbox that already publishes this host port, or
     None. A wildcard bind collides with every address on the same port."""
@@ -4467,7 +4502,7 @@ def cmd_port(args, config):
         if not ports:
             note(f"no published ports — `msbctl port {box.name} 8080` adds one")
         for _, *where in ports:
-            note(port_label(*where))
+            note(port_display(*where))
         return
     current = [spec for spec, *_ in ports]
     drop = []
@@ -6656,7 +6691,8 @@ def show_data(box, table=None):
         "root_disk": str(box.root_disk), "guest_path": box.guest_project,
         "egress_mode": box.egress_mode, "rule_groups": box.rule_groups,
         "extra_rules": box.extra_rules,
-        "ports": [spec for spec, *_ in box.published_ports],
+        "ports": [{"spec": spec, "url": port_url(bind, host, proto)}
+                  for spec, bind, host, _, proto in box.published_ports],
         "policy_approved": policy_pinned(box),
         "claude_token": {"name": box.claude_token,
                          "stored": box.claude_token in claude_tokens(shared)},
@@ -6727,7 +6763,7 @@ def cmd_show(args, config):
     for src, dest, mode in box.extra_mounts:
         note(f"folder     {tilde(src)} -> {dest} ({mode})")
     for _, *where in box.published_ports:
-        note(f"port       {port_label(*where)}")
+        note(f"port       {port_display(*where)}")
 
     say("Versions")
     if not info:
