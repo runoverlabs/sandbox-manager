@@ -48,19 +48,24 @@ $ msbctl secret migrate --to file        # and back
 
 `migrate` is safe to run again, never prints a value, has `--json`, and sets
 `[secrets] store` in `config.toml` to match, which decides where *new* values
-go:
+go. Moving back to the files stops at a value a line can't hold (a line break,
+or a space or quote at either end) and leaves it in the keyring. A
+`VAR=@keyring` line whose item you deleted in your keyring's own tool has no
+value to move, so `migrate` drops that line and says so:
 
 | `store` | New values go to |
 | --- | --- |
 | `"file"` (default) | the 0600 file |
 | `"keyring"` | the keyring. Storing **refuses** when there's no keyring at all, rather than writing a plaintext copy you didn't ask for |
-| `"auto"` | the keyring if there is one and nothing autostarts, otherwise the file |
+| `"auto"` | the keyring if there is one, otherwise the file |
 
 A locked keyring is fine: the first time msbctl reads or writes a value, your
-keyring shows its usual unlock prompt. If you dismiss it, a sandbox starts
-without the secrets kept there, with a warning naming each one, exactly as if
-they had never been stored. Storing a value or running `migrate` stops instead,
-and changes nothing. Before any of that, msbctl asks D-Bus whether a Secret
+keyring shows its usual unlock prompt, once per command however many values
+it reads. If you dismiss it, nothing else prompts during that command: a sandbox
+starts without the secrets kept there, with a warning naming each one, exactly
+as if they had never been stored. Storing a value, `migrate`, `rename` and
+`purge` stop instead, and change nothing. Listing what is stored (`secret ls`,
+`ls`, `show`, the `edit` menu) reads only the file, so it never prompts. Before any of that, msbctl asks D-Bus whether a Secret
 Service exists at all (`busctl`, or `gdbus`), so on a machine without one it
 never calls `secret-tool`. `msbctl host check` shows the store, whether the
 keyring is there and unlocked, and how many values are in it.
@@ -70,8 +75,9 @@ install` starts before anyone logs in. A desktop keyring is usually still locked
 then, and nobody is there to answer its prompt. So `msbctl start --autostart`
 run without a terminal (the boot unit) **skips** each sandbox that needs a
 keyring value while the keyring is locked, and names them: unlock it and start
-them yourself. A value in `global.env` counts for every sandbox, since the
-Claude tokens and model keys live there. From the picker, on a terminal, they
+them yourself. A value in `global.env` counts only for the sandboxes that use
+it: the Claude token each one logs in with, its model endpoints' keys, and
+bindings in its registry entry. Nothing else there is read for it. From the picker, on a terminal, they
 start as usual and the keyring asks. Turning autostart on while secrets are in
 the keyring (`msbctl edit`, `add`, `host autostart install`), or moving them
 there with autostart on, says this and asks you to confirm when there's a
@@ -85,7 +91,9 @@ answer it. For a server, `"file"` on an encrypted disk is the recommendation
 (`msbctl host check` looks for one).
 
 Renaming a sandbox moves its keyring values with it, and purging it deletes
-them. Each value is one keyring item labelled `msb-manager: VAR (file)`, so
+them, before anything else. If the keyring refuses, nothing is renamed or
+purged. With no Secret Service on that machine at all, `purge` goes ahead and
+prints the `secret-tool clear` command for wherever the values are. Each value is one keyring item labelled `msb-manager: VAR (file)`, so
 your keyring's own tool shows them too.
 
 ### Claude

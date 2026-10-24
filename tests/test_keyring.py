@@ -26,6 +26,14 @@ class KeyringTest(MsbctlTest):
         with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
             fh.write(f'[secrets]\nstore = "{store}"\n')
 
+    def forget_item(self, file, var):
+        """Delete one item behind msbctl's back, as a keyring manager would."""
+        items = [i for i in self.keyring_items()
+                 if (i["attrs"]["file"], i["attrs"]["var"]) != (file, var)]
+        with open(os.environ["FAKE_KEYRING_STATE"], "w", encoding="utf-8") as fh:
+            json.dump(items, fh)
+        self.m.keyring_forget()
+
     def env_text(self, path):
         with open(path, encoding="utf-8") as fh:
             return fh.read()
@@ -190,16 +198,22 @@ class KeyringTest(MsbctlTest):
         self.assertEqual([c for c in self.keyring_calls() if "PROMPTED" in c], [])
         self.assert_no_call_without_service()
 
-    def test_a_boot_skips_everything_when_global_values_are_in_it(self):
-        self.make_folder_sandbox("plain", entry_extra="autostart = true")
-        self.set_store("keyring")
-        self.use_keyring("unlocked")
-        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_LAN", SECRET)
-        self.use_keyring("locked")
-        code, _, err = self.run_main("start", "--autostart")
-        self.assertEqual(code, 0, err)
-        self.assertEqual(self.msb_calls("create"), [])
-        self.assertIn("plain", err)
+    def test_a_boot_skips_only_what_uses_a_global_value_in_it(self):
+        # An endpoint key no sandbox here uses holds up nothing; the Claude
+        # token they all log in with holds up all of them.
+        for var, started in (("LLM_KEY_LAN", ["plain"]), ("CLAUDE_CODE_OAUTH_TOKEN", [])):
+            with self.subTest(var=var):
+                self.fresh()
+                self.make_folder_sandbox("plain", entry_extra="autostart = true")
+                self.set_store("keyring")
+                self.use_keyring("unlocked")
+                self.store_secret(self.m.GLOBAL_ENV, var, SECRET)
+                self.use_keyring("locked")
+                code, _, err = self.run_main("start", "--autostart")
+                self.assertEqual(code, 0, err)
+                self.assertEqual([c["argv"][2] for c in self.msb_calls("create")], started)
+                self.assertEqual("skipped" in err, not started)
+                self.assertEqual([c for c in self.keyring_calls() if "PROMPTED" in c], [])
 
     def test_the_picker_on_a_terminal_starts_them_and_asks(self):
         path = self.npm_sandbox(entry_extra="autostart = true")
@@ -244,6 +258,45 @@ class KeyringTest(MsbctlTest):
                 self.assert_no_call_without_service()
                 # Still counted as stored, so `secret ls` does not claim it is missing.
                 self.assertIn("NPM_TOKEN", self.m.read_env_file(path))
+
+    def test_one_prompt_per_run_however_many_values_and_reads(self):
+        # A start reads the sandbox's file and global.env more than once; each
+        # value is asked for once, and after a dismissed prompt none again.
+        for prompt, prompts in ((None, 1), ("dismiss", 1)):
+            with self.subTest(prompt=prompt):
+                self.fresh()
+                self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["NPM_TOKEN@registry.npmjs.org", '
+                                                             '"PYPI_TOKEN@upload.pypi.org"]\n')
+                path = self.secrets_file("web")
+                self.set_store("keyring")
+                self.use_keyring("unlocked")
+                for var in ("NPM_TOKEN", "PYPI_TOKEN"):
+                    self.store_secret(path, var, SECRET)
+                self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-planted")
+                self.use_keyring("locked")
+                if prompt:
+                    os.environ["FAKE_KEYRING_PROMPT"] = prompt
+                code, _, err = self.run_main("start", "web")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len([c for c in self.keyring_calls() if "PROMPTED" in c]), prompts)
+                self.assertEqual(err.count("dismissed"), 3 if prompt else 0)
+
+    def test_listing_what_is_stored_never_asks_the_keyring(self):
+        path = self.stored_then("locked")
+        self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", SECRET)   # no prompt: unlocked by the store
+        self.use_keyring("locked")
+        before = len(self.keyring_calls())
+        for argv in (("secret", "ls", "web"), ("show", "web", "--json"), ("ls", "--json")):
+            with self.subTest(argv=argv):
+                code, out, err = self.run_main(*argv)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("NO VALUE", out + err)
+        box = self.m.Sandbox("web", self.m.load_config())
+        self.assertEqual(self.m._summary_login(self.m.load_config()).split(",")[0],
+                         "Claude token 'main' stored")
+        self.m._github_state(box)
+        self.assertEqual(self.keyring_calls()[before:], [])
+        self.assertIn("NPM_TOKEN", self.env_text(path))
 
     # ------------------------------------------------------------------ migrate
 
@@ -319,10 +372,49 @@ class KeyringTest(MsbctlTest):
     def test_migrate_takes_no_sandbox_and_others_still_need_one(self):
         code, _, err = self.run_main("secret", "migrate", "web", "--to", "file")
         self.assertNotEqual(code, 0)
-        self.assertIn("takes no sandbox", err)
+        self.assertIn("unrecognized arguments: web", err)
+        code, _, err = self.run_main("secret", "migrate")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--to", err)
         code, _, err = self.run_main("secret", "ls")
         self.assertNotEqual(code, 0)
-        self.assertIn("name the sandbox", err)
+        self.assertIn("required: name", err)
+
+    def test_migrate_back_drops_a_marker_with_no_item(self):
+        path = self.stored_then("unlocked")
+        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_LAN", "planted-global-key")
+        self.forget_item("web", "NPM_TOKEN")
+        code, out, err = self.run_main("secret", "migrate", "--to", "file", "--json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)
+        self.assertEqual(doc["dropped"], [{"file": "web.env", "var": "NPM_TOKEN"}])
+        self.assertEqual([m["var"] for m in doc["moved"]], ["LLM_KEY_LAN"])
+        self.assertNotIn("NPM_TOKEN", self.env_text(path))
+        self.assertIn("LLM_KEY_LAN=planted-global-key", self.env_text(self.m.GLOBAL_ENV))
+        self.assertIn("no item for it", err)
+
+    def test_migrate_back_refuses_a_value_a_file_cannot_hold(self):
+        for value in ("line one\nOTHER=injected", ' "quoted" ', "'x'"):
+            with self.subTest(value=value):
+                self.fresh()
+                path = self.npm_sandbox()
+                self.set_store("keyring")
+                self.use_keyring("unlocked")
+                self.store_secret(path, "NPM_TOKEN", value)
+                code, _, err = self.run_main("secret", "migrate", "--to", "file")
+                self.assertNotEqual(code, 0)
+                self.assertIn("cannot go into a file", err)
+                self.assertIn("NPM_TOKEN=@keyring", self.env_text(path))
+                self.assertNotIn("OTHER", self.env_text(path))
+                self.assertEqual([i["value"] for i in self.keyring_items()], [value])
+                self.assertEqual(self.m.secret_store_setting(self.m.load_config()), "keyring")
+
+    def test_the_file_store_refuses_a_value_it_cannot_hold(self):
+        path = self.npm_sandbox()
+        code, _, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin",
+                                     stdin="one\nOTHER=injected\n")
+        self.assertNotEqual(code, 0)
+        self.assertFalse(os.path.exists(path) and "OTHER" in self.env_text(path))
 
     def test_host_serve_refuses_migrate(self):
         self.assertIn("for the host itself",
@@ -341,6 +433,24 @@ class KeyringTest(MsbctlTest):
         self.assertEqual(self.m.read_env_file(new).get("NPM_TOKEN"), SECRET)
         self.assertEqual([i["attrs"]["file"] for i in self.keyring_items()], ["shop"])
 
+    def test_rename_refuses_when_the_keyring_does_not_take_them(self):
+        path = self.stored_then("unlocked")
+        os.environ["FAKE_KEYRING_FAIL"] = "store"
+        code, _, err = self.run_main("rename", "web", "shop")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been renamed", err)
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.exists(self.entry_path("web")))
+        self.assertEqual([i["attrs"]["file"] for i in self.keyring_items()], ["web"])
+
+    def test_rename_carries_a_marker_with_no_item_and_says_so(self):
+        self.stored_then("unlocked")
+        self.forget_item("web", "NPM_TOKEN")
+        code, _, err = self.run_main("rename", "web", "shop")
+        self.assertEqual(code, 0, err)
+        self.assertIn("no item for it", err)
+        self.assertIn("NPM_TOKEN=@keyring", self.env_text(self.secrets_file("shop")))
+
     def test_rename_refuses_when_the_values_cannot_be_read(self):
         path = self.stored_then("locked", "dismiss")
         code, _, err = self.run_main("rename", "web", "shop")
@@ -358,6 +468,15 @@ class KeyringTest(MsbctlTest):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.keyring_items(), [])
         self.assertFalse(os.path.exists(path))
+
+    def test_purge_stops_before_anything_when_the_keyring_refuses(self):
+        path = self.stored_then("locked", "dismiss")
+        code, _, err = self.run_main("purge", "web", "-y")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been purged", err)
+        self.assertTrue(os.path.exists(path))
+        self.assertTrue(os.path.exists(self.entry_path("web")))
+        self.assertEqual(len(self.keyring_items()), 1)
 
     def test_removing_a_value_clears_its_item(self):
         path = self.npm_sandbox()

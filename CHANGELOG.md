@@ -11,6 +11,9 @@ release notes.
 ### Added
 - Secret values can live in your desktop keyring instead of 0600 files: `msbctl secret migrate --to keyring` moves them (and `--to file` back), and `[secrets] store = "file" | "keyring" | "auto"` in `config.toml` decides where new ones go. A locked keyring asks to unlock with its own prompt, a machine without one keeps the files, a boot-time `start --autostart` skips (and names) the sandboxes whose secrets are in a still-locked keyring, and `msbctl host check` reports which store is in use; see the docs' "Credentials & SSH" page. Nothing changes until you opt in.
 
+### Changed
+- A secret value that a line in its 0600 file cannot hold as it is (a line break, or a space or quote at either end) is refused when you store it, instead of being written and read back trimmed.
+
 ## [0.8.0] - 2026-10-24
 
 ### Added

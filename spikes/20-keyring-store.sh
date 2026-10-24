@@ -20,6 +20,12 @@
 #      you answer). Here there is no display, so the prompt fails at once, and
 #      migrate must stop cleanly: the file and [secrets] store unchanged, and
 #      within seconds rather than at a timeout.
+#   2b Unlocked, a marker whose item was deleted behind msbctl's back:
+#      keyring_why() says "missing", which needs the bus to say unlocked
+#      after the failed lookup.
+#   4  Still locked, two values read twice each: secret-tool is called ONCE
+#      (the refused prompt latches for the run, after the bus still says
+#      Locked), and keyring_why() says "refused".
 #
 # PASS is all of it. Needs: dbus-run-session, gnome-keyring-daemon,
 # secret-tool, busctl (Debian/Ubuntu: dbus-daemon gnome-keyring libsecret-tools).
@@ -73,6 +79,21 @@ case "$out" in *"$VALUE"*) bad "migrate printed the value" ;; *) pass "migrate p
 got=$(secret-tool lookup service msb-manager file global var GH_TOKEN)
 [ "$got" = "$VALUE" ] && pass "the keyring holds the value" || bad "the keyring does not hold it"
 
+printf 'spike-password' | busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
+# 2b ------------------------------- an item deleted behind msbctl's back
+# OTHER's marker points at no item: a failed lookup, then the bus says unlocked.
+(umask 077 && printf 'GH_TOKEN=@keyring\nOTHER=@keyring\n' >"$env_file")
+why=$(python3 -I - "$MSBCTL" <<'PY' 2>/dev/null
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("msbctl", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("msbctl", loader))
+loader.exec_module(m)
+print(m.keyring_status()[0], m.keyring_get(m.GLOBAL_ENV, "OTHER"), m.keyring_why(m.GLOBAL_ENV, "OTHER")[0])
+PY
+)
+[ "$why" = "unlocked None missing" ] && pass "unlocked, item deleted: reads as missing" \
+	|| bad "unlocked, item deleted: '$why'"
+
 # 3 -------------------------------------------------------------- locked
 busctl --user call org.freedesktop.secrets /org/freedesktop/secrets \
 	org.freedesktop.Secret.Service Lock ao 1 /org/freedesktop/secrets/aliases/default >/dev/null
@@ -96,6 +117,25 @@ fi
 grep -q '^GH_TOKEN=@keyring$' "$env_file" && pass "the file is unchanged" || bad "the file changed"
 grep -q '^store = "keyring"' "$MSB_CONFIG_DIR/config.toml" && pass "[secrets] store is unchanged" \
 	|| bad "[secrets] store changed"
+
+# 4 ------------------------------------------------- one prompt, and why
+(umask 077 && printf 'GH_TOKEN=@keyring\nOTHER=@keyring\n' >"$env_file")
+rm -f "$HOME/secret-tool.calls"
+# The module is loaded from its path; -I keeps this folder off sys.path.
+why=$(python3 -I - "$MSBCTL" <<'PY' 2>/dev/null
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("msbctl", sys.argv[1])
+m = importlib.util.module_from_spec(importlib.util.spec_from_loader("msbctl", loader))
+loader.exec_module(m)
+for _ in range(2):
+    m.read_env_file(m.GLOBAL_ENV)
+print(m.keyring_why(m.GLOBAL_ENV, "GH_TOKEN")[0])
+PY
+)
+calls=$(wc -l <"$HOME/secret-tool.calls" 2>/dev/null || echo 0)
+[ "$calls" -eq 1 ] && pass "locked: one secret-tool call for two values read twice" \
+	|| bad "locked: $calls secret-tool calls"
+[ "$why" = refused ] && pass "and it reads as refused" || bad "it reads as '$why'"
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail

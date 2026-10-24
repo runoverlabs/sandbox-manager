@@ -94,7 +94,9 @@ class MsbctlTest(TestCase):
             os.environ.update({"FAKE_KEYRING": mode, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"})
         else:
             os.environ.pop("FAKE_KEYRING", None)
-        self.m._KEYRING_STATUS.clear()
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(os.environ["FAKE_KEYRING_STATE"] + ".unlocked")
+        self.m.keyring_forget()
 
     def fresh(self):
         """A new HOME and a new msbctl, for each case of a subTest loop. The

@@ -34,7 +34,9 @@ The rules:
 
 - **No dependencies.** Python 3.11+ standard library and the `msb` binary,
   nothing else. That includes this documentation site, which `docs/build.py`
-  builds with the standard library alone.
+  builds with the standard library alone. An opt-in feature may call a host
+  tool (`fzf` for the picker, `secret-tool` for the keyring) if its absence
+  only turns that feature off.
 - **Every behaviour change gets a one-line `CHANGELOG.md` entry** under
   `## [Unreleased]`, saying what changed and what a user must do about it (for
   example "needs a rebuild"). Refactors and CI-only changes need none.
