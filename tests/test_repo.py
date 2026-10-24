@@ -180,6 +180,42 @@ class RepoTest(MsbctlTest):
         self.assertIn("clone will fail", err)
         self.assertEqual(len(self.msb_calls("create")), 1)
 
+    def keyring_add(self, keyring, prompt=None):
+        """`add --repo` at a terminal with a token pasted and `[secrets] store =
+        "keyring"`: `keyring` as use_keyring() takes it, its unlock prompt
+        `prompt`ed. Every question takes its default but the last, to register."""
+        os.makedirs(self.m.CONFIG_DIR, exist_ok=True)
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write('[secrets]\nstore = "keyring"\n')
+        self.use_keyring(keyring)
+        if prompt:
+            os.environ["FAKE_KEYRING_PROMPT"] = prompt
+        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: "ghp_planted"), \
+                mock.patch.object(self.m, "github_token_help", lambda repo: None), \
+                mock.patch.object(self.m, "confirm", lambda q, *a, **k: q.startswith("register")):
+            return self.main("add", "--repo", "acme/webshop", stdin="\n" * 20, tty=True)
+
+    def test_add_stores_its_token_in_the_keyring(self):
+        code, _, err = self.keyring_add("locked")
+        self.assertEqual(code, 0, err)
+        with open(self.secrets_file("webshop"), encoding="utf-8") as fh:
+            self.assertIn("GH_TOKEN=@keyring", fh.read())
+        self.assertTrue(self.m.policy_pinned(self.m.Sandbox("webshop", self.m.load_config())))
+
+    def test_add_survives_a_keyring_that_does_not_take_its_token(self):
+        # Registered and approved all the same: only the token is to set again.
+        code, _, err = self.keyring_add("locked", "dismiss")
+        self.assertEqual(code, 0, err)
+        self.assertIn("secret set webshop GH_TOKEN", err)
+        self.assertTrue(self.m.policy_pinned(self.m.Sandbox("webshop", self.m.load_config())))
+        self.assertFalse(os.path.exists(self.secrets_file("webshop")))
+
+    def test_add_refuses_a_keyring_store_with_no_keyring_before_writing(self):
+        code, _, err = self.keyring_add(None)
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing was written", err)
+        self.assertFalse(os.path.exists(self.entry_path("webshop")))
+
     def test_a_repo_cannot_choose_its_conf(self):
         self.gh.files[SHA1][".msb/sandbox.toml"] = POLICY1 + 'conf = "other.yaml"\n'
         code, _, err = self.main("add", "--repo", "acme/webshop", "-y")

@@ -10,7 +10,7 @@ This file provides guidance to coding agents (Claude Code, Codex, and anything e
 
 ## Hard constraints
 
-- **No dependencies.** Python 3.11+ stdlib (`tomllib`) and the `msb` binary only. No pip, no TOML writer. Registry entries are rendered whole from `templates/` and only read back via `tomllib`; the single exception is the `[versions]` table that `update` rewrites (`write_version_override()`).
+- **No dependencies.** Python 3.11+ stdlib (`tomllib`) and the `msb` binary only. No pip, no TOML writer. A host tool an opt-in feature calls (`fzf` for the picker, `secret-tool` with `busctl`/`gdbus` for `[secrets] store = "keyring"`) is allowed only if its absence turns that feature off and nothing else: probe with `shutil.which`, never require it. Registry entries are rendered whole from `templates/` and only read back via `tomllib`; the single exception is the `[versions]` table that `update` rewrites (`write_version_override()`).
 - `.gitignore` blocks `*.env` and `secrets/`. Nothing machine-local or generated belongs in the repo.
 - Comments in config/templates are the documentation (failure modes are non-obvious and cost debugging sessions). Preserve and extend them when changing behaviour; `msbctl --help` and `defaults.toml` are the user-facing docs.
 

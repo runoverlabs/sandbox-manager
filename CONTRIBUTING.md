@@ -12,6 +12,8 @@ scripts/smoke-install.sh    # package, then install into a throwaway HOME
 ```
 
 - **No dependencies.** Python 3.11+ stdlib and the `msb` binary, nothing else.
+  An opt-in feature may call a host tool (`fzf`, `secret-tool`) if its absence
+  only turns that feature off.
 - **Every behaviour change gets a one-line `CHANGELOG.md` entry** under
   `## [Unreleased]`: what changed and what a user must do about it (for example
   "needs a rebuild"). Refactors and CI-only changes need none.

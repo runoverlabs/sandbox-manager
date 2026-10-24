@@ -27,7 +27,10 @@ class VerbArgsTest(MsbctlTest):
         self.assertGreater(len(calls), 10)
         for call in calls:
             with self.subTest(line=call.lineno):
-                self.m.verb_args(call.args[0].value, **{k.arg: None for k in call.keywords})
+                # A literal is passed as it is: `action="set"` picks `secret set`.
+                self.m.verb_args(call.args[0].value, **{
+                    k.arg: k.value.value if isinstance(k.value, ast.Constant) else None
+                    for k in call.keywords})
 
     def test_the_menus_add_reaches_the_wizard(self):
         # Without fzf the menu is numbered: 1 is "add". The wizard then runs out

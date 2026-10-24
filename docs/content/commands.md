@@ -328,15 +328,19 @@ msbctl secret add name|.
 msbctl secret ls  name|.
 msbctl secret rm  name|. VAR
 msbctl secret set name|. VAR [--stdin] [--restart]
+msbctl secret migrate --to keyring|file [--json]
 ```
 
 Tokens the sandbox can use but never see. `add` offers the presets or takes
 your own binding. `set` stores a new value for a variable the sandbox already
 binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt or, with
 `--stdin`, from standard input; binding a new variable is `add`. A running
-sandbox uses the new value from its next start, or now with `--restart`. See
-[Credentials & SSH](credentials.md#more-secrets) and
-[Scripting](credentials.md#scripting-storing-a-token-from-a-password-manager).
+sandbox uses the new value from its next start, or now with `--restart`.
+`migrate` moves every stored value, for every sandbox, into the desktop keyring
+or back into the files, and sets `[secrets] store` to match. See
+[Credentials & SSH](credentials.md#more-secrets),
+[Scripting](credentials.md#scripting-storing-a-token-from-a-password-manager)
+and [the keyring](credentials.md#keeping-the-values-in-the-keyring).
 
 ### `msbctl keys`
 
