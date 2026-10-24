@@ -70,6 +70,15 @@ else
 	sed 's/^/        /' /tmp/check.$$
 fi
 rm -f /tmp/check.$$
+# Again with every secret in the (fake) keyring: nothing that reads or writes a
+# secret may depend on which store holds it (tests/harness.py).
+if MSB_TEST_SECRET_STORE=keyring python3 -I -m unittest discover -s tests -t . -q >/tmp/check.$$ 2>&1; then
+	ok "the same tests pass with [secrets] store = \"keyring\""
+else
+	bad "unit tests failed with [secrets] store = \"keyring\":"
+	sed 's/^/        /' /tmp/check.$$
+fi
+rm -f /tmp/check.$$
 
 echo "toml"
 for f in defaults.toml .msb/sandbox.toml; do

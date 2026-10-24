@@ -30,7 +30,63 @@ What this means in practice:
   is useless to whoever receives it.
 
 The real values live in `~/.config/msb/secrets/`: `global.env` for the Claude
-token, and `<name>.env` per sandbox. Both are mode 0600, outside every project.
+token, and `<name>.env` per sandbox. Both are mode 0600, outside every project,
+and can instead keep each value in your desktop keyring, as below.
+
+### Keeping the values in the keyring
+
+A 0600 file is readable by anything running as you, and by every backup of your
+home folder. On a desktop with a keyring (GNOME Keyring, KWallet, KeePassXC: any
+Secret Service), the values can live there instead, through `secret-tool`
+(`libsecret-tools` on Debian and Ubuntu, `libsecret` on Fedora). The files stay,
+and still name every variable, but each value becomes `VAR=@keyring`:
+
+```console
+$ msbctl secret migrate --to keyring     # every stored value, every file
+$ msbctl secret migrate --to file        # and back
+```
+
+`migrate` is safe to run again, never prints a value, has `--json`, and sets
+`[secrets] store` in `config.toml` to match, which decides where *new* values
+go:
+
+| `store` | New values go to |
+| --- | --- |
+| `"file"` (default) | the 0600 file |
+| `"keyring"` | the keyring. Storing **refuses** when there's no keyring at all, rather than writing a plaintext copy you didn't ask for |
+| `"auto"` | the keyring if there is one and nothing autostarts, otherwise the file |
+
+A locked keyring is fine: the first time msbctl reads or writes a value, your
+keyring shows its usual unlock prompt. If you dismiss it, a sandbox starts
+without the secrets kept there, with a warning naming each one, exactly as if
+they had never been stored. Storing a value or running `migrate` stops instead,
+and changes nothing. Before any of that, msbctl asks D-Bus whether a Secret
+Service exists at all (`busctl`, or `gdbus`), so on a machine without one it
+never calls `secret-tool`. `msbctl host check` shows the store, whether the
+keyring is there and unlocked, and how many values are in it.
+
+**Autostart and servers.** A sandbox started at boot by `msbctl host autostart
+install` starts before anyone logs in. A desktop keyring is usually still locked
+then, and nobody is there to answer its prompt. So `msbctl start --autostart`
+run without a terminal (the boot unit) **skips** each sandbox that needs a
+keyring value while the keyring is locked, and names them: unlock it and start
+them yourself. A value in `global.env` counts for every sandbox, since the
+Claude tokens and model keys live there. From the picker, on a terminal, they
+start as usual and the keyring asks. Turning autostart on while secrets are in
+the keyring (`msbctl edit`, `add`, `host autostart install`), or moving them
+there with autostart on, says this and asks you to confirm when there's a
+terminal. Without one it only warns. `msbctl host check` flags the combination
+while the keyring is locked.
+
+A remote host, a Kandev host or an ssh session usually has no Secret Service at
+all, and `"auto"` keeps the file there. If a headless machine does run one, keep
+it unlocked or without a password, since an unlock prompt there has nobody to
+answer it. For a server, `"file"` on an encrypted disk is the recommendation
+(`msbctl host check` looks for one).
+
+Renaming a sandbox moves its keyring values with it, and purging it deletes
+them. Each value is one keyring item labelled `msb-manager: VAR (file)`, so
+your keyring's own tool shows them too.
 
 ### Claude
 

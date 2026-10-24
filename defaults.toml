@@ -292,6 +292,30 @@ ttl_hours = 6
 # the anonymous quota.
 use_global_token = true
 
+[secrets]
+# Where a stored secret's VALUE lives (a token, an API key). The files under
+# ~/.config/msb/secrets/ always exist and always name the variables; this
+# decides what follows the `=`.
+#   "file"     the value itself, in a 0600 file: what anything that can read
+#              your home folder (a backup, too) gets.
+#   "keyring"  the value in the desktop keyring (the Secret Service, through
+#              `secret-tool` from libsecret-tools), the file holding `@keyring`.
+#              A LOCKED keyring asks to unlock, with its own prompt: on a desktop
+#              that is you. With no Secret Service at all a write REFUSES.
+#   "auto"     the keyring whenever there is one, else the file. A remote host,
+#              a Kandev host or an ssh session usually has no Secret Service,
+#              and gets the file; one that has a keyring must keep it unlocked
+#              (or without a password), as nobody is there to answer the prompt.
+# With autostart: a boot finds nobody to answer that prompt either, so while
+# the keyring is still locked `start --autostart` (run without a terminal, by
+# the boot unit) SKIPS each sandbox that needs a value from it. Turning
+# autostart on while secrets are in the keyring says so, and asks on a terminal.
+# Changing this changes where NEW values go; `msbctl secret migrate --to
+# keyring|file` moves the ones already stored, and sets this to match.
+# A value already in the keyring is read from there whatever this says. On a
+# server, an encrypted disk is the answer instead (`msbctl host check`).
+store = "file"
+
 # ---------------------------------------------------------------------------
 # Kandev hosts
 #

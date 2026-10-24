@@ -121,6 +121,12 @@ sandbox's own `[versions]` overrides these.
 | `ttl_hours` | `6` | how long upstream version checks are cached |
 | `use_global_token` | `true` | use `GH_TOKEN` from `secrets/global.env` for them, if present |
 
+### `[secrets]`
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `store` | `"file"` | where new secret values go: `"file"`, `"keyring"` or `"auto"`. See [the keyring](credentials.md#keeping-the-values-in-the-keyring); `msbctl secret migrate` moves the existing ones and sets this |
+
 ### `[secret_presets.<name>]`
 
 What `msbctl secret add` offers. Shipped: `npm`, `dockerhub`, `ghcr`, `pypi`,

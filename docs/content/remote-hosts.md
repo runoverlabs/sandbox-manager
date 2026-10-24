@@ -62,7 +62,8 @@ forced command is there to contain.
 with lingering on, once, as root: `loginctl enable-linger msb`.
 
 `host check` reports what it can see, as heuristics: whether the user can
-become root, the modes of the home and secrets directories, core dumps, swap,
+become root, the modes of the home and secrets directories, where secret values
+are stored ([file or keyring](credentials.md#keeping-the-values-in-the-keyring)), core dumps, swap,
 whether the disk holding the home sits on dm-crypt, whether every
 `authorized_keys` line is restricted or an `sk-` key, lingering and the
 autostart unit, and the `msb`, `msbctl` and `/dev/kvm` it finds. Full-disk
