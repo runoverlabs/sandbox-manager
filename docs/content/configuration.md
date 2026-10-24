@@ -53,6 +53,7 @@ including a whole egress group, replaces the shipped value.
 | `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
 | `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
 | `llm` | `[]` | the [model endpoints](models.md) a sandbox with pi gets unless its registry entry sets `llm`; the first is pi's default |
+| `tools` | `[]` | the [agent tools](agent-tools.md) a new sandbox gets unless its registry entry sets `tools`; each is a folder under `~/.config/msb/tools` |
 | `identity` | `""` | the `[identities]` entry new sandboxes use |
 | `git_push` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` (https, the GitHub token) or `"ssh"` (the agent). See [git push](credentials.md#git-push-gh-or-ssh) |
 | `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
@@ -216,6 +217,7 @@ Any key it sets overrides the project's file.
 | `identity` | an `[identities]` name; applied at every start |
 | `claude_token` | a stored Claude token's name; absent means `[defaults] claude_token` |
 | `llm` | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |
+| `tools` | the [agent tools](agent-tools.md) it gets, by folder name; absent means `[defaults] tools`. Their rules and environment need a rebuild; the adapter files refresh at every start |
 | `autostart` | started when the picker opens |
 | `ssh_keys` | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |

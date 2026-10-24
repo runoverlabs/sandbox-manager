@@ -375,8 +375,8 @@ msbctl setup --identity KEY --git-name NAME --git-email EMAIL [--default]
 ```
 
 Your machine-level settings as a menu: git identities, Claude login, model
-endpoints (for [pi](models.md)), your network, new-sandbox defaults, or the
-config file itself. `--welcome` runs the
+endpoints (for [pi](models.md)), [agent tools](agent-tools.md), your network,
+new-sandbox defaults, or the config file itself. `--welcome` runs the
 first-time walk-through. `--claude-token NAME` skips the menu and stores one
 Claude token under that name (`main` is the default one), from a hidden prompt
 or `--stdin`. `--identity` adds or changes a git identity the same way, without

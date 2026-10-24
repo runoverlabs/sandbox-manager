@@ -62,6 +62,15 @@ claude_token = "{{CLAUDE_TOKEN}}"
 # {{NAME}}` → Models for pi offers the rebuild.
 {{LLM}}
 
+# Which of this machine's agent tool bundles it gets, by folder name under
+# ~/.config/msb/tools/ (`msbctl setup` → Agent tools lists them, and
+# docs/content/agent-tools.md is the format). Absent follows [defaults] tools.
+# Each bundle brings `allow@host:tcp:port` rules for its endpoints plus its
+# [env], both fixed at create time, and the adapter files it ships for pi and
+# Claude Code. Registry-only for the same reason as `llm`: a bundle names
+# servers this machine owns, so a committed name resolves nowhere else.
+# tools = ["web"]
+
 # Started by `msbctl start --autostart`: when the picker opens, and on a host
 # after a reboot (`msbctl host autostart install`). Each idle sandbox costs
 # ~300 MB, so this is cheap, but a stopped sandbox cannot be version-probed.

@@ -44,6 +44,7 @@ every session — if a symptom below rings a bell, the fix is one file away.
 | `msb-setup` | machine-level settings, first run, named Claude tokens |
 | `msb-pi-llm` | pi install or config, `[llm.<name>]`, how an endpoint's key reaches it |
 | `msb-git-agent` | how a sandbox pushes, which key, what the SSH agent filter forwards |
+| `msb-tool-bundles` | agent tool bundles: `~/.config/msb/tools/`, `[defaults] tools`, their rules/env/adapters, or a tool an agent is missing |
 
 ## Layout
 
