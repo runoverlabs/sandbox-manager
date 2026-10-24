@@ -2146,7 +2146,7 @@ class Sandbox:
         # fallback to the shared file is for bindings in the registry entry.
         # The reserved variables are never bound this way, from any layer.
         for spec in self.secret_binds:
-            var = secret_var(spec)
+            var = binding_var(spec)
             if is_reserved_var(var):
                 warn(f"{self.name}: secret binding {spec!r} is ignored — {var} has a fixed binding "
                      "and cannot be bound again (a rebuild refuses this)")
@@ -2452,8 +2452,8 @@ class Sandbox:
         when bound, each binding's variable, its pi endpoints' keys. A value
         left there unbound (`secret rm` keeps it) is not looked up, so it cannot
         prompt at start or keep the sandbox from starting at boot."""
-        out = {secret_var(spec) for spec in self.secret_binds
-               if not is_reserved_var(secret_var(spec))}
+        out = {binding_var(spec) for spec in self.secret_binds
+               if not is_reserved_var(binding_var(spec))}
         if self.wants_github:
             out.add("GH_TOKEN")
         if self.wants_component("pi"):
@@ -2466,7 +2466,7 @@ class Sandbox:
         to global.env, see secret_env()), its pi endpoints' keys. Nothing else
         there is looked up for it, so a keyring value it never uses cannot
         prompt at its start or keep it from starting at boot."""
-        out = {secret_var(spec) for spec in self.registry_binds}
+        out = {binding_var(spec) for spec in self.registry_binds}
         if self.claude_auth == "secret":
             out.add(claude_token_var(self.claude_token))
         if self.wants_component("pi"):
@@ -4442,7 +4442,7 @@ def is_reserved_var(var):
 
 def reserved_binding_problems(box):
     """The `secret_binds` entries that name a reserved variable."""
-    return [spec for spec in box.secret_binds if is_reserved_var(secret_var(spec))]
+    return [spec for spec in box.secret_binds if is_reserved_var(binding_var(spec))]
 
 
 def refuse_reserved_bindings(box):
@@ -5970,7 +5970,7 @@ def cmd_port(args, config):
         note("the server inside has to listen on 0.0.0.0, not localhost")
 
 
-def secret_var(spec):
+def binding_var(spec):
     """The environment variable name in an `ENV[:OPTIONS]@HOST` binding."""
     return spec.split("@", 1)[0].split(":", 1)[0]
 
@@ -6026,7 +6026,7 @@ def unreachable_secret_hosts(config, groups, specs, extra_rules=()):
     def covered(host):
         return any(host == a or (a.startswith("*.") and host.endswith(a[1:])) for a in allowed)
 
-    return [(secret_var(sp), h) for sp in specs for h in sp.split("@", 1)[1].split(",") if not covered(h)]
+    return [(binding_var(sp), h) for sp in specs for h in sp.split("@", 1)[1].split(",") if not covered(h)]
 
 
 def pick_secrets(config, taken=()):
@@ -6045,8 +6045,8 @@ def pick_secrets(config, taken=()):
             note(f"create it at {preset.get('help', '(see the provider)')}")
             if preset.get("usage"):
                 note(f"use it:  {preset['usage']}")
-        out.append((spec, read_secret_hidden(f"paste the {secret_var(spec)} value")))
-        note(f"{secret_var(spec)} -> {spec.split('@', 1)[1]}")
+        out.append((spec, read_secret_hidden(f"paste the {binding_var(spec)} value")))
+        note(f"{binding_var(spec)} -> {spec.split('@', 1)[1]}")
     return out
 
 
@@ -6098,7 +6098,7 @@ def bind_secret_live(box, config, spec, restart):
     box = Sandbox(box.name, config)
     _, env = box.secret_env()
     bound = msb_bound_secrets(box.name)
-    if bound is not None and secret_var(spec) in bound:
+    if bound is not None and binding_var(spec) in bound:
         if restart and state == "running":
             run(["msb", "stop", box.name], check=False, quiet=True)
             ensure_running(box)
@@ -6123,7 +6123,7 @@ def secret_set(box, config, args):
     a value is not a policy change; binding a new variable, or the same one to
     another host, is `secret add`, which is."""
     var = args.var or die("secret set needs the variable: `msbctl secret set <name> VAR`")
-    specs = [x for x in box.secret_binds if secret_var(x) == var and not is_reserved_var(var)]
+    specs = [x for x in box.secret_binds if binding_var(x) == var and not is_reserved_var(var)]
     if var != "GH_TOKEN" and not specs:
         if is_reserved_var(var):
             die(f"{var} is not stored per sandbox — a Claude token is `msbctl setup --claude-token NAME`")
@@ -6258,11 +6258,11 @@ def cmd_secret(args, config):
     if args.action == "ls":
         own = stored_env(os.path.join(SECRETS_DIR, f"{box.name}.env"))
         for spec in box.secret_binds or ["(none)"]:
-            have = "value stored" if secret_var(spec) in own else "NO VALUE"
+            have = "value stored" if binding_var(spec) in own else "NO VALUE"
             note(f"  {spec}   {DIM}{have}{RESET}" if spec != "(none)" else "  (none)")
         return
     if args.action == "rm":
-        spec = next((x for x in box.secret_binds if secret_var(x) == args.var), None)
+        spec = next((x for x in box.secret_binds if binding_var(x) == args.var), None)
         if not spec:
             die(f"{box.name} has no secret {args.var!r} (`msbctl secret ls {box.name}`)")
         if box.is_repo and spec not in box.registry_binds:
@@ -6289,19 +6289,19 @@ def cmd_secret(args, config):
     if not picked:
         return
     spec, preset = picked
-    if is_reserved_var(secret_var(spec)):
-        die(f"{secret_var(spec)} has a fixed binding and cannot be bound again")
+    if is_reserved_var(binding_var(spec)):
+        die(f"{binding_var(spec)} has a fixed binding and cannot be bound again")
     # Held open across the paste: the guest can write sandbox.toml meanwhile.
     with approving_edits(box, config, "adding a secret"):
         if preset:
             note(f"create it at {preset.get('help', '(see the provider)')}")
             if preset.get("usage"):
                 note(f"use it:  {preset['usage']}")
-        value = read_secret_hidden(f"paste the {secret_var(spec)} value")
+        value = read_secret_hidden(f"paste the {binding_var(spec)} value")
         if not value:
             note("skipped")
             return
-        set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), secret_var(spec), value)
+        set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), binding_var(spec), value)
         append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
@@ -7662,7 +7662,7 @@ def section_keys(box, config, ctx):
 
 
 def _summary_secrets(box):
-    return ", ".join(secret_var(x) for x in box.secret_binds) or "none"
+    return ", ".join(binding_var(x) for x in box.secret_binds) or "none"
 
 
 def section_secrets(box, config, ctx):
@@ -7672,7 +7672,7 @@ def section_secrets(box, config, ctx):
         if action.startswith("add"):
             cmd_secret(verb_args("secret", action="add", name=box.name, var=None), config)
         elif action.startswith("remove"):
-            names = [secret_var(x) for x in box.secret_binds]
+            names = [binding_var(x) for x in box.secret_binds]
             if not names:
                 note("none to remove")
                 continue
@@ -8455,7 +8455,7 @@ def show_data(box, table=None):
     shared = stored_env(GLOBAL_ENV)
     secrets = []
     for spec in box.secret_binds:
-        var = secret_var(spec)
+        var = binding_var(spec)
         from_registry = spec in box.registry_binds
         secrets.append({"var": var, "hosts": spec.rpartition("@")[2].split(","),
                         "origin": "registry" if from_registry else "project",
@@ -8519,7 +8519,7 @@ def cmd_show(args, config):
         note("ports      " + ", ".join(
             f"{g} <- {port_link(LOOPBACK_BIND, h, 'tcp', f'127.0.0.1:{h}')}"
             for g, h in rec["ports"].items()))
-        note(f"secrets    {', '.join(secret_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
+        note(f"secrets    {', '.join(binding_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
              "  (values only ever in Kandev's requests)")
         say("Egress")
         for rule in box.net_rules():
@@ -9963,7 +9963,7 @@ def cmd_add(args, config):
     if any(value for _, value in secrets) and write_store() == "file":
         for spec, value in secrets:
             if value and (problem := env_value_problem(value)):
-                die(f"{secret_var(spec)}: {problem}, which a line in an env file cannot hold "
+                die(f"{binding_var(spec)}: {problem}, which a line in an env file cannot hold "
                     "— nothing was written")
 
     # ------------------------------------------------------------- write out
@@ -9988,11 +9988,11 @@ def cmd_add(args, config):
     for spec, value in secrets:
         # The entry is written: a keyring that refuses a value now only warns.
         if value and not try_set_env_file_value(os.path.join(SECRETS_DIR, f"{name}.env"),
-                                                secret_var(spec), value):
-            warn(f"the keyring did not take {secret_var(spec)} — "
-                 f"`msbctl secret set {name} {secret_var(spec)} --stdin` stores it")
+                                                binding_var(spec), value):
+            warn(f"the keyring did not take {binding_var(spec)} — "
+                 f"`msbctl secret set {name} {binding_var(spec)} --stdin` stores it")
         elif not value:
-            note(f"no value for {secret_var(spec)} — `msbctl secret add {name}` when you have it")
+            note(f"no value for {binding_var(spec)} — `msbctl secret add {name}` when you have it")
 
     msb_dir = os.path.join(project, ".msb")
     os.makedirs(msb_dir, exist_ok=True)
@@ -10148,7 +10148,7 @@ def cmd_add_repo(args, config):
             # its policy must not bind a variable that already has a value here
             # (a fresh name has none, so ordinary use never meets this).
             own = stored_env(os.path.join(SECRETS_DIR, f"{name}.env"))
-            stored = [secret_var(sp) for sp in cfg.get("secret_binds", []) if secret_var(sp) in own]
+            stored = [binding_var(sp) for sp in cfg.get("secret_binds", []) if binding_var(sp) in own]
             if stored:
                 die(f"{repo}'s policy binds {', '.join(stored)}, which already has a value stored "
                     f"for {name} — refused here; add it on the host")
@@ -12115,7 +12115,7 @@ def kandev_start(args, config, settings):
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
     given, _ = kandev_bound_values(req.get("secrets"))
-    bound = [secret_var(spec) for spec in entry.get("secret_binds", [])]
+    bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):
         # Never a half-bound start: a missing value would reach the guest's
         # requests as the literal placeholder.
