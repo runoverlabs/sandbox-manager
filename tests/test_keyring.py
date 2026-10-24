@@ -372,6 +372,55 @@ class KeyringTest(MsbctlTest):
         self.assertIn("add it later", err.getvalue())
         self.assertFalse(os.path.exists(self.secrets_file("web")))
 
+    def test_add_refuses_a_secret_before_it_registers_anything(self):
+        # Past the entry, a die would leave a sandbox registered without its
+        # policy: an explicit keyring with none here, or a value a file
+        # cannot hold, refuses while nothing is written yet.
+        for store, value in (("keyring", SECRET), ("file", f'"{SECRET}')):
+            with self.subTest(store=store):
+                self.fresh()
+                self.set_store(store)
+                project = os.path.join(self.tmp, "shop")
+                os.makedirs(project)
+                self.m.mark_welcomed()
+                os.environ["TERM"] = "dumb"     # numbered prompts: each takes its default
+                patch = unittest.mock.patch.object
+                with patch(self.m, "pick_secrets",
+                           return_value=[("NPM_TOKEN@registry.npmjs.org", value)]), \
+                        patch(self.m, "confirm", lambda *a, **k: False), \
+                        patch(self.m, "available_digest", lambda image: None):
+                    code, _, err = self.run_main("add", project, stdin="\n" * 60, tty=True)
+                self.assertNotEqual(code, 0)
+                self.assertIn("nothing was written", err)
+                self.assertFalse(os.path.exists(self.entry_path("shop")))
+                self.assertFalse(os.path.exists(os.path.join(project, ".msb")))
+                self.assert_no_call_without_service()
+
+    def test_a_value_with_carriage_returns_reads_back_exactly(self):
+        path = self.npm_sandbox()
+        self.use_keyring("unlocked")
+        value = "a\rb\r\nc"
+        self.assertTrue(self.m.keyring_put(path, "NPM_TOKEN", value))
+        self.m.keyring_forget()
+        self.assertEqual(self.m.keyring_get(path, "NPM_TOKEN"), value)
+
+    def test_an_unbound_value_is_never_looked_up_at_start(self):
+        # `secret rm` keeps the value: it must neither prompt at start nor
+        # hold the sandbox up at boot.
+        self.make_folder_sandbox("plain", entry_extra="autostart = true")
+        self.set_store("keyring")
+        self.use_keyring("unlocked")
+        self.store_secret(self.secrets_file("plain"), "OLD_TOKEN", SECRET)
+        self.use_keyring("locked")
+        before = len(self.keyring_calls())
+        code, _, err = self.run_main("start", "--autostart")
+        self.assertEqual(code, 0, err)
+        self.assertEqual([c["argv"][2] for c in self.msb_calls("create")], ["plain"])
+        self.assertNotIn("skipped", err)
+        self.assert_never_prompted()
+        self.assertEqual([c["argv"][0] for c in self.keyring_calls()[before:] if "argv" in c
+                          and c["argv"][0] != "search"], [])
+
     def test_listing_what_is_stored_never_asks_the_keyring(self):
         path = self.stored_then("locked")
         self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", SECRET)   # no prompt: unlocked by the store
@@ -470,6 +519,26 @@ class KeyringTest(MsbctlTest):
         code, _, err = self.run_main("secret", "ls")
         self.assertNotEqual(code, 0)
         self.assertIn("required: name", err)
+
+    def test_migrate_back_says_when_the_old_copy_stays(self):
+        path = self.stored_then("unlocked")
+        os.environ["FAKE_KEYRING_FAIL"] = "clear"
+        code, _, err = self.run_main("secret", "migrate", "--to", "file")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"NPM_TOKEN={SECRET}", self.env_text(path))
+        self.assertIn("still in the keyring", err)
+        self.assertIn("secret-tool clear", err)
+        self.assert_not_in_output(SECRET, err)
+
+    def test_a_failed_store_is_not_called_a_missing_item(self):
+        path = self.npm_sandbox()
+        self.store_secret(path, "NPM_TOKEN", SECRET)
+        self.use_keyring("unlocked")
+        os.environ["FAKE_KEYRING_FAIL"] = "store"
+        code, _, err = self.run_main("secret", "migrate", "--to", "keyring")
+        self.assertNotEqual(code, 0)
+        self.assertIn("did not store it", err)
+        self.assertNotIn("deleted outside", err)
 
     def test_migrate_back_drops_a_marker_with_no_item(self):
         path = self.stored_then("unlocked")
@@ -588,6 +657,38 @@ class KeyringTest(MsbctlTest):
         self.assertEqual(sorted((i["attrs"]["var"], i["value"]) for i in self.keyring_items()),
                          [("GH_TOKEN", "planted-gh-value"), ("NPM_TOKEN", SECRET)])
         self.assertTrue(os.path.exists(path))
+
+    def refuse(self, verb, var):
+        """_secret_tool, with `verb` on `var` going unanswered (a timeout, a
+        prompt nobody saw): what latches a refusal for the rest of the run."""
+        real = self.m._secret_tool
+
+        def fake(argv, value=""):
+            attrs = argv[1:]
+            if argv[0] == verb and attrs[attrs.index("var") + 1] == var:
+                return None
+            return real(argv, value)
+        return unittest.mock.patch.object(self.m, "_secret_tool", side_effect=fake)
+
+    def test_purge_puts_back_what_it_cleared_after_a_refusal(self):
+        path = self.stored_then("unlocked")
+        self.store_secret(path, "GH_TOKEN", "planted-gh-value")
+        with self.refuse("clear", "GH_TOKEN"):
+            code, _, err = self.run_main("purge", "web", "-y")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been purged", err)
+        self.assertNotIn("could not be put back", err)
+        self.assertEqual(sorted((i["attrs"]["var"], i["value"]) for i in self.keyring_items()),
+                         [("GH_TOKEN", "planted-gh-value"), ("NPM_TOKEN", SECRET)])
+
+    def test_rename_takes_back_its_copies_after_a_refusal(self):
+        path = self.stored_then("unlocked")
+        self.store_secret(path, "GH_TOKEN", "planted-gh-value")
+        with self.refuse("store", "GH_TOKEN"):      # the second: NPM_TOKEN is copied by then
+            code, _, err = self.run_main("rename", "web", "shop")
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been renamed", err)
+        self.assertEqual({i["attrs"]["file"] for i in self.keyring_items()}, {"web"})
 
     def test_purge_with_a_marker_whose_item_is_gone(self):
         path = self.stored_then("unlocked")

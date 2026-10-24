@@ -79,7 +79,9 @@ run without a terminal (the boot unit) **skips** each sandbox that needs a
 keyring value while the keyring is locked, and names them: unlock it and start
 them yourself. A value in `global.env` counts only for the sandboxes that use
 it: the Claude token each one logs in with, its model endpoints' keys, and
-bindings in its registry entry. Nothing else there is read for it. From the picker, on a terminal, they
+bindings in its registry entry. Nothing else there is read for it. Likewise in
+its own file only what it binds counts: a value `msbctl secret rm` left behind
+is never read. From the picker, on a terminal, they
 start as usual and the keyring asks. Turning autostart on while secrets are in
 the keyring (`msbctl edit`, `add`, `host autostart install`), or moving them
 there with autostart on, says this and asks you to confirm when there's a
