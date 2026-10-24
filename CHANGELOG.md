@@ -14,7 +14,7 @@ release notes.
 - pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 
 ### Changed
-- pi installs from `@earendil-works/pi-coding-agent`: the `@mariozechner` package pi used to live in is deprecated on npm and stops at 0.73.1, so run `msbctl update <name> -c pi` on a sandbox that already has pi, which takes the old package out as it puts the new one in; a rebuild gets there from a clean root.
+- pi installs from `@earendil-works/pi-coding-agent`: the `@mariozechner` package pi used to live in is deprecated on npm and stops at 0.73.1, so rebuild a sandbox that already has pi: its key stops working until then, because `models.json` now uses the key spelling only the new pi understands.
 
 ## [0.7.0] - 2026-10-22
 

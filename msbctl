@@ -292,10 +292,9 @@ CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com,platform.claude.com"
 # old scope aliases only `@mariozechner/*` — so a package compiled against
 # `@earendil-works/*` cannot load on 0.73. 1.x keeps the old names aliased too,
 # which is why msb-<bundle>.ts adapters are unaffected either way.
+# bootstrap.sh's do_pi gets it as MSB_PI_PACKAGE, so this is the one place it is
+# spelled. A guest still on the old scope is not migrated: rebuild it.
 PI_PACKAGE = "@earendil-works/pi-coding-agent"
-# What a guest created before the move still has. Only UPDATERS names it, to take
-# it out rather than leave two pi installs competing for the `pi` bin.
-PI_PACKAGE_OLD = "@mariozechner/pi-coding-agent"
 GUEST_PI_DIR = "/root/.pi"
 # msbctl's copy of a bundle adapter is prefixed — pi's extensions/msb-<name>.ts,
 # Claude's skills/msb-<name>/ — so it is a file msbctl owns and may delete again,
@@ -361,7 +360,7 @@ def llm_key_ref(name):
     `Authorization` header carried the value only for `$NAME` on 1.4 and the bare
     name on 0.73. No spelling satisfies both, so msbctl writes what PI_PACKAGE
     resolves; a guest left on 0.73 sends the literal `$LLM_KEY_…` and gets the 401
-    that names it (`msbctl update -c pi`).
+    that names it — rebuild it.
     """
     return "$" + llm_key_var(name)
 
@@ -2961,8 +2960,9 @@ def ensure_pi(box):
                          server of yours, the models it serves NOW (asked from
                          here, else the last list; see served_models()), so
                          pi's /model offers exactly those. No secret in it —
-                         `apiKey` names LLM_KEY_<NAME>, whose value in the
-                         guest is msb's placeholder.
+                         `apiKey` is `$LLM_KEY_<NAME>` (llm_key_ref(): the
+                         `$` is required), whose value in the guest is msb's
+                         placeholder.
     agent/settings.json  MERGED: pi writes it too (the model you switch to,
                          the theme). msbctl turns install telemetry off and
                          sets the default model when the one chosen in msbctl
@@ -3874,6 +3874,7 @@ def bootstrap_payload(box):
         "MSB_WANT_CLAUDE": "0" if boot.get("claude") is False else "1",
         # Opt-in: it needs a model endpoint of this machine's to be any use.
         "MSB_WANT_PI": "1" if boot.get("pi") else "0",
+        "MSB_PI_PACKAGE": PI_PACKAGE,
         "MSB_WANT_BUN": "1" if boot.get("bun") else "0",
         "MSB_WANT_GITLEAKS": "1" if boot.get("gitleaks") else "0",
         "MSB_PROJECT_DIR": box.guest_project,
@@ -7932,11 +7933,7 @@ UPDATERS = {
     "claude": ("npm install -g @anthropic-ai/claude-code@latest "
                "@agentclientprotocol/claude-agent-acp@latest >/dev/null "
                "&& claude --version"),
-    # The uninstall is the migration: a guest from before the scope move keeps the
-    # deprecated package otherwise, and two installs mean two `pi` bins claiming
-    # the same symlink. It exits 0 on a guest that never had it.
-    "pi": (f"npm uninstall -g {PI_PACKAGE_OLD} >/dev/null 2>&1; "
-           f"npm install -g {PI_PACKAGE}@latest >/dev/null && pi --version"),
+    "pi": f"npm install -g {PI_PACKAGE}@latest >/dev/null && pi --version",
     "apt": "apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get -y -qq upgrade",
 }
 

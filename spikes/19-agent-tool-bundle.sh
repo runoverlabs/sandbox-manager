@@ -48,17 +48,9 @@ fail=0
 # ---------------------------------------------------------------- step 1: pi
 say "1  the adapter under pi's own loader"
 
-# Either scope: pi 1.x installs as @earendil-works and keeps @mariozechner in its
-# extension alias map, so an adapter loads under both. Prefer the current one.
-NPM_ROOT="$(npm root -g 2>/dev/null)"
-PI_ROOT=""
-for scope in @earendil-works @mariozechner; do
-    [ -f "$NPM_ROOT/$scope/pi-coding-agent/dist/core/extensions/loader.js" ] \
-        && { PI_ROOT="$NPM_ROOT/$scope/pi-coding-agent"; break; }
-done
+PI_ROOT="$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent"
 LOADER="$PI_ROOT/dist/core/extensions/loader.js"
-[ -f "$LOADER" ] || { echo "   pi's extension loader not found under $NPM_ROOT"; exit 1; }
-say "   pi at ${PI_ROOT#$NPM_ROOT/}"
+[ -f "$LOADER" ] || { echo "   pi's extension loader not found at $LOADER"; exit 1; }
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

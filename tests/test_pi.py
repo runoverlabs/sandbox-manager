@@ -88,6 +88,8 @@ class PiTest(PiBase):
         self.assertEqual(self.msb_calls("create")[0]["env"].get("LLM_KEY_QWEN"), KEY)
         self.assert_not_in_argv(KEY)
         self.assertIn("export MSB_WANT_PI='1'", self.msb_calls("exec")[0]["argv"][-1])
+        self.assertIn(f"export MSB_PI_PACKAGE='{self.m.PI_PACKAGE}'",
+                      self.msb_calls("exec")[0]["argv"][-1])
         self.assertTrue(any(a.endswith(":/root/.pi:uid=" + str(os.getuid()) + f",gid={os.getgid()}")
                             for a in argv))
 
@@ -285,9 +287,6 @@ class PiTest(PiBase):
         self.assertEqual(code, 0, err)
         scripts = [c["argv"][-1] for c in self.msb_calls("exec")]
         self.assertIn(f"npm install -g {self.m.PI_PACKAGE}@latest", scripts[-1])
-        # A guest from before the scope move must not keep the deprecated package
-        # alongside it: two installs, two `pi` bins for one symlink.
-        self.assertIn(f"npm uninstall -g {self.m.PI_PACKAGE_OLD}", scripts[-1])
 
 
 

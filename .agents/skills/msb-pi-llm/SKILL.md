@@ -14,11 +14,10 @@ msb 0.7.6 and re-checked on 0.7.7.
 
 **The scope.** `PI_PACKAGE` is `@earendil-works/pi-coding-agent`: pi moved out of
 the `@mariozechner` scope, which npm deprecates and which is frozen at 0.73.1, so
-`@latest` there never moves. `bootstrap.sh`'s `do_pi` installs the same name, and
-`UPDATERS["pi"]` uninstalls the old one (`PI_PACKAGE_OLD`) before installing the
-new — two installs would mean two `pi` bins claiming one symlink, and that
-uninstall is the whole migration, because `do_pi`'s `command -v pi` early return
-leaves an existing guest's install alone. Check any third-party pi package against
+`@latest` there never moves. `bootstrap.sh`'s `do_pi` gets the name as
+`MSB_PI_PACKAGE`. A guest still on the old scope is deliberately not migrated
+(pi is pre-release here): `do_pi`'s `command -v pi` early return leaves it alone,
+and a rebuild is the fix. Check any third-party pi package against
 this before promising it: pi resolves an extension's imports through an alias map
 of the scopes it bundles itself (`dist/core/extensions/loader.js`), 0.73 aliases
 only `@mariozechner/*` while 1.x aliases both, so a package compiled against
@@ -32,7 +31,7 @@ environment — verified by running each version's `resolveConfigValue()`. No
 spelling satisfies both; `!printenv NAME` does, at the cost of a shell per request
 out of a config file, which is exactly the config-as-code this repo keeps out of
 the guest. A guest left on 0.73 therefore sends the literal `$LLM_KEY_…` and gets
-a 401 that names it.
+a 401 that names it; rebuild it.
 
 **`PI_OFFLINE` earns its keep past 0.73:** it stops pi fetching `fd` and
 `ripgrep` from GitHub releases for its grep and find tools, which refuse outright
