@@ -5695,6 +5695,11 @@ def parse_mount_spec(spec, project_dest=GUEST_PROJECT):
     return src, dest, mode
 
 
+def bracketed(bind):
+    """`bind` as it prints in a spec or label: bracketed when it is IPv6."""
+    return f"[{bind}]" if ":" in bind else bind
+
+
 def parse_port_spec(spec):
     """A published port in msb's --port syntax, `[BIND:]HOST:GUEST[/tcp|/udp]`,
     or a bare `PORT` for the same number on both sides. IPv6 binds are
@@ -5724,17 +5729,62 @@ def parse_port_spec(spec):
         bind = str(ipaddress.ip_address(bind))
     except ValueError:
         die(f"port {raw!r}: {bind!r} is not an IP address to bind on")
-    shown = f"[{bind}]" if ":" in bind else bind
+    shown = bracketed(bind)
     canonical = f"{host}:{guest}" if bind == LOOPBACK_BIND else f"{shown}:{host}:{guest}"
     return canonical + ("/udp" if proto == "udp" else ""), bind, host, guest, proto
 
 
-def port_label(bind, host, guest, proto):
-    """How a published port reads to a person: where to point the browser."""
+def port_where(bind, host):
+    """The host side as a person reads it: `localhost:PORT`, or `BIND:PORT`."""
     if bind == LOOPBACK_BIND:
-        where = f"localhost:{host}"
-    else:
-        where = f"[{bind}]:{host}" if ":" in bind else f"{bind}:{host}"
+        return f"localhost:{host}"
+    return f"{bracketed(bind)}:{host}"
+
+
+def port_url(bind, host, proto):
+    """The `http://` URL that reaches a published tcp port, or None for udp.
+
+    The default bind is 127.0.0.1, so the URL names that. A bind to every
+    interface is reached on its own family's loopback (0.0.0.0 -> 127.0.0.1,
+    :: -> ::1); a specific bind is reached at that address. A link-local zone
+    id is percent-encoded in the URL (RFC 6874: %eth0 -> %25eth0). No proxy
+    and no preview hostname: it is still the plain bind the port already is."""
+    if proto != "tcp":
+        return None
+    addr = bind
+    if ipaddress.ip_address(bind).is_unspecified:
+        addr = "::1" if ":" in bind else LOOPBACK_BIND
+    return f"http://{bracketed(addr.replace('%', '%25'))}:{host}/"
+
+
+def _term_can_link():
+    """True when an OSC 8 hyperlink is safe to emit: a real terminal (not a
+    pipe), not a dumb one (Emacs shell, M-x compile, some CI), and not running
+    over ssh — where 127.0.0.1 would open on the caller's machine, not the one
+    the port is bound on."""
+    return (sys.stdout.isatty()
+            and os.environ.get("TERM", "dumb") != "dumb"
+            and not os.environ.get("SSH_CONNECTION"))
+
+
+def port_link(bind, host, proto, text):
+    """`text` as an OSC 8 hyperlink to a published tcp port's URL on a real
+    terminal, the plain `text` otherwise. udp ports have no URL, so `text`
+    comes back unchanged."""
+    url = port_url(bind, host, proto)
+    if url is None or not _term_can_link():
+        return text
+    return f"\033]8;;{url}\033\\{text}\033]8;;\033\\"
+
+
+def port_label(bind, host, guest, proto, link=False):
+    """How a published port reads to a person: where to point the browser.
+    `link` makes the host side a hyperlink on a real terminal; menu rows and
+    summaries pass the plain form, whose escape codes would break their width
+    maths."""
+    where = port_where(bind, host)
+    if link:
+        where = port_link(bind, host, proto, where)
     label = f"{where} -> {guest}" + ("/udp" if proto == "udp" else "")
     if ipaddress.ip_address(bind).is_unspecified:
         label += "   (every interface: reachable from your network)"
@@ -5885,7 +5935,7 @@ def cmd_port(args, config):
         if not ports:
             note(f"no published ports — `msbctl port {box.name} 8080` adds one")
         for _, *where in ports:
-            note(port_label(*where))
+            note(port_label(*where, link=True))
         return
     current = [spec for spec, *_ in ports]
     drop = []
@@ -8420,6 +8470,9 @@ def show_data(box, table=None):
         "egress_mode": box.egress_mode, "rule_groups": box.rule_groups,
         "extra_rules": box.extra_rules,
         "ports": [spec for spec, *_ in box.published_ports],
+        "port_urls": {spec: port_url(bind, host, proto)
+                      for spec, bind, host, _, proto in box.published_ports
+                      if proto == "tcp"},
         "policy_approved": policy_pinned(box),
         "claude_token": {"name": box.claude_token,
                          "stored": box.claude_token in claude_tokens(shared)},
@@ -8463,7 +8516,9 @@ def cmd_show(args, config):
             note(f"workspace  {box.entry['workspace_disk']} disk at {KANDEV_WORKSPACE}, "
                  "deleted with the sandbox")
         note(f"expires    {rec['expires_at']}  (created {rec['created_at']})")
-        note("ports      " + ", ".join(f"{g} <- 127.0.0.1:{h}" for g, h in rec["ports"].items()))
+        note("ports      " + ", ".join(
+            f"{g} <- {port_link(LOOPBACK_BIND, h, 'tcp', f'127.0.0.1:{h}')}"
+            for g, h in rec["ports"].items()))
         note(f"secrets    {', '.join(secret_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
              "  (values only ever in Kandev's requests)")
         say("Egress")
@@ -8520,7 +8575,7 @@ def cmd_show(args, config):
     for src, dest, mode in box.extra_mounts:
         note(f"folder     {tilde(src)} -> {dest} ({mode})")
     for _, *where in box.published_ports:
-        note(f"port       {port_label(*where)}")
+        note(f"port       {port_label(*where, link=True)}")
 
     say("Versions")
     if not info:
