@@ -25,6 +25,7 @@
     msbctl policy <name> [approve]   the project policy it is pinned to; approve a change
     msbctl observe <name> [on|off|report]   stop blocking and record what is reached
     msbctl secret add|rm|ls|set <name>   extra tokens the sandbox can use but not see
+    msbctl secret migrate --to keyring|file   every stored value into the OS keyring, or back
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
     msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (then rebuild)
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
@@ -1044,22 +1045,252 @@ def state_of(name, table=None):
 
 # --------------------------------------------------------------------- secrets
 
+#
+# Every secret msbctl stores is a line in secrets/global.env or
+# secrets/<sandbox>.env. Those files always name the variables; `[secrets]
+# store` decides whether the VALUE follows the `=` or sits in the OS keyring,
+# with the line saying `VAR=@keyring` (KEYRING_MARKER). Stdlib Python has no
+# cipher, so the keyring is the Secret Service reached through the
+# `secret-tool` binary (libsecret-tools), the value always on its stdin, never
+# in its argv. Everything reads through read_env_file() and writes through
+# set_env_file_value(), so no caller knows which store holds a value.
+#
+# A LOCKED keyring is used, and its own unlock prompt asks you: on a desktop
+# you are the human that prompt is for. Without one — ssh, a Kandev host, a
+# boot unit — there is either no Secret Service at all (keyring_status() says
+# "absent", and nothing is called: `auto` keeps the file, `keyring` refuses),
+# or one set up to be unlocked already, or with no lock. A prompt that is
+# dismissed, or cannot be shown, fails the call: the value is then an empty
+# one, warned about, exactly like a secret never stored.
+
+KEYRING_MARKER = "@keyring"
+KEYRING_SERVICE = "msb-manager"
+SECRET_STORES = ("file", "keyring", "auto")
+KEYRING_TIMEOUT = 300       # seconds: long enough to type a password at the unlock prompt
+_KEYRING_STATUS = []        # the probe's answer, once per run
+_KEYRING_WARNED = set()
+
+
+def _env_line(line):
+    """(key, value) of a KEY=VALUE line, or None for a comment or a blank."""
+    line = line.strip()
+    if not line or line.startswith("#") or "=" not in line:
+        return None
+    key, _, value = line.partition("=")
+    return key.strip(), value.strip().strip('"').strip("'")
+
+
+def _read_env_lines(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().splitlines()
+    except FileNotFoundError:
+        return []
+
+
+def _write_env_lines(path, lines):
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def keyring_vars(path):
+    """The variables whose value this env file keeps in the keyring."""
+    return [kv[0] for kv in map(_env_line, _read_env_lines(path))
+            if kv and kv[1] == KEYRING_MARKER]
+
+
+def keyring_status():
+    """("unlocked" | "locked" | "absent", why). Asked once per run, without
+    prompting: the D-Bus `Locked` property of the default collection, read
+    with busctl (systemd) or gdbus (glib). Locked is usable (its first use
+    prompts); absent is not."""
+    if not _KEYRING_STATUS:
+        _KEYRING_STATUS.append(_probe_keyring())
+    return _KEYRING_STATUS[0]
+
+
+def _probe_keyring():
+    if not shutil.which("secret-tool"):
+        return "absent", "secret-tool is not installed (libsecret-tools)"
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    if not (os.environ.get("DBUS_SESSION_BUS_ADDRESS") or os.path.exists(os.path.join(runtime, "bus"))):
+        return "absent", "no D-Bus session bus here (ssh, a boot unit, a Kandev host)"
+    default = "/org/freedesktop/secrets/aliases/default"
+    if shutil.which("busctl"):
+        argv = ["busctl", "--user", "--timeout=5", "get-property", "org.freedesktop.secrets",
+                default, "org.freedesktop.Secret.Collection", "Locked"]          # -> b false
+    elif shutil.which("gdbus"):
+        argv = ["gdbus", "call", "--session", "--timeout", "5", "--dest", "org.freedesktop.secrets",
+                "--object-path", default, "--method", "org.freedesktop.DBus.Properties.Get",
+                "org.freedesktop.Secret.Collection", "Locked"]                   # -> (<false>,)
+    else:
+        return "absent", "neither busctl nor gdbus, to ask whether the keyring is unlocked"
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=10,
+                              stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return "absent", "the Secret Service did not answer"
+    words = re.findall(r"[a-z]+", proc.stdout)
+    if proc.returncode != 0 or not ({"true", "false"} & set(words)):
+        return "absent", "no Secret Service with a default keyring on the session bus"
+    if "false" in words:
+        return "unlocked", "the default keyring is unlocked"
+    return "locked", "the default keyring is locked (its first use asks to unlock it)"
+
+
+def keyring_usable():
+    """A Secret Service is there: unlocked, or locked and able to ask."""
+    return keyring_status()[0] != "absent"
+
+
+def _keyring_attrs(path, var):
+    # The secrets folder is an attribute too: a second install (a throwaway
+    # MSB_CONFIG_DIR) must never read or overwrite this one's values.
+    return ["service", KEYRING_SERVICE, "dir", os.path.realpath(SECRETS_DIR),
+            "file", os.path.basename(path).removesuffix(".env"), "var", var]
+
+
+def _secret_tool(argv, value=""):
+    """Run secret-tool, the value (if any) on stdin. None if it could not run.
+    On a locked keyring this is where the unlock prompt appears."""
+    if not keyring_usable():
+        return None
+    try:
+        return subprocess.run(["secret-tool"] + argv, input=value, capture_output=True,
+                              text=True, timeout=KEYRING_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def keyring_get(path, var):
+    proc = _secret_tool(["lookup"] + _keyring_attrs(path, var))
+    return proc.stdout if proc and proc.returncode == 0 and proc.stdout else None
+
+
+def keyring_put(path, var, value):
+    """Store and read back. True only if the keyring now holds exactly `value`."""
+    label = f"msb-manager: {var} ({os.path.basename(path)})"
+    proc = _secret_tool(["store", f"--label={label}"] + _keyring_attrs(path, var), value)
+    return bool(proc and proc.returncode == 0) and keyring_get(path, var) == value
+
+
+def keyring_clear(path, var):
+    proc = _secret_tool(["clear"] + _keyring_attrs(path, var))
+    return bool(proc and proc.returncode == 0)
+
+
 def read_env_file(path):
-    """Parse KEY=VALUE. Warns if the mode is not 600 — these hold tokens."""
+    """Parse KEY=VALUE, resolving a value kept in the keyring. Warns if the
+    mode is not 600 — these hold tokens. A keyring value that cannot be read
+    (no Secret Service, a dismissed unlock prompt) is "": the key is still there, so `VAR in values` says
+    one is stored, and `.get(VAR)` says it cannot be used now."""
     if not os.path.isfile(path):
         return {}
     mode = os.stat(path).st_mode & 0o777
     if mode != 0o600:
         warn(f"{tilde(path)} is mode {mode:04o}, expected 0600")
-    values = {}
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, _, value = line.partition("=")
-            values[key.strip()] = value.strip().strip('"').strip("'")
+    values = dict(kv for kv in map(_env_line, _read_env_lines(path)) if kv)
+    for var in [k for k, v in values.items() if v == KEYRING_MARKER]:
+        value = keyring_get(path, var)
+        if value is None and (path, var) not in _KEYRING_WARNED:
+            _KEYRING_WARNED.add((path, var))
+            status, why = keyring_status()
+            warn(f"{var} ({tilde(path)}) is in the keyring and cannot be read: "
+                 + (why if status == "absent" else "it has no such item, or the unlock "
+                    "prompt was dismissed") +
+                 " — it counts as not stored this time")
+        values[var] = value or ""
     return values
+
+
+def secret_store_setting(config=None):
+    """`[secrets] store` as configured: file, keyring or auto."""
+    if config is None:
+        config = load_config()
+    store = (config.get("secrets") or {}).get("store", "file")
+    if store not in SECRET_STORES:
+        die(f'[secrets] store = {store!r}: it is one of "file", "keyring", "auto"')
+    return store
+
+
+def autostart_users():
+    """What starts sandboxes with nobody logged in: each registered sandbox
+    with autostart on, and the boot unit if it is installed."""
+    users = [n for n in registered() if read_toml(registry_path_for(n)).get("autostart") is True]
+    if os.path.exists(os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)):
+        users.append(AUTOSTART_UNIT)
+    return users
+
+
+def secrets_in_keyring():
+    """{env file: [vars]} for every value currently kept in the keyring."""
+    out = {}
+    if os.path.isdir(SECRETS_DIR):
+        for f in sorted(os.listdir(SECRETS_DIR)):
+            if f.endswith(".env"):
+                found = keyring_vars(os.path.join(SECRETS_DIR, f))
+                if found:
+                    out[os.path.join(SECRETS_DIR, f)] = found
+    return out
+
+
+# Autostart and the keyring do mix, on a machine whose keyring is unlocked (or
+# has no password) by the time the boot unit runs. Where it is still locked,
+# nobody is there to answer its prompt, so `start --autostart` off a terminal
+# skips each sandbox that needs a keyring value (autostart_needs_keyring())
+# instead of hanging on it. Turning either on says so, and asks on a terminal.
+AUTOSTART_KEYRING_CAVEAT = (
+    "secrets are kept in the keyring: at boot, while it is still locked, `msbctl start "
+    "--autostart` SKIPS every sandbox that needs one rather than wait on an unlock prompt "
+    "nobody can answer. On a machine that autostarts, keep the keyring unlocked by then "
+    "(or without a password)")
+
+
+def keyring_in_use():
+    """Secrets are, or new ones will be, kept in the keyring."""
+    store = secret_store_setting()
+    return store == "keyring" or bool(secrets_in_keyring()) or (store == "auto" and keyring_usable())
+
+
+def autostart_keyring_ok(interactive, question="turn autostart on anyway?"):
+    """Autostart alongside the keyring: the caveat is said, and asked about on
+    a terminal. False only when it was asked and declined."""
+    warn(AUTOSTART_KEYRING_CAVEAT)
+    return not interactive or confirm(question)
+
+
+def autostart_needs_keyring(name):
+    """Whether starting `name` reads a keyring value: one in its own file, or
+    any in global.env (the Claude tokens and model keys every sandbox may use)."""
+    return bool(keyring_vars(os.path.join(SECRETS_DIR, f"{name}.env")) or keyring_vars(GLOBAL_ENV))
+
+
+def write_store():
+    """Where a value written now goes: "file" or "keyring". `auto` picks the
+    keyring whenever there is one (a locked one asks to unlock); an explicit
+    "keyring" with none here refuses, rather than leaving a plaintext copy
+    nobody asked for."""
+    try:
+        store = secret_store_setting()
+    except SystemExit:
+        die(f"{tilde(CONFIG_FILE)} does not parse, so where secrets are stored is unknown "
+            "— nothing was written")
+    if store == "file":
+        return "file"
+    status, why = keyring_status()
+    if store == "auto":
+        return "keyring" if status != "absent" else "file"
+    if status == "absent":
+        die(f'[secrets] store = "keyring", but {why} — nothing was written. Set '
+            f'store = "auto" in {tilde(CONFIG_FILE)} to fall back to the file')
+    return "keyring"
+
+
+def stored_where(path, var):
+    """Where VAR's value now is, for a message."""
+    return "the keyring" if var in keyring_vars(path) else f"{tilde(path)} (0600)"
 
 
 # ------------------------------------------------------- the project's dev.yaml
@@ -4230,6 +4461,10 @@ def cmd_purge(args, config):
     if box.is_repo:
         shutil.rmtree(box.project, ignore_errors=True)
     remove_sandbox_volumes(box)
+    for var in keyring_vars(secret):
+        if not keyring_clear(secret, var):
+            warn(f"{var} stays in the keyring (it could not be cleared): "
+                 f"`secret-tool clear {shlex.join(_keyring_attrs(secret, var))}`")
     for path in (secret, entry, approved_path(box.name),
                  os.path.join(TOOLS_STATE_DIR, f"{box.name}.json")):
         try:
@@ -4331,6 +4566,13 @@ def rename_sandbox(box, new):
     if clash:
         die(f"left over from an earlier {new}: {', '.join(tilde(p) for p in clash)} — "
             "move it out of the way first")
+    # Keyring items are keyed by the env file's name, so they move too: read
+    # them all now, while a refusal still leaves everything as it was.
+    old_env, new_env = moves[0]
+    held = {var: keyring_get(old_env, var) for var in keyring_vars(old_env)}
+    if None in held.values():
+        die(f"{old}'s secrets are in the keyring and could not be read "
+            f"({keyring_status()[1]}) — nothing has been renamed")
 
     existed = state_of(old) != "absent"
     if existed:
@@ -4349,6 +4591,12 @@ def rename_sandbox(box, new):
     else:
         set_toml_key(entry, "volumes", None)
     _follow_rename_in_comments(entry, old, new)
+    for var, value in held.items():
+        if keyring_put(new_env, var, value):
+            keyring_clear(old_env, var)
+        else:
+            warn(f"the keyring did not take {var} under {new}: its old item is kept, "
+                 f"`msbctl secret set {new} {var}` stores it again")
     for src, dst in moves:
         if os.path.exists(src):
             os.replace(src, dst)
@@ -5432,19 +5680,10 @@ def secret_var(spec):
 
 
 def store_secret_value(name, var, value):
-    """Set VAR=value in this sandbox's 0600 env file, keeping its other lines.
-    Never echoed and never in argv."""
-    os.makedirs(SECRETS_DIR, mode=0o700, exist_ok=True)
+    """Set VAR=value for this sandbox, keeping its other secrets. Never echoed
+    and never in argv."""
     path = os.path.join(SECRETS_DIR, f"{name}.env")
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except FileNotFoundError:
-        lines = [f"# {name}'s secrets. Never commit this file."]
-    lines = [l for l in lines if not l.startswith(f"{var}=")] + [f"{var}={value}"]
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+    set_env_file_value(path, var, value)
     return path
 
 
@@ -5617,7 +5856,7 @@ def secret_set(box, config, args):
     value = read_secret_input(f"the {var} value", args.stdin)
     path = os.path.join(SECRETS_DIR, f"{box.name}.env")
     set_env_file_value(path, var, value)
-    note(f"{var} stored in {tilde(path)} (0600)")
+    note(f"{var} stored in {stored_where(path, var)}")
     if var != "GH_TOKEN":
         bind_secret_live(box, config, specs[0], args.restart)
         return
@@ -5628,9 +5867,82 @@ def secret_set(box, config, args):
     bind_secret_live(box, config, GH_SPEC, args.restart)
 
 
+def secret_migrate(args, config):
+    """secret migrate --to keyring|file: move every stored value, in every env
+    file, to one store, and set `[secrets] store` to match (an `auto` that
+    already means the keyring is left as it is). Idempotent: what is already
+    there is skipped. Each value is read back from the keyring before its line
+    becomes a marker, and a value only leaves the keyring after the file that
+    now holds it has been written. Never prints a value."""
+    to = args.to or die("secret migrate needs --to keyring or --to file")
+    status, why = keyring_status()
+    files = sorted(os.path.join(SECRETS_DIR, f) for f in
+                   (os.listdir(SECRETS_DIR) if os.path.isdir(SECRETS_DIR) else []) if f.endswith(".env"))
+    if to == "keyring":
+        if status == "absent":
+            die(f"the keyring cannot be used: {why} — nothing was moved")
+        users = autostart_users()
+        if users:
+            note(f"autostart: {', '.join(users)}")
+            if not autostart_keyring_ok(sys.stdin.isatty() and not args.json, "move them anyway?"):
+                die("cancelled — nothing was moved")
+    elif status == "absent" and any(keyring_vars(p) for p in files):
+        die(f"secrets are in the keyring, and {why} — nothing was moved")
+
+    moved, kept = [], 0
+    for path in files:
+        lines, cleared, failed = _read_env_lines(path), [], None
+        for i, line in enumerate(lines):
+            kv = _env_line(line)
+            if not kv or not kv[1] or (kv[1] == KEYRING_MARKER) == (to == "keyring"):
+                kept += bool(kv and kv[1])
+                continue
+            var, value = kv
+            if to == "keyring":
+                if not keyring_put(path, var, value):
+                    failed = var
+                    break
+                lines[i] = f"{var}={KEYRING_MARKER}"
+            else:
+                value = keyring_get(path, var)
+                if value is None:
+                    failed = var
+                    break
+                lines[i] = f"{var}={value}"
+                cleared.append(var)
+            moved.append({"file": os.path.basename(path), "var": var})
+        _write_env_lines(path, lines)       # what moved so far, even if one failed
+        for var in cleared:
+            keyring_clear(path, var)
+        if failed:
+            die(f"the keyring did not {'take' if to == 'keyring' else 'give back'} {failed} "
+                f"({tilde(path)}): a dismissed unlock prompt, or no such item — what is left "
+                f"is where it was, and [secrets] store is unchanged; run it again")
+
+    store = secret_store_setting(config)
+    final = "auto" if store == "auto" and to == "keyring" else to
+    if store != final:
+        ensure_local_config()
+        set_toml_key(CONFIG_FILE, "store", final, table="secrets")
+        note(f'[secrets] store = "{final}" in {tilde(CONFIG_FILE)}')
+    note(f"{len(moved)} value(s) moved to the {to}"
+         + (f", {kept} already there" if kept else ""))
+    return {"to": to, "moved": moved, "already": kept, "store": final}
+
+
 def cmd_secret(args, config):
     """secret add|rm|ls|set <name> — extra credentials for an existing sandbox. New
-    ones are registered with `msb modify`, so no rebuild is needed (a restart is)."""
+    ones are registered with `msb modify`, so no rebuild is needed (a restart is).
+    secret migrate --to keyring|file — where every stored value is kept."""
+    if args.action == "migrate":
+        if args.name or args.var or args.stdin or args.restart:
+            die("secret migrate takes no sandbox: it moves every stored secret (`--to keyring|file`)")
+        if args.json:
+            json_document(lambda: secret_migrate(args, config))
+        secret_migrate(args, config)
+        return
+    if args.to or args.json:
+        die("--to and --json are for `msbctl secret migrate`")
     box = Sandbox(args.name, config)
     if (getattr(args, "stdin", False) or getattr(args, "restart", False)) and args.action != "set":
         die("--stdin and --restart are for `msbctl secret set`")
@@ -5665,8 +5977,11 @@ def cmd_secret(args, config):
                 env=secret_vars, check=False)
         note(f"{args.var} removed: it is no longer substituted (the guest keeps an inert "
              "placeholder until its next restart)")
-        note(f"its value is still in {tilde(os.path.join(SECRETS_DIR, box.name + '.env'))} — "
-             "delete the line if you want it gone")
+        own_path = os.path.join(SECRETS_DIR, box.name + ".env")
+        note(f"its value is still in {stored_where(own_path, args.var)} — " + (
+            f"`secret-tool clear {shlex.join(_keyring_attrs(own_path, args.var))}` and delete "
+            "the line if you want it gone" if args.var in keyring_vars(own_path) else
+            "delete the line if you want it gone"))
         return
     picked = choose_secret(config, box.secret_binds)
     if not picked:
@@ -5801,19 +6116,25 @@ def ensure_local_config():
 
 def set_env_file_value(path, var, value):
     """Set VAR=value in a 0600 env file (None removes it), keeping the other lines
-    and the comments that document it. Never echoed, never in argv."""
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    try:
-        with open(path, encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
-    except FileNotFoundError:
-        lines = ["# Shared by every sandbox. 0600. NEVER commit this file."]
-    lines = [l for l in lines if not re.match(rf"^\s*{re.escape(var)}=", l)]
-    if value:
+    and the comments that document it. Never echoed, never in argv. The value
+    goes where write_store() says; the line is `VAR=@keyring` when that is the
+    keyring, and a value it held there before is cleared once it moves out."""
+    lines = _read_env_lines(path) or [
+        "# Shared by every sandbox. 0600. NEVER commit this file." if path == GLOBAL_ENV else
+        f"# {os.path.basename(path).removesuffix('.env')}'s secrets. 0600. NEVER commit this file."]
+    was_keyring = var in keyring_vars(path)
+    lines = [l for l in lines if not re.match(rf"^\s*{re.escape(var)}\s*=", l)]
+    store = write_store() if value else None
+    if store == "keyring":
+        if not keyring_put(path, var, value):
+            die(f"the keyring did not take {var} — nothing was written")
+        lines.append(f"{var}={KEYRING_MARKER}")
+    elif value:
         lines.append(f"{var}={value}")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+    _write_env_lines(path, lines)
+    if was_keyring and store != "keyring" and not keyring_clear(path, var):
+        warn(f"the old {var} is still in the keyring (it could not be cleared): "
+             f"`secret-tool clear {shlex.join(_keyring_attrs(path, var))}`")
 
 
 def mark_welcomed():
@@ -5995,7 +6316,7 @@ def section_login(config, ctx):
         say("Claude login")
         note("Sandboxes use a long-lived token from `claude setup-token`. It stays on this")
         note("machine: the sandbox sees only a placeholder, and the real value is swapped")
-        note("in on the way out to the two Anthropic hosts. Stored 0600 in secrets/global.env.")
+        note("in on the way out to the two Anthropic hosts. Stored per [secrets] store.")
         note("Keep one per account (say `work` and `personal`); a sandbox uses the default")
         note("unless `msbctl edit <name>` → Claude token picks another.")
         if not tokens:
@@ -6032,7 +6353,7 @@ def section_login(config, ctx):
             if not token.startswith("sk-ant-"):
                 warn("that does not look like a Claude token (they start with sk-ant-) — saved anyway")
             set_env_file_value(GLOBAL_ENV, claude_token_var(name), token)
-            note(f"stored {name!r} in {tilde(GLOBAL_ENV)} (0600); running sandboxes "
+            note(f"stored {name!r} in {stored_where(GLOBAL_ENV, claude_token_var(name))}; running sandboxes "
                  "pick it up on their next start")
             if not tokens and name != default:
                 # The first token is the default, whatever it is called.
@@ -6669,7 +6990,8 @@ def store_claude_token(args):
             f"(`{CLAUDE_TOKEN_MAIN}` is the default one)")
     value = read_secret_input(f"the Claude token {name!r}", args.stdin)
     set_env_file_value(GLOBAL_ENV, claude_token_var(name), value)
-    note(f"Claude token {name!r} stored in {tilde(GLOBAL_ENV)} (0600); read at each sandbox's next start")
+    note(f"Claude token {name!r} stored in {stored_where(GLOBAL_ENV, claude_token_var(name))}; "
+         "read at each sandbox's next start")
     if args.default:
         ensure_local_config()
         set_toml_key(CONFIG_FILE, "claude_token", name, table="defaults")
@@ -7218,6 +7540,9 @@ def section_identity(box, config, ctx):
     else:
         note("no identities defined — add some under [identities] in your config.toml")
     auto = choose_one("start with the others by default", ["yes", "no"], 0 if box.autostart else 1)
+    if auto == "yes" and not box.autostart and keyring_in_use() and not autostart_keyring_ok(True):
+        note("autostart stays off")
+        return
     set_toml_key(path, "autostart", auto == "yes")
 
 
@@ -9307,6 +9632,8 @@ def cmd_add(args, config):
         want_github = capture_token(name)
 
     autostart = confirm("start this one with the others by default?")
+    if autostart and keyring_in_use():
+        autostart = autostart_keyring_ok(True)
 
     # ------------------------------------------------------------- write out
     os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
@@ -9452,6 +9779,8 @@ def cmd_add_repo(args, config):
         claude_token = "" if choice == follow else choice
     autostart = args.autostart or (interactive and not args.yes
                                    and confirm("start this one with the others by default?"))
+    if autostart and keyring_in_use() and not autostart_keyring_ok(interactive and not args.yes):
+        autostart = False
 
     # Kept in memory until the sandbox is registered, so declining leaves
     # nothing behind; used for the fetch, in a header, and nowhere else.
@@ -9552,7 +9881,7 @@ def capture_token(name):
         note(f"Add it later: msbctl edit {name}  ->  GitHub token")
         return False
     set_env_file_value(path, "GH_TOKEN", token)
-    note(f"stored in {tilde(path)} (0600)")
+    note(f"stored in {stored_where(path, 'GH_TOKEN')}")
     return True
 
 
@@ -9653,6 +9982,9 @@ def restricted_problem(argv, kandev=False):
         return None if exc.code == 0 and ("-h" in split or "--help" in split) else \
             "the command line does not parse"
     func = args.func
+    if func is cmd_secret and args.action == "migrate":
+        # Moves every secret on the host between stores; nothing a laptop asks for.
+        return "secret migrate is for the host itself"
     names = list(getattr(args, "names", None) or [])
     if hasattr(args, "name"):
         names.append(args.name)
@@ -9819,6 +10151,33 @@ def _check(name, ok, detail):
     return {"check": name, "ok": ok, "detail": detail}
 
 
+def secret_store_check():
+    """Where secret values are kept and whether that works here. Failed when
+    the keyring holds values and there is no Secret Service to read them from;
+    with autostart, ok only while it is unlocked (a boot skips what needs a
+    locked one); otherwise informational (a locked keyring asks to unlock on
+    first use, and a file on an encrypted disk is the recommendation for a
+    server anyway)."""
+    try:
+        store = secret_store_setting()
+    except SystemExit:
+        return _check("secret store", False, f"{tilde(CONFIG_FILE)} does not parse")
+    status, why = keyring_status()
+    held = sum(len(v) for v in secrets_in_keyring().values())
+    detail = (f'[secrets] store = "{store}"'
+              + (f" (now: {'keyring' if status != 'absent' else 'file'})"
+                 if store == "auto" else "")
+              + f"; keyring {status}: {why}"
+              + (f"; {held} value(s) in the keyring" if held else ""))
+    if held and status == "absent":
+        return _check("secret store", False, detail + " — they cannot be read here")
+    if held and autostart_users():
+        return _check("secret store", status == "unlocked" or None,
+                      detail + " — sandboxes autostart; at boot, those needing it are skipped "
+                      "while it is locked")
+    return _check("secret store", None, detail)
+
+
 def host_checks():
     """The hygiene report. Heuristics, each labelled as such: none of these can
     prove the host is safe, only point at what plainly is not."""
@@ -9845,6 +10204,7 @@ def host_checks():
                           (f"; not 0600: {', '.join(loose)}" if loose else ", every file 0600")))
     else:
         out.append(_check("secrets", True, "no secrets stored yet"))
+    out.append(secret_store_check())
 
     def read(path):
         try:
@@ -9943,6 +10303,9 @@ AUTOSTART_UNIT = "msb-autostart.service"
 def host_autostart(args):
     if args.arg != "install":
         die("host autostart: the only action is `install`")
+    if keyring_in_use() and not autostart_keyring_ok(sys.stdin.isatty() and sys.stdout.isatty(),
+                                                     "install the boot unit anyway?"):
+        die("cancelled — the boot unit was not installed")
     me = shutil.which("msbctl") or os.path.realpath(__file__)
     os.makedirs(SYSTEMD_USER_DIR, exist_ok=True)
     path = os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)
@@ -13070,6 +13433,8 @@ def preflight(args):
     """
     if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update):
         return
+    if args.func is cmd_secret and args.action == "migrate":
+        return                          # moves stored values; runs no sandbox
     # `host check` reports a missing msb or /dev/kvm itself; the other host
     # verbs need neither (serve re-runs msbctl, which checks then). `kandev`
     # answers in JSON whatever happens, and `kandev health` reports both.
@@ -13226,14 +13591,20 @@ def build_parser():
     p = sub.add_parser("config", help="show the merged configuration and where each value is from")
     p.set_defaults(func=cmd_config)
 
-    p = sub.add_parser("secret", help="add, remove or list extra secrets for a sandbox")
-    p.add_argument("action", choices=["add", "rm", "ls", "set"])
-    p.add_argument("name", help=DOT_HELP)
+    p = sub.add_parser("secret", help="add, remove or list extra secrets for a sandbox, "
+                                      "or move every stored value to the keyring or back")
+    p.add_argument("action", choices=["add", "rm", "ls", "set", "migrate"])
+    # Required for every action but migrate, which takes none: main() says so.
+    p.add_argument("name", nargs="?", help=DOT_HELP)
     p.add_argument("var", nargs="?", help="for rm and set: the variable name")
     p.add_argument("--stdin", action="store_true",
                    help="for set: read the value from stdin (one trailing newline dropped)")
     p.add_argument("--restart", action="store_true",
                    help="for set: restart a running sandbox so the value is used now")
+    p.add_argument("--to", choices=["keyring", "file"],
+                   help="for migrate: where every stored value goes ([secrets] store follows)")
+    p.add_argument("--json", action="store_true",
+                   help="for migrate: print what moved as one JSON document (never a value)")
     p.set_defaults(func=cmd_secret)
 
     p = sub.add_parser("policy", help="show or approve the project policy a sandbox is pinned to")
@@ -13433,11 +13804,23 @@ def main():
             args.names = [n for n in registered()
                           if read_toml(registry_path_for(n)).get("autostart") is True
                           and state_of(n, table) != "running"]
+            # At boot nobody can answer an unlock prompt (AUTOSTART_KEYRING_CAVEAT);
+            # on a terminal (the picker) you can, so there it is asked as usual.
+            if not sys.stdin.isatty() and keyring_status()[0] != "unlocked":
+                blocked = [n for n in args.names if autostart_needs_keyring(n)]
+                if blocked:
+                    warn(f"skipped, their secrets are in the keyring and {keyring_status()[1]}: "
+                         f"{', '.join(blocked)} — unlock it and `msbctl start {' '.join(blocked)}`")
+                    args.names = [n for n in args.names if n not in blocked]
             if not args.names:
                 note("nothing in the autostart set needs starting")
                 return
         elif args.func not in (cmd_agent_filter, cmd_remote):
-            if hasattr(args, "name"):
+            if args.func is cmd_secret and args.name is None and args.action != "migrate":
+                # Its name is optional for migrate only; `secret rm VAR` must
+                # never be read as the sandbox VAR, so it is never guessed here.
+                die(f"secret {args.action}: name the sandbox (`.` for this folder's)")
+            if hasattr(args, "name") and not (args.func is cmd_secret and args.action == "migrate"):
                 args.name = resolve_here(args.name)
             if hasattr(args, "names"):
                 args.names = [n if split_remote(n) else resolve_here(n) for n in args.names or [None]]

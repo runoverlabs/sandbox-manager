@@ -40,9 +40,16 @@ def _no_network(*_args, **_kwargs):
 
 
 class MsbctlTest(TestCase):
-    """setUp gives each test its own HOME and its own msbctl module (self.m)."""
+    """setUp gives each test its own HOME and its own msbctl module (self.m).
+
+    MSB_TEST_SECRET_STORE=keyring runs every test against the fake keyring
+    (tests/fake/secret-tool), unlocked, with `[secrets] store` as "keyring":
+    scripts/check.sh runs the suite once per backend, since nothing that reads
+    or writes a secret may depend on which one holds it. A class that tests
+    the stores themselves sets `follows_store_env = False`."""
 
     env_keys = ()          # variables the fake msb records, per test class
+    follows_store_env = True
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="msbctl-test-")
@@ -63,13 +70,31 @@ class MsbctlTest(TestCase):
             "FAKE_MSB_STATE": os.path.join(self.tmp, "msb.json"),
             "FAKE_MSB_ENV_KEYS": ",".join(self.env_keys),
             "FAKE_TAILSCALE_LOG": os.path.join(self.tmp, "tailscale.log"),
+            "FAKE_KEYRING_LOG": os.path.join(self.tmp, "keyring.log"),
+            "FAKE_KEYRING_STATE": os.path.join(self.tmp, "keyring.json"),
             "PATH": FAKE_BIN + os.pathsep + os.environ.get("PATH", ""),
         })
         for var in ("SSH_AUTH_SOCK", "GH_TOKEN", "MSB_RESTRICTED", "SSH_ORIGINAL_COMMAND",
                     "CLAUDE_CODE_OAUTH_TOKEN", "FAKE_MSB_EXEC_OUT", "FAKE_MSB_READ_STDIN",
-                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH", "FAKE_TAILSCALE_NO_CERTS"):
+                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH", "FAKE_TAILSCALE_NO_CERTS",
+                    # No keyring unless a test sets one up: the fake busctl
+                    # answers "absent" and the fake secret-tool fails loudly.
+                    "FAKE_KEYRING", "FAKE_KEYRING_FAIL", "FAKE_KEYRING_PROMPT",
+                    "DBUS_SESSION_BUS_ADDRESS"):
             os.environ.pop(var, None)
         self.m = self.load_msbctl()
+        if self.follows_store_env and os.environ.get("MSB_TEST_SECRET_STORE") == "keyring":
+            self.use_keyring("unlocked")
+            self.m.secret_store_setting = lambda config=None: "keyring"
+
+    def use_keyring(self, mode):
+        """A fake Secret Service on a fake session bus: "unlocked", "locked",
+        or None for none at all. Asked afresh by the next msbctl call."""
+        if mode:
+            os.environ.update({"FAKE_KEYRING": mode, "DBUS_SESSION_BUS_ADDRESS": "unix:path=/nonexistent"})
+        else:
+            os.environ.pop("FAKE_KEYRING", None)
+        self.m._KEYRING_STATUS.clear()
 
     def fresh(self):
         """A new HOME and a new msbctl, for each case of a subTest loop. The
@@ -196,6 +221,26 @@ class MsbctlTest(TestCase):
                 if value in arg:
                     self.fail(f"the value under test reached argv: call {n} "
                               f"(msb {call['argv'][0]}), argument {i}")
+        for n, call in enumerate(self.keyring_calls()):
+            if any(value in arg for arg in call.get("argv", [])):
+                self.fail(f"the value under test reached secret-tool's argv: call {n}")
+
+    def keyring_calls(self):
+        """Every recorded secret-tool call: {"argv"}, then {"PROMPTED"} for one
+        made against a locked keyring, or {"NO_SERVICE"} for one made with no
+        Secret Service at all — which must never happen."""
+        try:
+            with open(os.environ["FAKE_KEYRING_LOG"], encoding="utf-8") as fh:
+                return [json.loads(line) for line in fh if line.strip()]
+        except FileNotFoundError:
+            return []
+
+    def keyring_items(self):
+        try:
+            with open(os.environ["FAKE_KEYRING_STATE"], encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return []
 
     def assert_not_in_output(self, value, *texts):
         """Like assert_not_in_argv, for captured output."""
