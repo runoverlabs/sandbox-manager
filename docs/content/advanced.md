@@ -197,6 +197,10 @@ $ msbctl port . 3000:5173             # host 3000 to a dev server on 5173
 $ msbctl port .                       # list them; --rm 8080 removes one
 ```
 
+`msbctl port` (with no arguments) and `msbctl show` make each tcp port's host
+side a clickable hyperlink to `http://127.0.0.1:<host>/` on a terminal, and
+`show --json` adds a `port_urls` map of each port to its URL.
+
 Inside, the server has to listen on `0.0.0.0` — `python3 -m http.server 8080
 --bind 0.0.0.0`, `vite --host 0.0.0.0` — because msb connects to the guest's
 own address and a server bound to `localhost` is never reached. On the host the

@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- Published tcp ports are clickable in `msbctl port` and `show` (an OSC 8 hyperlink to `http://127.0.0.1:<host>/` on a terminal), and `show --json` adds a `port_urls` map of each port to its URL.
+
 ## [0.8.0] - 2026-10-24
 
 ### Added

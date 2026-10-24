@@ -92,10 +92,12 @@ msbctl show [name] [--json]
 ```
 
 Everything about one sandbox: resources, disks, extra folders, installed
-versions, environment, every egress rule in the order it's emitted, and the
-identity, keys and secrets bound to it. `--json` prints the essentials as one
-JSON document; for each secret it says whether a value is **stored**, never
-what it is. For a Kandev sandbox it's its record, with agentctl checked live.
+versions, environment, every egress rule in the order it's emitted, published
+ports with their clickable URL, and the identity, keys and secrets bound to it.
+`--json` prints the essentials as one JSON document, with a `port_urls` map of
+each port to its URL; for each secret it says whether a value is **stored**,
+never what it is. For a Kandev sandbox it's its record, with agentctl checked
+live.
 
 ### `msbctl config`
 
@@ -315,7 +317,8 @@ msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--reb
 
 Publish a host port to a server inside the sandbox, so `http://localhost:PORT`
 on this machine reaches it. A bare `PORT` is the same on both sides; with no
-ports given it lists them, and `--rm` stops publishing one. Needs a rebuild. See
+ports given it lists them, each tcp port's host side a clickable hyperlink to
+its URL (on a terminal), and `--rm` stops publishing one. Needs a rebuild. See
 [Reaching a server in the sandbox](advanced.md#reaching-a-server-in-the-sandbox).
 
 ### `msbctl secret`
