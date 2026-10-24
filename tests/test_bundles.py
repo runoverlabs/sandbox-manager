@@ -351,6 +351,7 @@ class PiPackageTest(BundleBase):
                             ("./pkg", "bare npm name"),
                             ("pkg@^1.2.0", "exact version"),
                             ("pkg@latest", "exact version"),
+                            ("pkg@1.2.3+build", "exact version"),
                             ("Pkg", "not an npm package name"),
                             ("a/b/c", "not an npm package name"),
                             ("", "npm package name")):
@@ -429,6 +430,47 @@ class PiPackageTest(BundleBase):
         box = self.m.Sandbox("web", self.m.load_config())
         self.assertIn("context management", self.m.sandbox_profile_section(box, "pi"))
         self.assertNotIn("context management", self.m.sandbox_profile_section(box, "claude"))
+
+    def test_a_broken_value_is_reported_not_crashed_on(self):
+        self.bundle("bad", toml='description = "x"\npi_package = 5\n', pi=None, claude=None)
+        self.assertEqual(self.m.bundle_adapters(os.path.join(self.m.TOOLS_DIR, "bad"),
+                                                {"pi_package": 5}), {})
+        self.m.set_toml_key(self.entry_path("web"), "tools", ["bad"])
+        code, out, err = self.run_main("show", "web", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertIn("pi_package must be", json.loads(out)["tools"][0]["problem"])
+
+    def test_two_bundles_one_package_refused(self):
+        self.bundle("bili2", toml=BILI.replace("0.1.83", "0.1.82"), pi=None, claude=None)
+        self.m.set_toml_key(self.entry_path("web"), "tools", ["bili", "bili2"])
+        code, _, err = self.run_main("start", "web")
+        self.assertNotEqual(code, 0)
+        self.assertIn("both give pi the package billion-context-pi", err)
+
+    def test_operators_own_entry_is_never_adopted(self):
+        mine = {"source": "npm:billion-context-pi", "extensions": ["-x.ts"]}
+        os.makedirs(self.agent(), exist_ok=True)
+        self.m.write_json(self.agent("settings.json"), {"packages": [mine]})
+        self.installed(version="0.1.70")
+        out = self.start()
+        self.assertEqual(self.settings()["packages"], [mine])
+        self.assertIn("not from a tool bundle", out)
+        self.assertEqual(self.package_execs("pi install"), [])
+        self.assertEqual(self.m.read_json(os.path.join(
+            self.m.TOOLS_STATE_DIR, "web.json")).get("pi_packages", []), [])
+        # Detaching the bundle then leaves the operator's package alone.
+        self.m.set_toml_key(self.entry_path("web"), "tools", [])
+        self.start()
+        self.assertEqual(self.settings()["packages"], [mine])
+        self.assertEqual(self.package_execs("npm uninstall"), [])
+
+    def test_shell_into_a_running_one_does_not_retry(self):
+        self.start()        # creates it; the fake guest installs nothing
+        self.assertEqual(len(self.package_execs("pi install")), 1)
+        self.m.ensure_running(self.m.Sandbox("web", self.m.load_config()))
+        self.assertEqual(len(self.package_execs("pi install")), 1)
+        self.start()        # `msbctl start` is the explicit act: it does retry
+        self.assertEqual(len(self.package_execs("pi install")), 2)
 
     def test_update_moves_packages_too(self):
         self.assertIn("PI_OFFLINE=0 pi update --extensions", self.m.UPDATERS["pi"])

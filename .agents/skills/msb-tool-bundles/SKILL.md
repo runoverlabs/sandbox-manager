@@ -90,7 +90,12 @@ pi install npm:<spec>` for one missing or off its pin, `npm uninstall
 exits 1 once the settings entry is gone). Installed-or-not is read from the
 mount (`pi_package_installed()`: `agent/npm/node_modules/<name>/package.json`,
 pi 1.4's `getNpmInstallRoot()`), never from an exit status; a miss warns and the
-start carries on. `PI_OFFLINE=1` stays in `[agent_env.pi]` — it is exactly what
+start carries on. The guest step runs only when `ensure_running()` actually
+starts the sandbox or is `msbctl start` (`ensure_pi(box, packages)`), so a
+failing install never delays a `shell`/`exec` into a running one; the marker
+is kept either way. An entry the operator already has for the same npm name is
+never adopted (it would be uninstalled on a detach): the bundle's is left out
+with a warning. Two bundles naming one package die in `Sandbox.bundles`. `PI_OFFLINE=1` stays in `[agent_env.pi]` — it is exactly what
 stops pi's own `installMissing()` and `updateConfiguredSources()` — so the
 install and `UPDATERS["pi"]`'s `pi update --extensions` lift it for one command.
 A `pi_package` counts as a pi adapter (`bundle_adapters(folder, spec)`), so the

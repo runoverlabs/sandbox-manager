@@ -123,7 +123,13 @@ egress rule is added for it: the pi feature already allows the npm registry.
 pi installs it under `~/.pi/agent/npm/`, which is on the same mount as the
 rest of pi's config, so it survives a rebuild and an ordinary start runs
 nothing. If the install fails, the start warns and carries on without it, and
-the next start tries again.
+the next start tries again (`msbctl start`, or a `shell` or `exec` that has to
+start the sandbox — one into a running sandbox never waits on npm).
+
+If pi's `settings.json` already lists the same package because you installed it
+yourself with `pi install`, yours wins: the start warns, leaves your entry and
+its version alone, and the bundle's `pi_package` is left out until you
+`pi remove` it. Two bundles naming the same package are refused.
 
 `msbctl update <name> -c pi` updates pi and then runs `pi update --extensions`,
 which moves an unpinned package to its latest version and leaves a pinned one
