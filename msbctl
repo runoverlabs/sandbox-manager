@@ -10638,7 +10638,7 @@ def host_checks():
     """The hygiene report. Heuristics, each labelled as such: none of these can
     prove the host is safe, only point at what plainly is not."""
     out = []
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+    user = current_user()
     try:
         import grp
         groups = {grp.getgrgid(g).gr_name for g in os.getgroups()}
@@ -10700,16 +10700,17 @@ def host_checks():
                                                  if open_keys else "each is host serve or an sk- key")))
     out.append(_check("restricted", None, "yes: this key runs under host serve"
                       if restricted() else "no: this session is unrestricted"))
-    linger = os.path.exists(f"/var/lib/systemd/linger/{user}")
+    linger = lingering(user)
     unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
     out.append(_check("autostart", linger and unit,
                       f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
                       f"{'enabled' if unit else 'not enabled'} (`msbctl host autostart install`)"))
     msb = shutil.which("msb")
-    version = run(["msb", "--version"], capture=True, check=False).stdout.strip() if msb else ""
-    out.append(_check("msb", bool(msb) and os.path.exists("/dev/kvm"),
-                      f"{version or 'not found'}{' at ' + msb if msb else ''}, "
-                      f"/dev/kvm {'present' if os.path.exists('/dev/kvm') else 'MISSING'}"))
+    version = local_msb_version() if msb else ""
+    kvm = kvm_status()
+    out.append(_check("msb", bool(msb) and kvm != "missing",
+                      f"{'msb ' + version if version else 'not found'}{' at ' + msb if msb else ''}, "
+                      f"/dev/kvm {'MISSING' if kvm == 'missing' else 'present'}"))
     out.append(_check("msbctl", True, version_string()))
     return out
 
@@ -10786,10 +10787,7 @@ WantedBy=default.target
     if shutil.which("systemctl"):
         run(["systemctl", "--user", "daemon-reload"], check=False)
         run(["systemctl", "--user", "enable", AUTOSTART_UNIT], check=False)
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
-    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
-        note("a user unit runs with nobody logged in only with lingering on; once, as root:")
-        note(f"  loginctl enable-linger {user}")
+    note_linger("a user unit")
 
 
 def cmd_host(args, config):
@@ -11923,6 +11921,19 @@ PROC_MEMINFO = "/proc/meminfo"
 PROC_UPTIME = "/proc/uptime"
 
 
+def msb_disk_usage():
+    """shutil.disk_usage of the filesystem msb keeps its sandboxes and their
+    owned disks on; before msb has made its directory, the one it will be made
+    in. None when it cannot be read."""
+    where = MSB_HOME
+    while not os.path.exists(where) and os.path.dirname(where) != where:
+        where = os.path.dirname(where)
+    try:
+        return shutil.disk_usage(where)
+    except OSError:
+        return None
+
+
 def kandev_host_facts():
     """health.host: this machine as the operator's host list shows it. Not the
     [kandev] limits (placement reads capacity), and nothing secret. Each field
@@ -11953,13 +11964,8 @@ def kandev_host_facts():
                 facts[field] = mem[key] // 1024             # kB
     with contextlib.suppress(OSError):
         facts["load_1m"] = round(os.getloadavg()[0], 2)
-    # The filesystem msb keeps its sandboxes and their owned disks on; before
-    # msb has made its directory, the one it will be made in.
-    where = MSB_HOME
-    while not os.path.exists(where) and os.path.dirname(where) != where:
-        where = os.path.dirname(where)
-    with contextlib.suppress(OSError):
-        usage = shutil.disk_usage(where)
+    usage = msb_disk_usage()
+    if usage:
         facts["disk_total_gib"] = round(usage.total / (1024 * MIB), 2)
         facts["disk_free_gib"] = round(usage.free / (1024 * MIB), 2)
     with contextlib.suppress(OSError, ValueError, IndexError):
@@ -11986,7 +11992,7 @@ def kandev_health(args, config, settings):
         "protocol": KANDEV_PROTOCOL, "features": list(KANDEV_FEATURES),
         "msbctl_version": version_string(),
         "msb_version": local_msb_version() or "",
-        "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK), "enabled": settings["enabled"],
+        "kvm": kvm_status() == "rw", "enabled": settings["enabled"],
         "platform": host_platform(), "base_url": settings["base_url"],
         "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
                      "max_cpus": settings["max_cpus"], "cpus": cpus,
@@ -12875,10 +12881,7 @@ WantedBy=default.target
         # restart, not just --now: an upgrade must run the new code.
         run(["systemctl", "--user", "enable", f"{KANDEV_PROXY_UNIT}.service"], check=False)
         run(["systemctl", "--user", "restart", f"{KANDEV_PROXY_UNIT}.service"], check=False)
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
-    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
-        note("a user timer runs with nobody logged in only with lingering on; once, as root:")
-        note(f"  loginctl enable-linger {user}")
+    note_linger("a user timer")
 
 
 # ----------------------------------------------------------- remotes (laptop)
@@ -13176,6 +13179,10 @@ sed 's/^    get_latest_version$/    VERSION="v'"$2"'"/' "$t/install.sh" > "$t/pi
 sh "$t/pinned.sh"
 """
 MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
+# The msb releases msbctl's behaviour has been checked against (the comments
+# that say "verified on 0.7.6" are about these). Another one may well work, but
+# its flags, its log lines and `msb ls` output are unchecked: `doctor` warns.
+MSB_TESTED = ("0.7.6", "0.7.7")
 
 
 def local_msb_version():
@@ -14336,9 +14343,38 @@ def local_problem():
     """Why this machine cannot run sandboxes, or None."""
     if not shutil.which("msb"):
         return "msb is not on PATH"
-    if not os.path.exists("/dev/kvm"):
+    if kvm_status() == "missing":
         return "no /dev/kvm — msbctl runs on the host, not inside a container"
     return None
+
+
+# A name a test can point elsewhere.
+KVM_DEVICE = "/dev/kvm"
+
+
+def kvm_status():
+    """"rw" when this user can open /dev/kvm, "denied" when it exists and they
+    cannot (usually: not in the kvm group), "missing" without one (no KVM, a
+    container, or a VM without nested virtualization). The same three words
+    REMOTE_PROBE prints for a remote host."""
+    if os.access(KVM_DEVICE, os.R_OK | os.W_OK):
+        return "rw"
+    return "denied" if os.path.exists(KVM_DEVICE) else "missing"
+
+
+def current_user():
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+
+
+def lingering(user=None):
+    """Whether systemd keeps this user's units running with nobody logged in."""
+    return os.path.exists(f"/var/lib/systemd/linger/{user or current_user()}")
+
+
+def note_linger(what):
+    if not lingering():
+        note(f"{what} runs with nobody logged in only with lingering on; once, as root:")
+        note(f"  loginctl enable-linger {current_user()}")
 
 
 def verb_args(verb, **values):
