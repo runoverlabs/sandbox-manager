@@ -148,7 +148,7 @@ class DoctorTest(MsbctlTest):
         real = subprocess.run
         for exc in (subprocess.TimeoutExpired(["msb"], 15), PermissionError(13, "Permission denied")):
             with self.subTest(type(exc).__name__):
-                def fake(argv, *a, **kw):
+                def fake(argv, *a, exc=exc, **kw):
                     if argv and argv[0] == "msb" and argv[1:] in (["--help"], ["--version"]):
                         raise exc
                     return real(argv, *a, **kw)
