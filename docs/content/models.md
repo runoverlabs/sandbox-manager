@@ -5,6 +5,9 @@ order: 35
 description: Run the pi coding agent against your own model server or any provider, with the API key kept on the host.
 ---
 
+Read this to run a model other than Claude: your own server, or any provider
+pi knows.
+
 ## pi, the agent for any model
 
 Claude Code talks to Anthropic. For anything else (a model you serve

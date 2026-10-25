@@ -63,7 +63,7 @@ REPO_URL = f"https://github.com/{REPO}"
 SITE_URL = "https://sandbox-manager.runoverlabs.dev/"
 TAGLINE = ("Run coding agents in per-project microVMs with deny-by-default egress, "
            "and credentials and SSH keys that never enter the VM.")
-SECTIONS = ["Start here", "Guides", "Reference", "Project"]
+SECTIONS = ["Start here", "Guides", "Concepts", "Reference", "Project"]
 GENERATED = ("llms.txt", "llms-full.txt", "sitemap.xml")   # written beside the pages
 
 

@@ -31,7 +31,7 @@ denied for every sandbox, and a project can't override that (see
 [first-match-wins](egress.md#rules-are-first-match-wins)).
 
 If you can't tell what's being refused, use
-[observe mode](advanced.md#observe-mode-building-an-allowlist).
+[observe mode](egress.md#finding-out-what-a-sandbox-needs).
 
 ## The bootstrap reports "REQUIRED, FAILED"
 
@@ -55,8 +55,9 @@ A fresh session works, then every request fails, permanently. This is the
 (`$MSB_GH_TOKEN`) at some point, and now carries it in every request body,
 which msb kills.
 
-Sandboxes created by current msb-manager let the placeholder travel to the
-agent's own endpoints, so this shouldn't happen. If it does:
+msbctl binds the placeholder so that it may travel to the agent's own
+endpoints, which prevents this. A sandbox that still hits it has bindings from
+an older msb-manager:
 
 ```console
 $ msbctl observe .          # lists secret-policy blocks, even in enforce mode
@@ -84,7 +85,7 @@ Both are questions for a person, and an unattended run stops at the first one.
 Worse, started by `msbctl exec` with no terminal, pi answers the trust question
 by itself — as *no* — so the project's own `.agents/skills/` load nothing. Update
 the manager and start the sandbox once (`msbctl stop` then `msbctl start`): every
-start now trusts the project folder and `/tmp` in `~/.pi/agent/trust.json`, and
+start trusts the project folder and `/tmp` in `~/.pi/agent/trust.json`, and
 sets `defaultProjectTrust` and a changelog marker in `~/.pi/agent/settings.json`.
 `/changelog` still shows the notes when asked. See
 [pi, the agent for any model](models.md#pi-the-agent-for-any-model).

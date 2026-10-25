@@ -9,6 +9,8 @@ This page takes you from a fresh [install](install.md) to an agent running in
 your first sandbox. It takes about ten minutes, most of which is the first
 bootstrap.
 
+A word you don't know is probably in the [Glossary](glossary.md).
+
 ## 1. First run: the machine-level setup
 
 ```console

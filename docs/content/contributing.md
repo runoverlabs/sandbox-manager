@@ -98,8 +98,8 @@ $ python3 docs/build.py --check        # build into docs/_site and check links
 $ xdg-open docs/_site/index.html       # works straight off the disk
 ```
 
-Each page starts with `title`, `section` (Start here, Guides, Reference or
-Project), `order` and a one-sentence `description`, which `--check` requires:
+Each page starts with `title`, `section` (Start here, Guides, Concepts,
+Reference or Project), `order` and a one-sentence `description`, which `--check` requires:
 it becomes the page's meta description, its link preview and its line in
 `llms.txt`. The converter supports a deliberate subset of Markdown:
 headings, paragraphs, lists, fenced code (`console` blocks get prompts, and
@@ -107,6 +107,16 @@ their copy button copies only the commands), tables, `> **Note:**` /
 `**Tip:**` / `**Warning:**` callouts, and inline code, emphasis, links and
 images. A new `msbctl` subcommand needs a `### msbctl <name>` section on the
 [Commands](commands.md) page, or `--check` fails.
+
+Each section is one kind of page, and a page stays one kind. **Start here** is
+a single path to follow in order. A **guide** does one task and is named for
+it. **Concepts** explain why, and what the model doesn't cover. **Reference**
+is complete and terse: every command and key, with tables to scan. Write
+plainly and say why: a failure the docs predict saves a debugging session.
+State behaviour as it is, without "now" or "no longer"; that belongs in the
+changelog. Define a word before relying on it, or add it to the
+[Glossary](glossary.md). The full guide is in
+`.agents/skills/msb-docs/SKILL.md`.
 
 The same build writes what search engines and agents look for: canonical
 links, Open Graph and JSON-LD tags, `sitemap.xml`, `llms.txt`, `llms-full.txt`

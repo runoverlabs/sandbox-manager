@@ -31,6 +31,21 @@ writes are the long-form documentation of every key; this page is the map.
 
 `MSB_CONFIG_DIR` and `MSB_STATE_DIR` move the two roots.
 
+## Value types
+
+The tables below name a type for each key. These are what the types mean, and
+what msbctl checks before it hands a value to msb.
+
+| Type | Written as | Checked |
+| --- | --- | --- |
+| size | `"8G"`: a whole number and `M`, `G` or `T` | disk sizes when the disk is made (`is not a size like 5G or 512M`); `memory` is passed to msb as it is |
+| rule | `"allow@github.com:tcp:443"`, see [the rule grammar](egress.md#the-rule-grammar) | its shape, before create, naming the file it's in; msb checks the target |
+| group | a name from `[rules]`, shipped or yours | an unknown name stops the create with `unknown rule group` |
+| guest path | an absolute path inside the sandbox | no `:`; not inside `/bin`, `/boot`, `/dev`, `/etc`, `/lib*`, `/proc`, `/run`, `/sbin`, `/sys` or `/usr`; not one of `/`, `/home`, `/media`, `/mnt`, `/opt`, `/root`, `/srv`, `/tmp` or `/var`; not over a folder msbctl mounts itself |
+| host path | absolute, or starting with `~` | `~` is expanded to your home |
+| image reference | `registry/name:tag@sha256:…` | a path is refused: msb would boot a host folder |
+| list | a TOML array, `["a", "b"]` | |
+
 ## config.toml
 
 Keep it short: a value copied here from `defaults.toml` stops following the
@@ -39,24 +54,24 @@ including a whole egress group, replaces the shipped value.
 
 ### `[defaults]`
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `workspaces` | `"~/workspaces"` | where a bare name given to `msbctl add` resolves. `""` resolves against the current directory |
-| `guest_path` | `"/work"` | where a new sandbox mounts its project: `"/work"`, `"host"` for the host's own path, or an absolute path |
-| `image` | a pinned devcontainers Ubuntu digest | the image a new sandbox starts from |
-| `cpus` | `4` | |
-| `memory` | `"8G"` | a ceiling, not a reservation |
-| `root_disk` | `"16G"` | the writable root disk |
-| `rule_groups` | `["github", "claude"]` | groups a new sandbox gets on top of `base` |
-| `egress_mode` | `"enforce"` | `"observe"` stops blocking (per sandbox is better: `msbctl observe`) |
-| `private_dns_groups` | `[]` | groups whose names resolve to private addresses; projects using one get `allow_private_dns` |
-| `claude_auth` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead. A fallback only |
-| `claude_token` | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
-| `llm` | `[]` | the [model endpoints](models.md) a sandbox with pi gets unless its registry entry sets `llm`; the first is pi's default |
-| `tools` | `[]` | the [agent tools](agent-tools.md) a new sandbox gets unless its registry entry sets `tools`; each is a folder under `~/.config/msb/tools` |
-| `identity` | `""` | the `[identities]` entry new sandboxes use |
-| `git_push` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` (https, the GitHub token) or `"ssh"` (the agent). See [git push](credentials.md#git-push-gh-or-ssh) |
-| `workspace_disk` | `"20G"` | the clone's disk volume for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder); fixed when created |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `workspaces` | host path | `"~/workspaces"` | where a bare name given to `msbctl add` resolves. `""` resolves against the current directory |
+| `guest_path` | `"/work"`, `"host"` or a guest path | `"/work"` | where a new sandbox mounts its project. `"host"` means the host's own path |
+| `image` | image reference | a pinned devcontainers Ubuntu digest | the image a new sandbox starts from |
+| `cpus` | integer | `4` | |
+| `memory` | size | `"8G"` | a ceiling, not a reservation |
+| `root_disk` | size | `"16G"` | the writable root disk |
+| `rule_groups` | list of groups | `["github", "claude"]` | groups a new sandbox gets on top of `base` |
+| `egress_mode` | `"enforce"` or `"observe"` | `"enforce"` | `"observe"` stops blocking for every sandbox; per sandbox is better (`msbctl observe`) |
+| `private_dns_groups` | list of groups | `[]` | groups whose names resolve to private addresses; projects using one get `allow_private_dns` |
+| `claude_auth` | `"secret"` or `"mount"` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead of a placeholder token. A fallback only |
+| `claude_token` | token name | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
+| `llm` | list of endpoint names | `[]` | the [model endpoints](models.md) a sandbox with pi gets unless its registry entry sets `llm`; the first is pi's default |
+| `tools` | list of tool names | `[]` | the [agent tools](agent-tools.md) a new sandbox gets unless its registry entry sets `tools`; each is a folder under `~/.config/msb/tools` |
+| `identity` | identity name | `""` | the `[identities]` entry new sandboxes use |
+| `git_push` | `"gh"` or `"ssh"` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` is https with the GitHub token, `"ssh"` the filtered agent. See [git push](credentials.md#git-push-gh-or-ssh) |
+| `workspace_disk` | size | `"20G"` | the clone's disk volume for a sandbox [without a folder](repo-sandboxes.md); fixed when created |
 
 ### `[identities.<name>]`
 
@@ -116,16 +131,16 @@ sandbox's own `[versions]` overrides these.
 
 ### `[version_check]`
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `ttl_hours` | `6` | how long upstream version checks are cached |
-| `use_global_token` | `true` | use `GH_TOKEN` from `secrets/global.env` for them, if present |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `ttl_hours` | integer | `6` | how long upstream version checks are cached |
+| `use_global_token` | boolean | `true` | use `GH_TOKEN` from `secrets/global.env` for them, if present |
 
 ### `[secrets]`
 
-| Key | Default | Meaning |
-| --- | --- | --- |
-| `store` | `"file"` | where new secret values go: `"file"`, `"keyring"` or `"auto"`. See [the keyring](credentials.md#keeping-the-values-in-the-keyring); `msbctl secret migrate` moves the existing ones and sets this |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `store` | `"file"`, `"keyring"` or `"auto"` | `"file"` | where new secret values go. See [the keyring](credentials.md#keeping-the-values-in-the-keyring); `msbctl secret migrate` moves the existing ones and sets this |
 
 ### `[secret_presets.<name>]`
 
@@ -145,29 +160,30 @@ usage = "mytool login --token \"$MYTOOL_TOKEN\""
 The project's policy. It never contains a host path, a token or a sandbox
 name, so it's safe to commit.
 
-| Key | Meaning |
-| --- | --- |
-| `rule_groups` | egress groups, on top of `base` |
-| `extra_rules` | one-off rules, emitted last |
-| `allow_private_dns` | accept DNS answers that point at private addresses |
-| `secret_binds` | extra secrets, as `ENV[:OPTIONS]@HOST[,HOST]`; values live in `secrets/<name>.env` |
-| `cpus`, `memory`, `root_disk` | resources; omit to use the defaults |
-| `containers_disk` | a disk for `/var/lib/containers`, kept across rebuilds |
-| `identity` | an `[identities]` name this project commits as |
-| `[env]` | extra environment variables, merged over the machine-wide set |
-| `[caches]` | `key = "size"` per package manager: `npm`, `bun`, `python`, `rust`, `go` |
-| `[secrets] github` | bind this project's `GH_TOKEN` (default: true when it has a GitHub repo) |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `rule_groups` | list of groups | `[defaults] rule_groups` | egress groups, on top of `base` |
+| `extra_rules` | list of rules | `[]` | one-off rules, emitted last |
+| `allow_private_dns` | boolean | `false` | accept DNS answers that point at private addresses |
+| `secret_binds` | list of `"ENV[:OPTIONS]@HOST[,HOST]"` | `[]` | extra secrets; the values live in `secrets/<name>.env` or the keyring |
+| `cpus` | integer | `[defaults] cpus` | |
+| `memory`, `root_disk` | size | `[defaults]` | |
+| `containers_disk` | size | none | a disk for `/var/lib/containers`, kept across rebuilds |
+| `identity` | identity name | `[defaults] identity` | the `[identities]` entry this project commits as |
+| `[env]` | table of strings | | extra environment variables, merged over the machine-wide set |
+| `[caches]` | table of sizes | | one disk per package manager: `npm`, `bun`, `python`, `rust`, `go` |
+| `[secrets] github` | boolean | `true` with a GitHub repo | bind this project's `GH_TOKEN` |
 
 ### `[bootstrap]`
 
-| Key | Meaning |
-| --- | --- |
-| `packages` | extra apt packages |
-| `claude` | install Claude Code and its ACP adapter, `claude-agent-acp` (default true) |
-| `pi` | install [pi](models.md), the agent for any model (default false). Which endpoints it gets is machine-local |
-| `bun`, `gitleaks` | install these (default false) |
-| `containers_storage` | `"fuse-overlayfs"` for podman without a container disk |
-| `script` | a project script run last, inside the guest, from the project folder |
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `packages` | list | `[]` | extra apt packages |
+| `claude` | boolean | `true` | install Claude Code and its ACP adapter, `claude-agent-acp` |
+| `pi` | boolean | `false` | install [pi](models.md), the agent for any model. Which endpoints it gets is machine-local |
+| `bun`, `gitleaks` | boolean | `false` | install these |
+| `containers_storage` | `"fuse-overlayfs"` | none | for [podman](toolchains.md#containers-inside-a-sandbox-podman) without a container disk |
+| `script` | path inside the project | none | a project script run last, inside the guest, from the project folder |
 
 ## .msb/dev.yaml
 
@@ -214,24 +230,24 @@ yours and are never re-approved.
 `~/.config/msb/sandboxes/<name>.toml` is machine-local and never committed.
 Any key it sets overrides the project's file.
 
-| Key | Meaning |
-| --- | --- |
-| `name`, `project` | the sandbox's name and the absolute path of its project folder |
-| `source`, `repo`, `ref` | `source = "repo"` for a sandbox [without a folder](advanced.md#sandboxes-without-a-folder), which has `repo` and an optional `ref` instead of `project` |
-| `guest_path` | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
-| `repo` | `owner/name` on GitHub, for the token binding and the picker |
-| `identity` | an `[identities]` name; applied at every start |
-| `claude_token` | a stored Claude token's name; absent means `[defaults] claude_token` |
-| `llm` | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |
-| `tools` | the [agent tools](agent-tools.md) it gets, by folder name; absent means `[defaults] tools`. Their rules and environment need a rebuild; the adapter files refresh at every start |
-| `autostart` | started when the picker opens |
-| `ssh_keys` | key fingerprints this sandbox may use. Absent means all, `[]` means none |
-| `mounts` | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
-| `extra_rule_groups` | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
-| `ports` | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
-| `egress_mode` | `"observe"` while measuring; only ever set here, never in the project |
-| `volumes` | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
-| `policy_pin` | written by msbctl: the digest of the project policy last approved |
-| `msb_conf` | your own msb config file, passed as `--conf`: an absolute path, never in a project, no `${` in it. See [dev.yaml](#msbdevyaml) |
-| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | per-machine overrides. `conf` must name a file inside the project |
-| `[versions]` | what `msbctl update` installed, so a rebuild reproduces it |
+| Key | Type | Meaning |
+| --- | --- | --- |
+| `name`, `project` | string, host path | the sandbox's name and the absolute path of its project folder |
+| `source`, `repo`, `ref` | strings | `source = "repo"` for a sandbox [without a folder](repo-sandboxes.md), which has `repo` and an optional `ref` instead of `project` |
+| `guest_path` | `"/work"`, `"host"` or a guest path | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
+| `repo` | `owner/name` | `owner/name` on GitHub, for the token binding and the picker |
+| `identity` | identity name | an `[identities]` name; applied at every start |
+| `claude_token` | token name | a stored Claude token's name; absent means `[defaults] claude_token` |
+| `llm` | list of endpoint names | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |
+| `tools` | list of tool names | the [agent tools](agent-tools.md) it gets, by folder name; absent means `[defaults] tools`. Their rules and environment need a rebuild; the adapter files refresh at every start |
+| `autostart` | boolean | started when the picker opens |
+| `ssh_keys` | list of fingerprints | key fingerprints this sandbox may use. Absent means all, `[]` means none |
+| `mounts` | list | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
+| `extra_rule_groups` | list of groups | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
+| `ports` | list | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
+| `egress_mode` | `"enforce"` or `"observe"` | `"observe"` while measuring; only ever set here, never in the project |
+| `volumes` | string | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
+| `policy_pin` | string | written by msbctl: the digest of the project policy last approved |
+| `msb_conf` | absolute host path | your own msb config file, passed as `--conf`: an absolute path, never in a project, no `${` in it. See [dev.yaml](#msbdevyaml) |
+| `image`, `cpus`, `memory`, `root_disk`, `conf`, `rule_groups`, `extra_rules` | as above | per-machine overrides. `conf` must name a file inside the project |
+| `[versions]` | table | what `msbctl update` installed, so a rebuild reproduces it |
