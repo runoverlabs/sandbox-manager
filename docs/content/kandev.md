@@ -288,7 +288,9 @@ It never touches a sandbox that lacks either the `kandev` source or the label.
 The line `host authorize --kandev` writes is
 `restrict,command="…/msbctl host serve --kandev" <key>`, with no `pty`. That key
 runs `msbctl kandev …`, `ls`, `show`, `stop` and `purge -y` with `--json` on
-one named sandbox, `self-update --json`, and `msbctl --version`. Nothing else,
+one named sandbox, `self-update --json`, `doctor --json` (which leaves your own
+sandboxes out of its report, so provisioning can gate on the host), and
+`msbctl --version`. Nothing else,
 and none of `host`: the reaper, the proxy and `host kandev configure` are this
 host's own. Your laptop's everyday key is refused every `kandev` verb, since
 one could create a sandbox with any egress.

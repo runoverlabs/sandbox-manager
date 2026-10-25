@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `msbctl doctor [--json]` checks that this machine can run sandboxes and prints the fix for each problem: KVM access, msb and its version (and `msb doctor`'s verdict), disk space, config and secret file modes, registry entries whose folder is gone or that msb doesn't know about, the SSH agent, and `host check`'s hygiene heuristics. It never prompts and exits 1 only when something failed. `remote test` and `remote setup` now run it on the host, falling back to `host check` on an older one.
 - Tab completion for bash, zsh and fish: `msbctl completion bash|zsh|fish` prints a script to source, completing verbs, flags and sandbox names (`HOST:name` from what `ls` last cached) and handing `exec`'s command to the shell's own completion, without starting `msb` or ssh on a Tab.
 - `msbctl allow . --from-observe` allows every host the observation log shows reached and no rule covers, in one write and one approval (names seen only in DNS with `--with-dns`), and `msbctl observe . --json` prints the report as one JSON document, so the observe → allow → rebuild loop runs from a script.
 - Published tcp ports are clickable in `msbctl port` and `show` (an OSC 8 hyperlink to `http://127.0.0.1:<host>/` on a terminal), and `show --json` adds a `port_urls` map of each port to its URL.

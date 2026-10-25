@@ -9,6 +9,11 @@ Most failures here are disguised: they look like an outage or a bug, and are
 actually policy doing its job. Start with `msbctl show` for the sandbox, which
 lists every rule it emits.
 
+When nothing starts at all, or on a machine you've just installed on, run
+`msbctl doctor` first. It checks KVM, msb, disk space, your registry entries
+and the SSH agent, and prints the fix for each problem
+([Commands](commands.md#msbctl-doctor)).
+
 ## "connection refused" / a host is unreachable
 
 **It's a missing egress rule until proven otherwise.** Don't retry, and don't

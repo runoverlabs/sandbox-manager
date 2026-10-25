@@ -1,0 +1,236 @@
+"""`msbctl doctor`: one record per check, ok/warn/fail, exit 1 only when
+something failed, no prompts, and `remote test` asking a host for it."""
+
+import json
+import os
+import shutil
+import subprocess
+from collections import namedtuple
+from unittest import main, mock
+
+from tests.harness import MsbctlTest
+
+Usage = namedtuple("Usage", "total used free")
+GIB = 1024 ** 3
+SECRET = "ghp_doctorTestValue0123456789abcdef"
+
+
+class DoctorTest(MsbctlTest):
+
+    def setUp(self):
+        super().setUp()
+        self.kvm = "rw"
+        self.free = 100 * GIB
+        self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: self.kvm))
+        self.enterContext(mock.patch.object(
+            self.m, "msb_disk_usage", lambda: Usage(500 * GIB, 500 * GIB - self.free, self.free)))
+
+    def doctor(self, *extra):
+        code, out, err = self.run_main("doctor", "--json", *extra)
+        data = json.loads(out)
+        return code, {c["id"]: c for c in data["checks"]}, data, err
+
+    def test_a_working_machine(self):
+        code, checks, data, err = self.doctor()
+        self.assertEqual(code, 0, err)
+        self.assertTrue(data["ok"])
+        self.assertEqual(set(data), {"msbctl", "restricted", "ok", "checks"})
+        for c in data["checks"]:
+            self.assertEqual(set(c), {"id", "status", "message", "fix"})
+            self.assertIn(c["status"], ("ok", "warn", "fail"))
+            self.assertNotEqual(c["status"], "fail", c)
+            if c["status"] == "ok":
+                self.assertEqual(c["fix"], "")
+            else:
+                self.assertTrue(c["fix"], c)
+        for id in ("kvm", "msb", "python", "git", "disk", "config-dir", "secrets", "secret-store",
+                   "swap", "authorized-keys", "registry"):
+            self.assertIn(id, checks)
+        self.assertEqual(checks["msb"]["status"], "ok")
+        self.assertIn("0.7.7", checks["msb"]["message"])
+        self.assertNotIn("msb-doctor", checks)      # this fake msb has none
+
+    def test_no_kvm_fails(self):
+        for state, words in (("missing", "nested virtualization"), ("denied", "usermod -aG kvm")):
+            with self.subTest(state):
+                self.kvm = state
+                code, checks, data, _ = self.doctor()
+                self.assertEqual(code, 1)
+                self.assertFalse(data["ok"])
+                self.assertEqual(checks["kvm"]["status"], "fail")
+                self.assertIn(words, checks["kvm"]["fix"])
+
+    def test_text_report(self):
+        self.kvm = "missing"
+        code, out, _ = self.run_main("doctor")
+        self.assertEqual(code, 1)
+        self.assertIn("FAIL  kvm", out)
+        self.assertIn("→ msbctl runs on the host", out)
+        self.assertIn("1 failed: kvm", out)
+        self.kvm = "rw"
+        code, out, _ = self.run_main("doctor")
+        self.assertEqual(code, 0)
+        self.assertIn("this machine can run sandboxes", out)
+
+    def test_msb(self):
+        real = shutil.which
+        with mock.patch.object(self.m.shutil, "which", lambda n: None if n == "msb" else real(n)):
+            code, checks, _, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertEqual(checks["msb"]["status"], "fail")
+        self.assertIn("install.sh", checks["msb"]["fix"])
+        os.environ["FAKE_MSB_VERSION"] = "0.9.1"
+        code, checks, _, _ = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks["msb"]["status"], "warn")
+        self.assertIn("0.9.1", checks["msb"]["message"])
+
+    def test_msb_doctor_when_msb_has_one(self):
+        for mode, status, words in (("ok", "ok", "host setup is ready"),
+                                    ("warn", "warn", "Root clone: copy fallback"),
+                                    ("fail", "fail", "KVM access          permission denied")):
+            with self.subTest(mode):
+                os.environ["FAKE_MSB_DOCTOR"] = mode
+                code, checks, _, _ = self.doctor()
+                self.assertEqual(checks["msb-doctor"]["status"], status)
+                self.assertIn(words, checks["msb-doctor"]["message"])
+                self.assertEqual(code, 1 if status == "fail" else 0)
+        self.assertIn("/dev/kvm is not accessible", checks["msb-doctor"]["message"])
+        self.assertIn("msb doctor --fix", checks["msb-doctor"]["fix"])
+
+    def test_disk(self):
+        for gib, status, code_wanted in ((50, "ok", 0), (5, "warn", 0), (1, "fail", 1)):
+            with self.subTest(gib):
+                self.free = gib * GIB
+                code, checks, _, _ = self.doctor()
+                self.assertEqual(checks["disk"]["status"], status)
+                self.assertEqual(code, code_wanted)
+
+    def test_registry(self):
+        project = self.make_folder_sandbox("web")
+        self.make_folder_sandbox("api")
+        os.rename(project, project + ".moved")
+        with open(self.entry_path("bad"), "w", encoding="utf-8") as fh:
+            fh.write('name = "bad"\nsource = "bogus"\n')
+        self.set_state(api="running", stray="stopped")
+        code, checks, _, _ = self.doctor()
+        self.assertEqual(code, 0)       # each is about one sandbox
+        self.assertEqual(checks["registry"]["status"], "warn")
+        self.assertIn("bad (bad.toml: source is 'bogus'", checks["registry"]["message"])
+        self.assertEqual(checks["project-missing"]["status"], "warn")
+        self.assertIn("web", checks["project-missing"]["message"])
+        self.assertNotIn("api", checks["project-missing"]["message"])
+        self.assertEqual(checks["orphans"]["status"], "warn")
+        self.assertIn("stray", checks["orphans"]["message"])
+        self.assertNotIn("api", checks["orphans"]["message"])
+
+    def test_ssh_agent_only_when_a_sandbox_may_use_a_key(self):
+        self.make_folder_sandbox("web")         # ssh_keys = []: no agent needed
+        _, checks, _, _ = self.doctor()
+        self.assertNotIn("ssh-agent", checks)
+        with open(self.entry_path("web"), encoding="utf-8") as fh:
+            text = fh.read().replace("ssh_keys = []\n", "")
+        with open(self.entry_path("web"), "w", encoding="utf-8") as fh:
+            fh.write(text)
+        code, checks, _, _ = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertEqual(checks["ssh-agent"]["status"], "warn")
+        self.assertIn("web", checks["ssh-agent"]["message"])
+
+    def test_a_broken_config_is_reported(self):
+        self.m.ensure_local_config()
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("\n[[[ not toml\n")
+        code, checks, _, _ = self.doctor()
+        self.assertEqual(code, 1)
+        self.assertEqual(checks["config"]["status"], "fail")
+        self.assertNotIn("registry", checks)
+
+    def test_kandev_key_sees_no_operator_sandbox(self):
+        self.make_folder_sandbox("web")
+        self.set_state(stray="stopped")
+        os.environ["MSB_RESTRICTED"] = "kandev"
+        code, checks, data, _ = self.doctor()
+        self.assertEqual(code, 0)
+        self.assertTrue(data["restricted"])
+        for id in ("registry", "orphans", "project-missing", "ssh-agent"):
+            self.assertNotIn(id, checks)
+        text = json.dumps(data)
+        self.assertNotIn("web", text)
+        self.assertNotIn("stray", text)
+
+    def test_never_prints_a_secret(self):
+        self.make_folder_sandbox("web")
+        self.store_secret(self.secrets_file("web"), "GH_TOKEN", SECRET)
+        code, out, err = self.run_main("doctor", "--json")
+        self.assertEqual(code, 0, err)
+        self.assert_not_in_output(SECRET, out, err)
+        checks = {c["id"]: c for c in json.loads(out)["checks"]}
+        self.assertEqual(checks["github-token"]["status"], "ok")
+        code, out, err = self.run_main("doctor")
+        self.assert_not_in_output(SECRET, out, err)
+
+    def test_host_check_keeps_its_shape(self):
+        self.kvm = "missing"
+        code, out, err = self.run_main("host", "check", "--json")
+        self.assertEqual(code, 0, err)      # host check never failed, and still does not
+        data = json.loads(out)
+        kvm = next(c for c in data["checks"] if c["check"] == "kvm")
+        self.assertEqual(set(kvm), {"check", "ok", "detail"})
+        self.assertIs(kvm["ok"], False)
+
+
+class RemoteDoctorTest(MsbctlTest):
+    """`remote test` reads the host's doctor, or an older host's host check."""
+
+    def setUp(self):
+        super().setUp()
+        self.m.ensure_local_config()
+        self.m.set_toml_key(self.m.CONFIG_FILE, "ssh", "msb@sbx-01.example", table="remotes.sbx-01")
+        self.mine = self.m.version_string().split()[0]
+
+    def remote_test(self, answer):
+        real = subprocess.run
+        calls = []
+
+        def fake(argv, *a, **kw):
+            if argv and argv[0] == "ssh":
+                calls.append(argv[-1])
+                return answer(argv)
+            return real(argv, *a, **kw)
+        with mock.patch.object(self.m.subprocess, "run", fake):
+            code, out, err = self.run_main("remote", "test", "sbx-01")
+        with open(os.path.join(self.m.REMOTES_DIR, "sbx-01.test.json"), encoding="utf-8") as fh:
+            return code, out, err, calls, json.load(fh)
+
+    def test_a_failed_check_there_is_a_problem(self):
+        doctor = {"msbctl": self.mine, "restricted": True, "ok": False, "checks": [
+            {"id": "kvm", "status": "fail", "message": "no /dev/kvm", "fix": "a host with KVM"}]}
+        code, out, err, calls, cached = self.remote_test(
+            lambda argv: subprocess.CompletedProcess(argv, 1, json.dumps(doctor), ""))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, ["msbctl doctor --json"])
+        self.assertIn("FAIL  kvm", out)
+        self.assertIn("→ a host with KVM", out)
+        self.assertFalse(cached["ok"])
+        self.assertIn("failed: kvm", cached["summary"])
+
+    def test_an_older_host_is_asked_for_host_check(self):
+        check = {"msbctl": self.mine, "restricted": True, "checks": [
+            {"check": "swap", "ok": False, "detail": "/dev/sda2 — not encrypted"},
+            {"check": "restricted", "ok": None, "detail": "yes"}]}
+
+        def answer(argv):
+            if "doctor" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 126, "", "msbctl host serve: refused\n")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(check), "")
+        code, out, err, calls, cached = self.remote_test(answer)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls, ["msbctl doctor --json", "msbctl host check --json"])
+        self.assertIn("WARN  swap", out)
+        self.assertIn("ok    restricted", out)
+        self.assertTrue(cached["ok"], cached)
+
+
+if __name__ == "__main__":
+    main()

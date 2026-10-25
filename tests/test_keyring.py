@@ -722,14 +722,14 @@ class KeyringTest(MsbctlTest):
         self.use_keyring("unlocked")
         self.store_secret(path, "NPM_TOKEN", SECRET)
         check = self.m.secret_store_check()
-        self.assertIsNone(check["ok"])
-        self.assertIn('store = "keyring"', check["detail"])
-        self.assertIn("unlocked", check["detail"])
-        self.assertIn("1 value(s) in the keyring", check["detail"])
+        self.assertEqual(check["status"], "ok")
+        self.assertIn('store = "keyring"', check["message"])
+        self.assertIn("unlocked", check["message"])
+        self.assertIn("1 value(s) in the keyring", check["message"])
         self.use_keyring("locked")      # asks on first use: fine
-        self.assertIsNone(self.m.secret_store_check()["ok"])
+        self.assertEqual(self.m.secret_store_check()["status"], "ok")
         self.use_keyring(None)          # nothing here to read them from
-        self.assertFalse(self.m.secret_store_check()["ok"])
+        self.assertEqual(self.m.secret_store_check()["status"], "fail")
         self.assert_no_call_without_service()
 
 

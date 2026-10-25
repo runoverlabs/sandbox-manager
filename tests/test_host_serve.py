@@ -47,6 +47,8 @@ ALLOWED = [
     "msbctl policy web show",
     "msbctl host check",
     "msbctl host check --json",
+    "msbctl doctor",
+    "msbctl doctor --json",
 ]
 
 REFUSED = [
@@ -125,13 +127,15 @@ KANDEV_ALLOWED = ["msbctl --version", *KANDEV_VERBS,
                   "msbctl stop k-6f1c2b9e-aaaa --json",
                   "msbctl purge k-6f1c2b9e-aaaa -y --json",
                   "msbctl self-update --json",
-                  "msbctl self-update --version 99.0.0 --json"]
+                  "msbctl self-update --version 99.0.0 --json",
+                  "msbctl doctor --json"]
 
 KANDEV_REFUSED = [
     "msbctl ls", "msbctl status", "msbctl show web", "msbctl shell web",
     "msbctl exec web -- true", "msbctl secret set web GH_TOKEN --stdin", "msbctl setup",
     "msbctl allow web x.example", "msbctl add --repo acme/web -y", "msbctl edit web",
     "msbctl rm web", "msbctl purge web -y", "msbctl start web", "msbctl host check",
+    "msbctl doctor",
     "msbctl kandev bogus", "msbctl kandev", "/bin/sh -c ls", "",
     # The generic verbs in any other shape: text output, a prompt, a re-probe,
     # several names, or the host's own folder.

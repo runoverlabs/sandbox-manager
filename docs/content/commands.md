@@ -108,6 +108,29 @@ msbctl config
 The merged configuration (`defaults.toml` plus your `config.toml`), with where
 each value comes from.
 
+### `msbctl doctor`
+
+```text
+msbctl doctor [--json]
+```
+
+Checks that this machine can run sandboxes, one line per check, with the fix
+for anything that isn't right. It looks at `/dev/kvm` (and whether you can
+open it), `msb` and its version against the ones msbctl is tested on, and
+`msb doctor`'s own verdict. It also covers `git`, `fzf` and a stored
+`GH_TOKEN`, free disk under msb's home, and the modes of the config and
+secrets directories. For the registry, it checks that each entry loads, that
+its project folder still exists, that an SSH agent is reachable when a sandbox
+may use a key, and that msb has no sandbox no entry names. Last come
+[`host check`](#msbctl-host)'s hygiene heuristics. It never asks anything and
+changes nothing. It exits 1 when a check **failed** (no KVM, no msb, under
+2 GiB free, secrets nothing can read) and 0 otherwise, including with
+warnings, so a script can gate on it. `--json` prints
+`{"checks": [{"id", "status", "message", "fix"}, …]}` with `status` one of
+`ok`, `warn` or `fail`, plus `ok`, `msbctl` and `restricted`. A remote host's
+`host serve` allows it, and the Kandev plugin's key may run `doctor --json`,
+which leaves the operator's own sandboxes out.
+
 ### `msbctl entry`
 
 ```text
@@ -459,6 +482,8 @@ adds a key to `~/.ssh/authorized_keys` with that forced command, or with
 `--replace`, which rewrites its line. `check` reports the host's hygiene, as heuristics.
 `autostart install` writes and enables a systemd user unit that runs `msbctl
 start --autostart` at boot. Under `host serve`, only `check` is allowed.
+`check` is [`doctor`](#msbctl-doctor)'s report under its older name, in its
+older JSON shape (`check`, `ok`, `detail`), and it always exits 0.
 `--kandev` is the [Kandev plugin's key](kandev.md#the-plugin-key): its line
 runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`,
 `show`, `stop`, `purge` and `self-update` with `--json` (seeing only Kandev's
@@ -512,7 +537,8 @@ the kvm group, autostart, copying your git identities and sending Claude
 tokens (on stdin), and last restricting this machine's key to
 `host serve` (it warns first when that key is the one with a shell there). Then
 it tests. `test` runs
-the host's `host check` and warns about an unrestricted key or a version
+the host's [`doctor`](#msbctl-doctor) (`host check` on a host whose msbctl
+predates it), shows each check, and warns about a failed one, an unrestricted key or a version
 mismatch. `rm` forgets it; the host isn't touched. Then `NAME:sandbox`
 addresses a sandbox there for every verb, and `ls` shows every host. See
 [Remote hosts](remote-hosts.md#on-the-laptop).

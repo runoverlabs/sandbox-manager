@@ -319,6 +319,7 @@ note "msb-manager $VERSION ($MODE)"
 # ran `msbctl setup` in the middle of an install. Single quotes are text.
 cat <<EOF
    Next:
+     0. msbctl doctor              checks this machine can run sandboxes (KVM, msb, disk)
      1. msbctl                     the first run walks you through your git identities,
                                    Claude login and your own network (homelab, …); all
                                    optional, and 'msbctl setup' returns to any of it
