@@ -47,6 +47,19 @@ class GitCheckstatTest(MsbctlTest):
         with self.assertRaises(SystemExit):
             self.box('git_checkstat = "yes"\n')
 
+    def test_a_bad_default_names_config_toml(self):
+        self.defaults('git_checkstat = "no"\n')
+        with mock.patch.object(self.m, "die", side_effect=SystemExit) as die:
+            with self.assertRaises(SystemExit):
+                self.box()
+        self.assertIn("config.toml", die.call_args[0][0])
+
+    def test_read_write_extra_mounts_are_walked_too(self):
+        extra = [tempfile.mkdtemp(dir=self.tmp) for _ in range(2)]
+        box = self.box(f'mounts = ["{extra[0]}:/lib:rw", "{extra[1]}:/ref:ro"]\n')
+        (argv,) = self.checkstat_calls(box)
+        self.assertEqual(argv[-2:], [box.guest_project, "/lib"])
+
     def test_show_and_the_profile_say_which(self):
         box = self.box()
         self.assertIs(self.m.show_data(box)["git_checkstat"], True)
@@ -55,12 +68,6 @@ class GitCheckstatTest(MsbctlTest):
         box = self.box("git_checkstat = false\n")
         self.assertIs(self.m.show_data(box)["git_checkstat"], False)
         self.assertIn(self.m.GIT_CHECKSTAT_PROFILE[False], self.m.sandbox_profile_section(box))
-
-    def test_show_json_is_null_where_it_does_not_apply(self):
-        box = self.box()
-        box.is_repo, box.shares_host_index = True, False
-        self.assertIsNone(self.m.show_data(box)["git_checkstat"])
-        self.assertNotIn(self.m.GIT_CHECKSTAT_PROFILE[True], self.m.sandbox_profile_section(box))
 
     def test_never_touches_a_kandev_sandbox(self):
         os.makedirs(self.m.REGISTRY_DIR, exist_ok=True)
@@ -82,6 +89,17 @@ class GitCheckstatTest(MsbctlTest):
             self.m.section_git_checkstat(box, self.m.load_config(), {"rebuild": set()})
         self.assertNotIn("git_checkstat", self.m.read_toml(path))
 
+    def test_edit_walks_a_running_sandbox_only_when_turned_on(self):
+        box = self.box()
+        with mock.patch.object(self.m, "choose_one", lambda title, opts, d=0: opts[0]), \
+             mock.patch.object(self.m, "state_of", lambda name: "running"):
+            self.m.section_git_checkstat(box, self.m.load_config(), {"rebuild": set()})
+            self.assertEqual(self.msb_calls("exec"), [])    # already on
+            box.git_checkstat = False
+            self.m.section_git_checkstat(box, self.m.load_config(), {"rebuild": set()})
+        (call,) = self.msb_calls("exec")
+        self.assertEqual(call["argv"][call["argv"].index("--") + 7], "1")   # forced
+
 
 @unittest.skipUnless(shutil.which("git"), "needs git")
 class GitCheckstatScriptTest(MsbctlTest):
@@ -92,19 +110,29 @@ class GitCheckstatScriptTest(MsbctlTest):
                               check=False).stdout.strip()
 
     def script(self, force=False):
+        """The guest-side argv, with the project root pointed at self.work."""
         self.make_folder_sandbox("web")
-        with mock.patch.object(self.m, "GIT_CHECKSTAT_MARKER", self.marker):
-            self.m.ensure_git_checkstat(self.m.Sandbox("web", self.m.load_config()), force)
-        return [c["argv"] for c in self.msb_calls("exec")
-                if "core.checkStat" in " ".join(c["argv"])][-1][-1]
+        box = self.m.Sandbox("web", self.m.load_config())
+        with mock.patch.object(self.m, "GIT_CHECKSTAT_MARKER", self.marker), \
+             mock.patch.object(self.m, "GIT_CHECKSTAT_BOOT_ID", self.boot_id):
+            self.m.ensure_git_checkstat(box, force)
+        argv = self.msb_calls("exec")[-1]["argv"]
+        argv = argv[argv.index("--") + 1:]
+        return [self.work if a == box.guest_project else a for a in argv]
 
     def setUp(self):
         super().setUp()
         self.marker = os.path.join(self.tmp, "marker")
+        self.boot_id = os.path.join(self.tmp, "boot_id")
+        self.boot("boot-1")
         self.work = tempfile.mkdtemp(dir=self.tmp)
 
-    def run_script(self, script):
-        subprocess.run(["sh", "-c", script], cwd=self.work, check=True)
+    def boot(self, ident):
+        with open(self.boot_id, "w", encoding="utf-8") as fh:
+            fh.write(ident + "\n")
+
+    def run_script(self, argv, env=None):
+        subprocess.run(argv, cwd=self.work, check=True, env=env)
 
     def init(self, rel):
         path = os.path.join(self.work, rel)
@@ -116,9 +144,14 @@ class GitCheckstatScriptTest(MsbctlTest):
         return self.git("config", "--local", "--get", "core.checkStat",
                         cwd=os.path.join(self.work, rel))
 
+    def unset(self, rel):
+        self.git("config", "--local", "--unset", "core.checkStat",
+                 cwd=os.path.join(self.work, rel))
+
     def test_which_repos_it_sets(self):
         repos = {".": "minimal", "a": "minimal", "g/b": "minimal", "set": "default",
-                 "node_modules/x": "", "g/h/deep": "", ".hidden/r": ""}
+                 "node_modules/x": "", "g/node_modules": "", "g/h/deep": "",
+                 ".hidden/r": ""}
         for rel in repos:
             self.init(rel)
         self.git("config", "core.checkStat", "default", cwd=os.path.join(self.work, "set"))
@@ -136,17 +169,65 @@ class GitCheckstatScriptTest(MsbctlTest):
                 self.assertEqual(self.checkstat(rel), want)
         self.assertEqual(self.checkstat("api"), "minimal")
 
-    def test_once_per_boot_unless_forced(self):
+    def test_a_repo_owned_by_another_user_is_still_set(self):
+        # The guest's case: root, over files presented as the host user.
+        if os.geteuid() != 0:
+            self.skipTest("needs root to own files as someone else")
+        self.init("g/b")
+        for root, dirs, files in os.walk(self.work):
+            for name in [root] + [os.path.join(root, f) for f in dirs + files]:
+                os.lchown(name, 65534, 65534)
         self.run_script(self.script())
+        self.assertEqual(self.git("-c", "safe.directory=*", "config", "--local", "--get",
+                                  "core.checkStat", cwd=os.path.join(self.work, "g/b")),
+                         "minimal")
+
+    def test_skipped_until_the_repos_or_the_boot_change(self):
+        self.init(".")
+        self.run_script(self.script())
+        with open(self.marker, encoding="utf-8") as fh:
+            self.assertTrue(fh.read().startswith("boot-1\n"))
+        # Same boot, same repos: no git runs, so an unset value stays unset.
+        self.unset(".")
+        self.run_script(self.script())
+        self.assertEqual(self.checkstat("."), "")
+        # A repo cloned since changes the list, and the walk runs again.
         self.init("late")
         self.run_script(self.script())
-        boot_id = "/proc/sys/kernel/random/boot_id"
-        if os.path.exists(boot_id):
-            self.assertEqual(self.checkstat("late"), "")    # this boot already walked
-            with open(self.marker, encoding="utf-8") as fh, open(boot_id, encoding="utf-8") as b:
-                self.assertEqual(fh.read(), b.read())
+        self.assertEqual((self.checkstat("."), self.checkstat("late")), ("minimal", "minimal"))
+        # A new boot walks again too.
+        self.unset(".")
+        self.boot("boot-2")
+        self.run_script(self.script())
+        self.assertEqual(self.checkstat("."), "minimal")
+
+    def test_forced_walks_regardless(self):
+        self.init(".")
+        self.run_script(self.script())
+        self.unset(".")
         self.run_script(self.script(force=True))
-        self.assertEqual(self.checkstat("late"), "minimal")
+        self.assertEqual(self.checkstat("."), "minimal")
+
+    def test_no_git_leaves_no_marker(self):
+        self.init(".")
+        bindir = tempfile.mkdtemp(dir=self.tmp)
+        os.symlink(shutil.which("cat"), os.path.join(bindir, "cat"))
+        argv = self.script()
+        self.run_script([shutil.which("sh"), *argv[1:]], env={"PATH": bindir})
+        self.assertFalse(os.path.exists(self.marker))
+        self.run_script(argv)
+        self.assertEqual(self.checkstat("."), "minimal")
+
+    def test_a_failed_repo_leaves_no_marker(self):
+        self.init(".")
+        os.chmod(os.path.join(self.work, ".git", "config"), 0o444)
+        os.chmod(os.path.join(self.work, ".git"), 0o555)
+        self.addCleanup(os.chmod, os.path.join(self.work, ".git"), 0o755)
+        if os.access(os.path.join(self.work, ".git"), os.W_OK):
+            self.skipTest("running as root: permissions do not stop git")
+        self.run_script(self.script())
+        self.assertFalse(os.path.exists(self.marker))
+
 
 if __name__ == "__main__":
     main()

@@ -143,10 +143,11 @@ identity = ""
 git_push = "gh"
 
 # Set core.checkStat = minimal in the .git/config of every repo in a mounted
-# project (the project folder and two levels under it), unless that repo
-# already sets core.checkStat. Re-asserted on every start, so a repo cloned
-# later is covered next time. A registry entry's `git_checkstat` overrides
-# (`msbctl edit <name>` → Host editor).
+# project (the project folder and two levels under it, and every read-write
+# extra mount), unless that repo already sets core.checkStat. Checked on each
+# `shell`/`exec`, so a repo cloned since is covered on the next one. A
+# registry entry's `git_checkstat` overrides (`msbctl edit <name>` → Host
+# editor).
 #
 # Why: a git-aware editor on the host (zed, any IDE that polls git) and git in
 # the guest share .git/index, but see different uid, gid and device numbers

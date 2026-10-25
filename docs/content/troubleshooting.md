@@ -120,13 +120,15 @@ straight after the sandbox does. The sandbox's view of the file then goes stale
 until it expires.
 
 msbctl prevents this by setting `core.checkStat=minimal` in the `.git/config`
-of every repo in the project, on every start: the project folder itself and
-up to two levels under it (`repo/`, `group/repo/`, symlinked ones included),
-skipping `node_modules` and hidden folders. A repo that already sets `core.checkStat` is left alone. Git then
+of every repo in the project, on each `msbctl shell` or `exec`: the project
+folder itself and up to two levels under it (`repo/`, `group/repo/`, symlinked
+ones included), skipping `node_modules` and hidden folders, and the same in
+every read-write extra mount. A repo that already sets `core.checkStat` is left alone. Git then
 compares only mtime and size, which both sides agree on. It has to be
 `.git/config`, because that's the one file the host's git and the sandbox's
 both read; it's per clone and never committed, so no other checkout is
-affected. For a repo nested deeper, or one cloned since the last start, run
+affected. A repo cloned since is picked up by the next `shell` or `exec`. For one
+nested deeper, or to cover a fresh clone straight away, run
 `git config core.checkStat minimal` in it. `GIT_OPTIONAL_LOCKS=0` for the
 editor doesn't help: `git diff` ignores it.
 
