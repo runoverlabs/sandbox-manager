@@ -183,16 +183,40 @@ class DoctorTest(MsbctlTest):
 
     def test_kandev_key_sees_no_operator_sandbox(self):
         self.make_folder_sandbox("web")
-        self.set_state(stray="stopped")
+        with open(self.entry_path("web"), "a", encoding="utf-8") as fh:
+            fh.write("autostart = true\n")
+        self.store_secret(self.secrets_file("web"), "GH_TOKEN", SECRET)
+        os.chmod(self.secrets_file("web"), 0o644)
+        with open(self.entry_path("k-lab"), "w", encoding="utf-8") as fh:
+            fh.write('name = "k-lab"\nsource = "kandev"\nkandev_env = "lab"\n')
+        with open(self.entry_path("k-bad"), "w", encoding="utf-8") as fh:
+            fh.write("[[[ not toml\n")
+        self.set_state(stray="stopped", **{"k-lab": "running", "k-orphan": "running"})
+        state = self.fake_state()
+        state["_labels"] = {"k-lab": ["msbctl.owner=kandev"], "k-orphan": ["msbctl.owner=kandev"]}
+        with open(os.environ["FAKE_MSB_STATE"], "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
         os.environ["MSB_RESTRICTED"] = "kandev"
-        code, checks, data, _ = self.doctor()
-        self.assertEqual(code, 0)
+        code, checks, data, err = self.doctor()
+        self.assertEqual(code, 0, err)
         self.assertTrue(data["restricted"])
-        for id in ("registry", "orphans", "project-missing", "ssh-agent"):
+        # The host, in full; the operator's sandboxes, not at all.
+        for id in ("kvm", "msb", "disk", "swap", "authorized-keys"):
+            self.assertIn(id, checks)
+        for id in ("github-token", "secret-store", "autostart"):
             self.assertNotIn(id, checks)
+        self.assertEqual(checks["secrets"]["status"], "warn")
+        self.assertIn("not 0600: 1 file(s)", checks["secrets"]["message"])
+        # Kandev's own entries and VMs, with what is wrong with them.
+        self.assertEqual(checks["registry"]["status"], "warn")
+        self.assertIn("2 Kandev sandbox(es)", checks["registry"]["message"])
+        self.assertIn("k-bad (", checks["registry"]["message"])
+        self.assertEqual(checks["orphans"]["status"], "warn")
+        self.assertIn("k-orphan", checks["orphans"]["message"])
         text = json.dumps(data)
-        self.assertNotIn("web", text)
-        self.assertNotIn("stray", text)
+        for name in ("web", "stray", "GH_TOKEN"):
+            self.assertNotIn(name, text)
+        self.assert_not_in_output(SECRET, text, err)
 
     def test_never_prints_a_secret(self):
         self.make_folder_sandbox("web")

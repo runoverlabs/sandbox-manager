@@ -128,8 +128,9 @@ changes nothing. It exits 1 when a check **failed** (no KVM, no msb, under
 warnings, so a script can gate on it. `--json` prints
 `{"checks": [{"id", "status", "message", "fix"}, …]}` with `status` one of
 `ok`, `warn` or `fail`, plus `ok`, `msbctl` and `restricted`. A remote host's
-`host serve` allows it, and the Kandev plugin's key may run `doctor --json`,
-which leaves the operator's own sandboxes out.
+`host serve` allows it, and the Kandev plugin's key may run `doctor --json`:
+for that key the report covers the host and Kandev's own sandboxes only, and
+names none of the operator's.
 
 ### `msbctl entry`
 

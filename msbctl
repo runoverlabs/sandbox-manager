@@ -10644,12 +10644,18 @@ def doctor_checks(config=None):
     if config is None:
         out.insert(0, _doctor("config", "fail", f"{tilde(CONFIG_FILE)} does not load",
                               "`msbctl config` shows the error; `msbctl setup` → edit the file"))
-    elif not kandev_key():
-        # The Kandev plugin's key sees Kandev's sandboxes alone; the operator's
-        # entries, their folders and keys are none of its business.
+    else:
         out += registry_checks(config, entries)
     return out
 
+
+# Under the Kandev plugin's key, doctor reports what decides whether Kandev's
+# sandboxes can run: the host (KVM, msb, disk, its hygiene) and Kandev's own
+# entries. What concerns the operator's sandboxes — their names, how many hold
+# GH_TOKEN or autostart, the secret store, which Kandev never uses — is left
+# out, and a finding about shared files gives a count, never a file name (a
+# secrets file is named after its sandbox). The same line `ls`, `show` and
+# `purge` hold under that key (kandev_guard()).
 
 def doctor_registry():
     """Each registry entry's table, or for one that does not parse the reason,
@@ -10752,6 +10758,8 @@ def tool_checks(entries):
     out.append(_doctor("fzf", "ok", "fzf is on PATH") if shutil.which("fzf") else
                _doctor("fzf", "warn", "fzf is not on PATH: menus are numbered prompts",
                        "install fzf for the picker (optional)"))
+    if kandev_key():
+        return out      # Kandev delivers its own credentials, through agentctl
     # The token sandboxes push and use the API with; gh's own login on the host
     # is never used. Names only: stored_env() reads no keyring value.
     holders = [n for n in entries
@@ -10798,13 +10806,14 @@ def storage_checks(config, autostart):
             except OSError:
                 pass    # gone since listdir (a `secret rm`), or a dangling link: nothing to read
         dmode = os.stat(SECRETS_DIR).st_mode & 0o777
+        shown = f"{len(loose)} file(s)" if kandev_key() else ", ".join(loose)
         out.append(_doctor("secrets", "ok" if dmode == 0o700 and not loose else "warn",
                            f"{tilde(SECRETS_DIR)} {dmode:04o}" +
-                           (f"; not 0600: {', '.join(loose)}" if loose else ", every file 0600"),
+                           (f"; not 0600: {shown}" if loose else ", every file 0600"),
                            f"chmod 700 {tilde(SECRETS_DIR)}; chmod 600 {tilde(SECRETS_DIR)}/*"))
     else:
         out.append(_doctor("secrets", "ok", "no secrets stored yet"))
-    if config is not None:
+    if config is not None and not kandev_key():
         out.append(secret_store_check(config, autostart))
     return out
 
@@ -10910,6 +10919,8 @@ def hygiene_checks(autostart):
           "`msbctl host authorize` each laptop's key; keep a shell for an sk- key")
     check("restricted", True, "yes: this key runs under host serve"
           if restricted() else "no: this session is unrestricted")
+    if kandev_key():
+        return out      # autostart is the operator's sandboxes'
     linger = lingering(user)
     unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
     wanted = len(autostart)
@@ -10950,9 +10961,13 @@ def registry_checks(config, entries):
     """Each registry entry loads, its folder is there, the agent its keys need
     is reachable, and msb has no sandbox no entry names. Each is about one
     sandbox, so a warning: the host itself can still run the rest.
-    `entries`: doctor_registry()."""
+    `entries`: doctor_registry(). Under the Kandev key, Kandev's entries
+    alone: those with source = "kandev", and a k- one that does not parse
+    (`add` keeps k- names for Kandev); orphans are VMs with Kandev's label."""
     out = []
-    names = list(entries)
+    scoped = kandev_key()
+    names = [n for n, e in entries.items()
+             if not scoped or (e.get("source") == "kandev" if isinstance(e, dict) else n.startswith("k-"))]
     broken, gone, need_agent = [], [], []
     for name in names:
         if isinstance(entries[name], str):
@@ -10971,7 +10986,7 @@ def registry_checks(config, entries):
         if not box.is_kandev and box.ssh_keys != []:
             need_agent.append(name)
     out.append(_doctor("registry", "warn" if broken else "ok",
-                       f"{len(names)} sandbox(es) registered" +
+                       f"{len(names)} {'Kandev ' if scoped else ''}sandbox(es) registered" +
                        (f"; not loading: {'; '.join(broken)}" if broken else ""),
                        f"fix or remove the entry under {tilde(REGISTRY_DIR)}"))
     if gone:
@@ -10983,7 +10998,18 @@ def registry_checks(config, entries):
                            "the SSH agent is reachable" if agent else
                            f"no SSH agent here, and these may use a key: {', '.join(need_agent)}",
                            "start an agent and ssh-add a key, or `msbctl keys <name>` → none"))
-    if shutil.which("msb"):
+    if shutil.which("msb") and scoped:
+        try:
+            orphans = sorted(set(kandev_labelled()) - set(entries))
+        except KandevError as exc:
+            out.append(_doctor("orphans", "warn", f"cannot list Kandev's VMs: {exc}",
+                               "run `msb ls` on the host"))
+        else:
+            out.append(_doctor("orphans", "warn" if orphans else "ok",
+                               f"Kandev VMs no entry names: {', '.join(orphans)}" if orphans else
+                               "every Kandev VM has a registry entry",
+                               "`msbctl host kandev reap` removes them once they are old enough"))
+    elif shutil.which("msb"):
         orphans = sorted(set(msb_table()) - set(names))
         out.append(_doctor("orphans", "warn" if orphans else "ok",
                            f"msb has sandboxes no entry names: {', '.join(orphans)}" if orphans else
