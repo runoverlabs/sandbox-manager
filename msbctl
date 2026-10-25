@@ -21,9 +21,9 @@
     msbctl edit <name>            edit an existing sandbox: a menu of the wizard's sections
     msbctl resize <name>          change cpus / memory / root disk, keeping its state
     msbctl cache <name> [ls|clear [key]]   the package-cache disks
-    msbctl allow <name> host…     add egress rules (then rebuild to apply)
+    msbctl allow <name> host…     add egress rules (then rebuild to apply); --from-observe: what was reached
     msbctl policy <name> [approve]   the project policy it is pinned to; approve a change
-    msbctl observe <name> [on|off|report]   stop blocking and record what is reached
+    msbctl observe <name> [on|off|report] [--json]   stop blocking and record what is reached
     msbctl secret add|rm|ls|set <name>   extra tokens the sandbox can use but not see
     msbctl secret migrate --to keyring|file   every stored value into the OS keyring, or back
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
@@ -5332,9 +5332,29 @@ def append_toml_list(path, key, items, after_key=None):
 def cmd_allow(args, config):
     """Add egress rules to a sandbox's policy. Rules are fixed when the sandbox
     is created (msb cannot change them live), so this records them and says a
-    rebuild is needed; --rebuild does it now."""
+    rebuild is needed; --rebuild does it now, and on a terminal it is offered.
+
+    --from-observe adds every host the observation log shows reached and no
+    rule covers (observed_targets()), in the same one write and one approval
+    as named targets. Off a terminal nothing is asked, so `observe on`, the
+    workload, `allow --from-observe --rebuild`, `observe off` runs headless."""
+    if not args.targets and not args.from_observe:
+        die("name a host to allow, or --from-observe for every one the sandbox reached")
+    if args.with_dns and not args.from_observe:
+        die("--with-dns goes with --from-observe")
     box = Sandbox(args.name, config)
-    rules = [parse_allow_target(t) for t in args.targets]
+    targets = list(args.targets)
+    if args.from_observe:
+        if not runtime_logs(box.name):
+            die(f"{box.name}: no runtime log to allow from — `msbctl observe {box.name} on "
+                "--rebuild`, then use the sandbox")
+        observed, skipped = observed_targets(observe_data(box), args.with_dns)
+        for where, why in skipped:
+            note(f"skipped {where}: {why}")
+        if not observed:
+            note("nothing observed that the current rules do not already cover")
+        targets += observed
+    rules = [parse_allow_target(t) for t in targets]
     for rule in rules:
         if re.search(r":tcp:80(\b|$)", rule) and rule.startswith("allow"):
             die(f"{rule}: plaintext :80 is denied by `base`, which is always first, "
@@ -5363,6 +5383,10 @@ def cmd_allow(args, config):
     for rule in added:
         note(f"allowed: {rule}")
     note(f"written to {tilde(target)}")
+    # Asked only where someone can answer: off a terminal (or under host serve)
+    # an omitted --rebuild means --no-rebuild, as it always did.
+    if args.rebuild is None and not restricted() and sys.stdin.isatty() and sys.stdout.isatty():
+        args.rebuild = confirm("rebuild now so it takes effect?")
     if args.rebuild:
         cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
@@ -5502,8 +5526,19 @@ def report_secret_violations(box):
     return True
 
 
-def rule_allows(rules, host, port):
-    """Whether `rules` already permit `host` on `port`, judged BY NAME.
+def _port_in(port, ports):
+    """Whether `port` is in a rule's ports field: one port, LO-HI or `any`."""
+    if ports == "any":
+        return True
+    lo, _, hi = ports.partition("-")
+    try:
+        return int(lo) <= int(port) <= int(hi or lo)
+    except ValueError:
+        return False
+
+
+def deciding_rule(rules, host, port):
+    """The first of `rules` that decides `host` on `port`, judged BY NAME, or None.
 
     First-match-wins, so this walks the list in order and the first rule whose
     target names the host decides it. Only domain and suffix targets are
@@ -5513,15 +5548,25 @@ def rule_allows(rules, host, port):
     skipped, so the worst this can do is call something uncovered that msb would
     in fact permit — the safe direction for a hint whose output you then read
     before running it.
+
+    What is observed is an outbound TCP connection (TLS, or a lookup that
+    `allow` turns into tcp:443), so only an egress rule on tcp decides it: an
+    `allow@host:udp:443` for QUIC, or an `:ingress` rule, says nothing about
+    it, and counting one as covering it would leave the host blocked after
+    `observe off`.
     """
-    for rule in rules:
-        action, _, target = rule.partition("@")
-        action = action.split(":")[0]           # drop an :egress/:ingress direction
+    # One token can carry several rules, comma-separated, as `base` does.
+    for rule in (part.strip() for token in rules for part in token.split(",") if part.strip()):
+        left, _, target = rule.partition("@")
+        if left.partition(":")[2] not in ("", "egress", "any"):
+            continue                            # an ingress rule
         spec = target.split(":")
+        if len(spec) >= 2 and spec[1] not in ("", "tcp", "any"):
+            continue                            # udp, icmp: not this connection
         name = spec[0]
         if name.startswith("suffix="):
             name = "*." + name[len("suffix="):]
-        if port and len(spec) >= 3 and spec[2] and spec[2] != port:
+        if port and len(spec) >= 3 and spec[2] and not _port_in(port, spec[2]):
             continue                            # a rule about a different port
         if name.startswith("*."):
             bare = name[2:].lower()
@@ -5529,8 +5574,8 @@ def rule_allows(rules, host, port):
                 continue
         elif name.lower() != host:
             continue
-        return action == "allow"
-    return False
+        return rule
+    return None
 
 
 def cmd_observe(args, config):
@@ -5540,11 +5585,73 @@ def cmd_observe(args, config):
     while, `report` to see every host it reached, `msbctl allow` the ones that
     belong, `off`. Observe mode is the measuring step, not a destination.
     """
+    if args.json and args.action != "report":
+        die(f"observe {args.action}: --json is for the report only")
     box = Sandbox(args.name, config)
+    if args.json:
+        return observe_data(box)                    # main() prints it
     if args.action in ("on", "off"):
         _observe_set(box, "observe" if args.action == "on" else "enforce", args, config)
     else:
         _observe_report(box)
+
+
+def observe_data(box):
+    """The observe report as data, for `observe report --json` and
+    `allow --from-observe`. Each host: its port (None when seen only as a DNS
+    lookup), how it was seen ("tls" or "dns"), and the rule that decides it
+    now (deciding_rule(), so a name this cannot judge reads as not allowed)."""
+    rules = box.net_rules()
+    hosts = []
+    for (host, port), info in observed_hosts(box.name).items():
+        rule = deciding_rule(rules, host, port)
+        hosts.append({"host": host, "port": int(port) if port else None,
+                      "seen": "tls" if port else "dns",
+                      "hits": info["hits"], "first": info["first"], "last": info["last"],
+                      "allowed": bool(rule) and rule.partition("@")[0].split(":")[0] == "allow",
+                      "rule": rule})
+    # Uncovered first — that is the list you are here to read — then by traffic.
+    hosts.sort(key=lambda h: (h["allowed"], -h["hits"], h["host"]))
+    blocks = [{"var": var, "host": host, "location": where, **info}
+              for (var, host, where), info in sorted(secret_violations(box.name).items(),
+                                                     key=lambda kv: -kv[1]["hits"])]
+    return {"name": box.name, "egress_mode": box.egress_mode, "logs": runtime_logs(box.name),
+            "hosts": hosts, "secret_blocks": blocks}
+
+
+# A name observe may turn into a rule: lowercase DNS labels ending in a
+# letter-led TLD. The log's names are whatever the GUEST put in its SNI or its
+# lookups, so they are attacker-chosen, and a rule target is not only a name:
+# `public`, `private`, `suffix=…`, an address or a CIDR would each allow far
+# more than the one host it claims to be. None of those has this shape.
+OBSERVABLE_NAME = re.compile(r"(?=.{1,253}$)(?:[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9])?\.)+"
+                             r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
+
+
+def observed_targets(data, with_dns=False):
+    """(targets, skipped) from observe_data(): the `msbctl allow` arguments
+    for what was reached and no rule covers, and [(host, why)] for what was
+    left out. A name seen only in DNS carries no port and is left out unless
+    `with_dns`, which allows it on 443 — the only port a hostname rule fully
+    works on anyway."""
+    targets, skipped = [], []
+    for h in data["hosts"]:
+        if h["allowed"]:
+            continue
+        where = f"{h['host']}:{h['port']}" if h["port"] not in (None, 443) else h["host"]
+        if h["rule"]:
+            # Rules are first-match-wins and an added one goes after this.
+            skipped.append((where, f"denied by {h['rule']}, which an added rule cannot precede"))
+        elif not OBSERVABLE_NAME.fullmatch(h["host"]):
+            skipped.append((where, "not a plain DNS name"))
+        elif h["port"] == 80:
+            skipped.append((where, "plaintext :80 is denied by `base`"))
+        elif h["port"] is None and not with_dns:
+            skipped.append((where, "seen only as a DNS lookup, so its port is unknown "
+                                   "(--with-dns allows it on 443)"))
+        else:
+            targets.append(where)
+    return list(dict.fromkeys(targets)), skipped
 
 
 def _observe_set(box, mode, args, config):
@@ -5576,7 +5683,6 @@ def _observe_set(box, mode, args, config):
 
 
 def _observe_report(box):
-    seen = observed_hosts(box.name)
     logs = runtime_logs(box.name)
     say(f"{box.name}  [egress: {box.egress_mode}]")
     if not logs:
@@ -5587,7 +5693,8 @@ def _observe_report(box):
     if not box.observing:
         note(f"{DIM}this sandbox is enforcing, so only what its rules already allow"
              f" could appear here{RESET}")
-    if not seen:
+    data = observe_data(box)
+    if not data["hosts"]:
         note("nothing recorded yet — msb only writes these lines at --log-level debug,")
         note(f"which is what observe mode turns on: `msbctl observe {box.name} on`")
         # Still worth saying: these are logged at WARN, so they show up here
@@ -5596,14 +5703,8 @@ def _observe_report(box):
         report_secret_violations(box)
         return
 
-    rules = box.net_rules()
-    rows = []
-    for (host, port), info in seen.items():
-        covered = rule_allows(rules, host, port)
-        rows.append((host, port or "?", str(info["hits"]), info["last"], covered))
-    # Uncovered first — that is the list you are here to read — then by traffic.
-    rows.sort(key=lambda r: (r[4], -int(r[2]), r[0]))
-
+    rows = [(h["host"], str(h["port"] or "?"), str(h["hits"]), h["last"], h["allowed"])
+            for h in data["hosts"]]
     head = ("HOST", "PORT", "HITS", "LAST SEEN", "")
     widths = [max(len(str(r[i])) for r in [head] + rows) for i in range(4)]
     # strict=False: the last heading has no width, since nothing is padded after it.
@@ -5618,22 +5719,31 @@ def _observe_report(box):
     # it is being killed. That reads as a contradiction unless this says so.
     report_secret_violations(box)
 
-    missing = [r[0] for r in rows if not r[4]]
     if any(r[1] == "?" for r in rows):
         note("")
         note(f"{DIM}? — seen only as a DNS lookup. msb logs no port for anything but"
              f" HTTPS,{RESET}")
         note(f"{DIM}    so the port is unknown; `msbctl allow` assumes 443.{RESET}")
     note("")
+    missing = [r for r in rows if not r[4]]
     if not missing:
         note("every host reached is already covered by this sandbox's rules.")
         if box.observing:
             note(f"nothing left to collect: `msbctl observe {box.name} off --rebuild`")
         return
-    note(f"{len(missing)} host(s) not covered by the current rules. To allow them:")
-    note(f"   msbctl allow {box.name} " + " ".join(dict.fromkeys(missing)))
-    note("Read that list before running it — it is what the sandbox reached, which")
-    note("is not the same as what it ought to reach.")
+    note(f"{len(missing)} host(s) not covered by the current rules.")
+    targets, skipped = observed_targets(data, with_dns=True)
+    for where, why in skipped:
+        note(f"   {where}: {why}")
+    if targets:
+        note("To allow them:")
+        note(f"   msbctl allow {box.name} " + " ".join(targets))
+        # Only when --from-observe (no --with-dns: the TLS hosts) would add
+        # something, not when everything it takes was skipped above.
+        if observed_targets(data)[0]:
+            note(f"or every one seen over TLS: `msbctl allow {box.name} --from-observe`")
+        note("Read that list before running it — it is what the sandbox reached, which")
+        note("is not the same as what it ought to reach.")
     if box.observing:
         note(f"Then: `msbctl observe {box.name} off --rebuild`")
 
@@ -12553,7 +12663,7 @@ def json_document(body):
     then exit 0; on failure, exit 3 with {"error": {"code", "message"}}, the
     code one of Kandev's (KANDEV_ERROR_CODES). Everything else printed
     meanwhile goes to stderr. The contract of every `kandev` verb and of
-    `ls`, `show`, `stop`, `purge` and `self-update` with --json."""
+    `ls`, `show`, `stop`, `purge`, `self-update` and `observe` with --json."""
     code, data = 0, None
     with contextlib.redirect_stdout(sys.stderr):
         try:
@@ -12576,11 +12686,11 @@ def json_document(body):
     sys.exit(code)
 
 
-JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge, cmd_self_update)
+JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge, cmd_self_update, cmd_observe)
 
 
 def json_verb(args, config):
-    """`ls`, `show`, `stop`, `purge` or `self-update` with --json: one
+    """`ls`, `show`, `stop`, `purge`, `self-update` or `observe` with --json: one
     document for all the names given, built from what each call returns."""
     if kandev_key() and not kandev_settings(config)["enabled"]:
         raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
@@ -13974,8 +14084,14 @@ def build_parser():
 
     p = sub.add_parser("allow", help="add egress rules to a sandbox (host, host:port, or a full rule)")
     p.add_argument("name", help=DOT_HELP)
-    p.add_argument("targets", nargs="+", metavar="target")
-    p.add_argument("--rebuild", action="store_true", help="rebuild now so it takes effect")
+    p.add_argument("targets", nargs="*", metavar="target")
+    p.add_argument("--from-observe", action="store_true",
+                   help="also every host the observation log shows reached and no rule covers")
+    p.add_argument("--with-dns", action="store_true",
+                   help="with --from-observe: names seen only as a DNS lookup too, on 443")
+    p.add_argument("--rebuild", action=argparse.BooleanOptionalAction, default=None,
+                   help="rebuild now so it takes effect (default: asked on a terminal, "
+                        "not done off one)")
     p.set_defaults(func=cmd_allow)
 
     p = sub.add_parser("observe", help="stop blocking a sandbox and record where it goes, "
@@ -13986,6 +14102,8 @@ def build_parser():
     p.add_argument("--rebuild", action="store_true", help="rebuild now so it takes effect")
     p.add_argument("-y", "--yes", action="store_true",
                    help="skip the confirmation when turning observation on")
+    p.add_argument("--json", action="store_true",
+                   help="report as one JSON document: hosts, ports, coverage, secret blocks")
     p.set_defaults(func=cmd_observe)
 
     p = sub.add_parser("mount", help="add an extra host folder to a sandbox (read-only unless --rw)")

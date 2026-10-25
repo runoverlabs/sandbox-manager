@@ -267,13 +267,17 @@ what it can immediately and offers one rebuild at the end for the rest.
 ### `msbctl allow`
 
 ```text
-msbctl allow name|. target… [--rebuild]
+msbctl allow name|. [target…] [--from-observe [--with-dns]] [--rebuild|--no-rebuild]
 ```
 
 Add egress rules. Each target is `host` (HTTPS, :443), `host:port` (TCP),
 `host:udp:port`, or a full rule such as `allow@10.0.0.5:tcp:5432`; an IPv6
 address goes in brackets, `[fd00::5]:22`. Written to the project's
-`extra_rules`. See [Adding a host](egress.md#adding-a-host).
+`extra_rules`. `--from-observe` adds every host the [observation
+log](egress.md#finding-out-what-a-sandbox-needs) shows reached and no rule
+covers. On a terminal, it asks whether to rebuild unless `--rebuild` or
+`--no-rebuild` is given. Off one, it never asks and doesn't rebuild. See
+[Adding a host](egress.md#adding-a-host).
 
 ### `msbctl policy`
 
@@ -292,12 +296,13 @@ inside the sandbox isn't touched.
 ### `msbctl observe`
 
 ```text
-msbctl observe name|. [report|on|off] [--rebuild] [-y]
+msbctl observe name|. [report|on|off] [--rebuild] [-y] [--json]
 ```
 
 `on` stops blocking and records every host the sandbox reaches; `report` (the
 default) reads that record back and prints the `msbctl allow` line for what no
-rule covers; `off` restores deny-by-default. Turning it on asks first unless
+rule covers (`--json`: [as one document](egress.md#finding-out-what-a-sandbox-needs));
+`off` restores deny-by-default. Turning it on asks first unless
 `-y` is given. See [Observe mode](advanced.md#observe-mode-building-an-allowlist).
 
 ### `msbctl mount`
