@@ -20,6 +20,8 @@ description: The security model, the four configuration layers, and what is fixe
 What it does **not** protect: anything the agent can reach through an allowed
 host, and your project folder itself, which it can read and write by design.
 Choose rule groups the way you'd choose what a new contractor can access.
+[Compared with alternatives](alternatives.md) sets this model beside other
+agent sandboxes.
 
 ## What runs where
 
