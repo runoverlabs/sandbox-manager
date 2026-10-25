@@ -120,7 +120,7 @@ For a Kandev sandbox it's its record, with agentctl checked live.
 
 | Option | Meaning |
 | --- | --- |
-| `--json` | the essentials as one JSON document, with a `port_urls` map of each port to its URL. For each secret it says whether a value is **stored**, never what it is |
+| `--json` | the essentials as one JSON document, with a `port_urls` map of each port to its URL and `git_checkstat` (`null` where it does not apply). For each secret it says whether a value is **stored**, never what it is |
 
 ### `msbctl config`
 

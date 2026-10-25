@@ -1617,13 +1617,17 @@ class Sandbox:
         # [defaults] tools. See TOOL_KEYS and docs/content/agent-tools.md.
         self.bundles_pinned = self.entry.get("tools")
         self.identity_name = self._pick("identity", defaults.get("identity"))
-        # Registry only, like the identity's keys it may name: how git reaches
-        # GitHub is this machine's credentials, not the project's. See GIT_PUSH.
         # Registry-only, like git_push: whether a host editor watches the
         # project is a fact about this machine, not about the project.
         self.git_checkstat = self.entry.get("git_checkstat", defaults.get("git_checkstat", True))
         if not isinstance(self.git_checkstat, bool):
             die(f"{self.name}: git_checkstat {self.git_checkstat!r} is not true or false")
+        # Only a folder sandbox's project is a host folder a host editor can
+        # watch: a repo sandbox's clone is on a disk volume, and Kandev's
+        # project is an empty dir msbctl never runs per-boot plumbing in.
+        self.shares_host_index = not self.is_repo and not self.is_kandev
+        # Registry only, like the identity's keys it may name: how git reaches
+        # GitHub is this machine's credentials, not the project's. See GIT_PUSH.
         self.git_push = self.entry.get("git_push") or defaults.get("git_push", "gh")
         if self.git_push not in GIT_PUSH:
             die(f"{self.name}: git_push {self.git_push!r} is not one of "
@@ -3307,9 +3311,10 @@ def sandbox_profile_section(box, harness="claude"):
         lines += [""]
     lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push],
               ""]
-    if not box.is_repo:
-        # So the agent neither "tidies" the setting away nor, with it off,
-        # goes restoring files that only looked deleted for five seconds.
+    if box.shares_host_index:
+        # So the agent neither "tidies" the setting away nor goes restoring
+        # files that only looked deleted for five seconds: with it on, a repo
+        # the start did not reach (deeper, or cloned since) is still exposed.
         lines += [GIT_CHECKSTAT_PROFILE[box.git_checkstat], ""]
     lines += [
               f"Your project folder here is **{box.guest_project}**. If it ships agent "
@@ -3847,21 +3852,32 @@ def ensure_git_push(box):
 
 # What sandbox_profile_section() tells the agent about the shared .git/index,
 # by `git_checkstat` (folder sandboxes only; see ensure_git_checkstat()).
+_GIT_CHECKSTAT_SYMPTOM = (
+    "If `git status` suddenly reports every file deleted and untracked, the host has "
+    "just rewritten the index: wait about five seconds and run it again. Nothing was "
+    "lost; do not restore or re-add anything because of it.")
 GIT_CHECKSTAT_PROFILE = {
-    True: "`core.checkStat = minimal` is set in the project's repos' `.git/config` on "
-          "purpose: an editor on the host shares their `.git/index`, and without it the "
-          "host's git rewrites the index after every git command here. Leave it set.",
-    False: "An editor on the host may share this project's `.git/index`. If `git status` "
-           "suddenly reports every file deleted and untracked, the host has just rewritten "
-           "the index: wait about five seconds and run it again. Nothing was lost; do not "
-           "restore or re-add anything because of it.",
+    True: "An editor on the host may share this project's `.git/index`. At each start, "
+          "`core.checkStat = minimal` is put in the `.git/config` of every repo in the "
+          "project folder and up to two levels under it that does not already set "
+          "`core.checkStat`, so the host's git does not rewrite the index after every "
+          "git command here. Leave it set; a repo nested deeper or cloned since the "
+          "start lacks it until `git config core.checkStat minimal` is run in it. "
+          + _GIT_CHECKSTAT_SYMPTOM,
+    False: "An editor on the host may share this project's `.git/index`. "
+           + _GIT_CHECKSTAT_SYMPTOM,
 }
 
 
-def ensure_git_checkstat(box):
+# Holds the boot ID ensure_git_checkstat() last walked the project under.
+GIT_CHECKSTAT_MARKER = "/var/tmp/msb-git-checkstat"
+
+
+def ensure_git_checkstat(box, force=False):
     """Set core.checkStat=minimal in the project's own repos, unless one
-    already sets core.checkStat. Per boot, so an existing sandbox gets it on
-    its next start.
+    already sets core.checkStat. Once per boot, so an existing sandbox gets it
+    on its next start; `force` runs it again in this boot (`msbctl edit`
+    turning it on in a running sandbox).
 
     Without it, `.git/index` vanishes for ~5 s after any git command in the
     guest that writes it, whenever a host editor watches the repo (zed, and
@@ -3890,21 +3906,34 @@ def ensure_git_checkstat(box):
     The project folder and two levels under it are covered: a project is
     often a workspace holding several checkouts side by side, or grouped one
     folder deeper (`group/repo`), and the editor watches every one of them,
-    so stopping at the root would leave them all exposed. node_modules and
-    .venv are pruned, and so is each .git found, since the walk runs on every
-    `shell`/`exec`. Only a real `.git` DIRECTORY is touched: a linked
-    worktree's `.git` file names the gitdir of the repo it belongs to, whose
-    config is shared with it anyway, and which may be a host path that does
-    not exist in the guest.
+    so stopping at the root would leave them all exposed. It is a plain sh
+    glob, not find: a glob follows a symlinked checkout (`api ->
+    ../shared/api`) where find does not, and needs nothing a minimal image
+    may lack. Hidden folders are not walked, and node_modules is skipped.
+    Only a `.git` that is a directory is touched: a linked worktree's `.git`
+    file names the gitdir of the repo it belongs to, whose config is shared
+    with it anyway, and which may be a host path that does not exist in the
+    guest.
+
+    ensure_running() calls this on every `shell`/`exec`, so the walk and its
+    git processes are skipped when GIT_CHECKSTAT_MARKER already holds
+    this boot's ID: a marker's existence would not do, since nothing here is
+    emptied by a reboot, /run included (see ensure_podman_runtime()). A guest
+    without a boot ID just walks every time.
     """
-    if box.is_repo or not box.git_checkstat:
-        return      # a repo sandbox's clone is on a disk volume no host editor watches
-    script = ('find . -maxdepth 3 \\( -name node_modules -o -name .venv \\) -prune '
-              '-o -type d -name .git -prune -print | '
-              'while IFS= read -r g; do d=${g%/.git}; '
+    if not box.shares_host_index or not box.git_checkstat:
+        return
+    script = (f'm={GIT_CHECKSTAT_MARKER}; '
+              'b=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); '
+              + ('' if force else
+                 '[ -n "$b" ] && [ "$(cat "$m" 2>/dev/null)" = "$b" ] && exit 0; ') +
+              'for d in . */ */*/; do '
+              'case "/$d" in */node_modules/*) continue;; esac; '
+              '[ -d "$d/.git" ] || continue; '
               'git -C "$d" config --local --get core.checkStat >/dev/null '
               '|| git -C "$d" config --local core.checkStat minimal; '
-              'done')
+              'done; '
+              '[ -z "$b" ] || echo "$b" >"$m"')
     run(["msb", "exec", box.name, "--no-tty", "--workdir", box.guest_project,
          "--", "sh", "-c", script], check=False, quiet=True)
 
@@ -7996,15 +8025,15 @@ def section_git_push(box, config, ctx):
 
 
 def _summary_git_checkstat(box):
-    if box.is_repo:
-        return "not needed: the clone is on a disk volume"
+    if not box.shares_host_index:
+        return "not needed: no host editor sees the project"
     return ("core.checkStat=minimal set on every start" if box.git_checkstat
             else "left alone (core.checkStat not set)")
 
 
 def section_git_checkstat(box, config, ctx):
-    if box.is_repo:
-        note("this sandbox's clone is on a disk volume no host editor can watch: nothing to do")
+    if not box.shares_host_index:
+        note("no host editor can watch this sandbox's project: nothing to do")
         return
     note("A git-aware editor on the host (zed, any IDE that polls git) shares the project's")
     note(".git/index with the sandbox. Without core.checkStat=minimal in each repo's")
@@ -8020,7 +8049,7 @@ def section_git_checkstat(box, config, ctx):
         note("repos that already have it keep it: `git config --local --unset core.checkStat`")
         note("in one takes it out")
     elif state_of(box.name) == "running":
-        ensure_git_checkstat(Sandbox(box.name, config))
+        ensure_git_checkstat(Sandbox(box.name, config), force=True)
         note("applied")
     else:
         note("applied on the next start")
@@ -8674,7 +8703,8 @@ def show_data(box, table=None):
                          "stored": box.claude_token in claude_tokens(shared)},
         "github_token_stored": bool(own.get("GH_TOKEN")),
         "git_push": box.git_push,
-        "git_checkstat": box.git_checkstat and not box.is_repo,
+        # null where it does not apply (a repo sandbox), so false means "off".
+        "git_checkstat": box.git_checkstat if box.shares_host_index else None,
         "secrets": secrets,
         "agents": [key for key, _, _ in AGENTS if box.wants_component(key)],
         "llm": llm_rows(box),
@@ -8820,7 +8850,7 @@ def cmd_show(args, config):
     else:
         note("  git  no identity set; a repo without one cannot commit here")
     note(f"  push {_summary_git_push(box)}  (`msbctl edit {box.name}` → Git push)")
-    if not box.is_repo:
+    if box.shares_host_index:
         note(f"  index {_summary_git_checkstat(box)}  (`msbctl edit {box.name}` → Host editor)")
     if box.claude_auth == "secret":
         missing = "" if box.claude_token in claude_tokens() else f"  {RED}NOT STORED{RESET}"
