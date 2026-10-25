@@ -32,6 +32,7 @@
     msbctl reclaim <name>         give the guest's page cache back to the host
     msbctl host serve|authorize|check|autostart   run this machine as a remote host
     msbctl remote add|ls|test|rm  the machines this one drives; then HOST:name anywhere
+    msbctl completion bash|zsh|fish   a shell completion script to source
 
 Inside a registered project folder the name can be left out where it is the
 only argument (`msbctl shell`, `msbctl stop`), and `.` stands for it where more
@@ -13879,6 +13880,349 @@ def cmd_menu(args, config):
             note(f"not an option: {choice}")
 
 
+# ------------------------------------------------------------ shell completion
+#
+# `msbctl completion bash|zsh|fish` prints a script to source. Everything about
+# the command line in it (the verbs, their flags, what each positional takes)
+# is read from build_parser() as the script is printed, so it cannot drift from
+# what msbctl accepts; regenerating it after an upgrade picks up a new verb.
+# Sandbox names are not baked in: each Tab asks `msbctl _complete names`, which
+# reads the registry folder and the remotes' cached `ls` and nothing else. No
+# msb call and no ssh, so a Tab never waits on a VM or a network, and a remote
+# that was never listed simply offers none of its names.
+#
+# zsh gets its own function rather than bash's under bashcompinit: that runs
+# the bash function's body as zsh code, where arrays start at 1 and an unquoted
+# variable is not split, and both mattered.
+
+COMPLETION_SHELLS = ("bash", "zsh", "fish")
+
+
+def _completion_kind(action, func):
+    """What a positional or an option's value takes, as the scripts spell it:
+    "sandbox", "remote", "dir", "words:a,b,c", or "-" for nothing to offer."""
+    if action.choices:
+        return "words:" + ",".join(map(str, action.choices))
+    if action.dest in ("name", "names"):
+        # `remote <action> NAME` is the remote itself, not a sandbox on one.
+        return "remote" if func is cmd_remote else "sandbox"
+    if action.dest == "remote":
+        return "remote"
+    # A project folder (add, move) and the host side of a mount.
+    if action.dest == "dir" or (func is cmd_mount and action.dest == "spec"):
+        return "dir"
+    return "-"
+
+
+def completion_model():
+    """{command path: spec} for every visible verb, "" being msbctl itself and
+    "secret add" a verb's own verb. A spec: subs (the verbs one level down),
+    flags, valued (the flags that take a value), values ({flag: kind} for the
+    ones whose value can be offered), slots (one kind per positional, in
+    order) and repeat (the last slot takes more than one word)."""
+    model = {}
+
+    def walk(parser, path, func):
+        func = parser._defaults.get("func", func)
+        spec = model[path] = {"subs": [], "flags": [], "valued": [], "values": {},
+                              "slots": [], "repeat": False}
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                hidden = {c.dest for c in action._choices_actions if c.help == argparse.SUPPRESS}
+                for name, child in action.choices.items():
+                    if name not in hidden and not name.startswith("_"):
+                        spec["subs"].append(name)
+                        walk(child, f"{path} {name}".strip(), func)
+            elif action.option_strings:
+                if action.help == argparse.SUPPRESS:
+                    continue
+                spec["flags"] += action.option_strings
+                if action.nargs != 0:
+                    spec["valued"] += action.option_strings
+                    kind = _completion_kind(action, func)
+                    if kind != "-":
+                        spec["values"].update(dict.fromkeys(action.option_strings, kind))
+            elif action.nargs != argparse.REMAINDER:      # exec's command is not ours
+                spec["slots"].append(_completion_kind(action, func))
+                spec["repeat"] = action.nargs in ("*", "+")
+
+    walk(build_parser(), "", None)
+    return model
+
+
+def _sh_word(text):
+    """`text` single-quoted for sh, bash, zsh and fish alike. Nothing in the
+    model has a quote or a backslash in it (fish reads `\\'` inside quotes)."""
+    if "'" in text or "\\" in text:
+        raise ValueError(f"cannot quote {text!r} for every shell")
+    return f"'{text}'"
+
+
+def _completion_sh_tables(model):
+    """_msbctl_spec and _msbctl_value as sh: plain assignments and `case`,
+    which bash and zsh both read the same way."""
+    out = ["_msbctl_spec() {",
+           "    _msbctl_subs= _msbctl_flags= _msbctl_valued= _msbctl_slots= _msbctl_repeat=",
+           '    case "$1" in']
+    for path, spec in model.items():
+        sets = [f"_msbctl_{key}={_sh_word(' '.join(spec[key]))}"
+                for key in ("subs", "flags", "valued", "slots") if spec[key]]
+        if spec["repeat"]:
+            sets.append("_msbctl_repeat=1")
+        out.append(f"        {_sh_word(path)}) {'; '.join(sets) or ':'} ;;")
+    out += ["    esac", "}", "", "_msbctl_value() {", '    case "$1 $2" in']
+    for path, spec in model.items():
+        for flag, kind in spec["values"].items():
+            out.append(f"        {_sh_word(f'{path} {flag}'.strip())}) echo {_sh_word(kind)} ;;")
+    out += ["        *) echo - ;;", "    esac", "}"]
+    return "\n".join(out)
+
+
+def _completion_fish_tables(model):
+    out = ["function __msbctl_spec",
+           "    for var in subs flags valued slots repeat",
+           "        set -g __msbctl_$var",
+           "    end",
+           "    switch $argv[1]"]
+    for path, spec in model.items():
+        out.append(f"        case {_sh_word(path)}")
+        for key in ("subs", "flags", "valued", "slots"):
+            if spec[key]:
+                out.append(f"            set __msbctl_{key} {' '.join(map(_sh_word, spec[key]))}")
+        if spec["repeat"]:
+            out.append("            set __msbctl_repeat 1")
+    out += ["    end", "end", "", "function __msbctl_value", '    switch "$argv[1] $argv[2]"']
+    for path, spec in model.items():
+        for flag, kind in spec["values"].items():
+            out += [f"        case {_sh_word(f'{path} {flag}'.strip())}",
+                    f"            echo {_sh_word(kind)}"]
+    out += ["        case '*'", "            echo -", "    end", "end"]
+    return "\n".join(out)
+
+
+COMPLETION_BASH = r"""
+# The line up to the cursor, split by msbctl's rules rather than bash's
+# COMP_WORDS, which COMP_WORDBREAKS cuts at every `:` (host:name). Readline then
+# replaces only what follows the last `:`, so each reply loses what precedes
+# it, as bash-completion's __ltrim_colon_completions does; without that,
+# host:<Tab> became host::name.
+_msbctl() {
+    local line=${COMP_LINE:0:COMP_POINT} cur= word cmd= pos=0 value= kind=- list=
+    local prog=${COMP_WORDS[0]/#\~/$HOME}
+    local -a words
+    read -r -a words <<<"$line"
+    if [[ $line != *[[:space:]] && ${#words[@]} -gt 1 ]]; then
+        cur=${words[${#words[@]}-1]}
+        unset 'words[${#words[@]}-1]'
+    fi
+    _msbctl_spec ''
+    for word in "${words[@]:1}"; do
+        if [[ -n $value ]]; then value=; continue; fi
+        if [[ $word == -- ]]; then              # exec's command: the shell's own
+            compopt -o bashdefault -o default 2>/dev/null
+            return 0
+        fi
+        if [[ $word == -* ]]; then
+            [[ $word != *=* && " $_msbctl_valued " == *" $word "* ]] && value=$word
+            continue
+        fi
+        if [[ $pos == 0 && " $_msbctl_subs " == *" $word "* ]]; then
+            cmd=${cmd:+$cmd }$word
+            _msbctl_spec "$cmd"
+            continue
+        fi
+        pos=$((pos + 1))
+    done
+    local -a slots=($_msbctl_slots)
+    if [[ -n $value ]]; then
+        kind=$(_msbctl_value "$cmd" "$value")
+    elif [[ $cur == -* ]]; then
+        list=$_msbctl_flags
+    elif [[ $pos == 0 && -n $_msbctl_subs ]]; then
+        list=$_msbctl_subs
+    elif (( pos < ${#slots[@]} )); then
+        kind=${slots[pos]}
+    elif [[ -n $_msbctl_repeat && ${#slots[@]} -gt 0 ]]; then
+        kind=${slots[${#slots[@]}-1]}
+    fi
+    local IFS=$'\n'
+    case $kind in
+        sandbox) list=$("$prog" _complete names 2>/dev/null) ;;
+        remote) list=$("$prog" _complete remotes 2>/dev/null) ;;
+        words:*) list=${kind#words:}; list=${list//,/$'\n'} ;;
+        dir)
+            compopt -o filenames 2>/dev/null
+            COMPREPLY=($(compgen -d -- "$cur"))
+            return 0 ;;
+    esac
+    [[ -z $list ]] && return 0
+    COMPREPLY=($(compgen -W "${list// /$'\n'}" -- "$cur"))
+    local colon=${cur%"${cur##*:}"} i
+    if [[ -n $colon && $COMP_WORDBREAKS == *:* ]]; then
+        for i in "${!COMPREPLY[@]}"; do
+            COMPREPLY[i]=${COMPREPLY[i]#"$colon"}
+        done
+    fi
+}
+complete -F _msbctl msbctl
+"""
+
+COMPLETION_ZSH = r"""
+_msbctl() {
+    local cmd= word kind=- value= prog=${words[1]/#\~/$HOME} cur=${words[CURRENT]}
+    local -a slots list
+    integer pos=0 i
+    _msbctl_spec ''
+    for (( i = 2; i < CURRENT; i++ )); do
+        word=${words[i]}
+        if [[ -n $value ]]; then value=; continue; fi
+        if [[ $word == -- ]]; then              # exec's command: as if typed alone
+            shift $i words
+            (( CURRENT -= i ))
+            _normal
+            return
+        fi
+        if [[ $word == -* ]]; then
+            [[ $word != *=* && " $_msbctl_valued " == *" $word "* ]] && value=$word
+            continue
+        fi
+        if (( pos == 0 )) && [[ " $_msbctl_subs " == *" $word "* ]]; then
+            cmd=${cmd:+$cmd }$word
+            _msbctl_spec "$cmd"
+            continue
+        fi
+        (( pos++ ))
+    done
+    slots=(${=_msbctl_slots})
+    if [[ -n $value ]]; then
+        kind=$(_msbctl_value "$cmd" "$value")
+    elif [[ $cur == -* ]]; then
+        list=(${=_msbctl_flags})
+    elif (( pos == 0 )) && [[ -n $_msbctl_subs ]]; then
+        list=(${=_msbctl_subs})
+    elif (( pos < $#slots )); then
+        kind=${slots[pos + 1]}
+    elif [[ -n $_msbctl_repeat ]] && (( $#slots )); then
+        kind=${slots[-1]}
+    fi
+    case $kind in
+        sandbox) list=(${(f)"$($prog _complete names 2>/dev/null)"}) ;;
+        remote) list=(${(f)"$($prog _complete remotes 2>/dev/null)"}) ;;
+        words:*) list=(${(s:,:)${kind#words:}}) ;;
+        dir) _files -/; return ;;
+    esac
+    (( $#list )) && compadd -- $list
+}
+compdef _msbctl msbctl
+"""
+
+COMPLETION_FISH = r"""
+function __msbctl_complete
+    set -l tokens (commandline -opc)
+    set -l cur (commandline -ct)
+    set -l cmd ''
+    set -l pos 0
+    set -l value ''
+    set -l kind -
+    __msbctl_spec ''
+    for i in (seq 2 (count $tokens))
+        set -l word $tokens[$i]
+        if test -n "$value"
+            set value ''
+            continue
+        end
+        if test "$word" = --                        # exec's command: as if typed alone
+            complete -C (string join ' ' -- $tokens[(math $i + 1)..-1] $cur)
+            return
+        end
+        if string match -q -- '-*' $word
+            if not string match -q -- '*=*' $word; and contains -- $word $__msbctl_valued
+                set value $word
+            end
+            continue
+        end
+        if test $pos -eq 0; and contains -- $word $__msbctl_subs
+            set cmd (string trim -- "$cmd $word")
+            __msbctl_spec "$cmd"
+            continue
+        end
+        set pos (math $pos + 1)
+    end
+    if test -n "$value"
+        set kind (__msbctl_value "$cmd" $value)
+    else if string match -q -- '-*' $cur
+        printf '%s\n' $__msbctl_flags
+        return
+    else if test $pos -eq 0; and set -q __msbctl_subs[1]
+        printf '%s\n' $__msbctl_subs
+        return
+    else if test $pos -lt (count $__msbctl_slots)
+        set kind $__msbctl_slots[(math $pos + 1)]
+    else if test -n "$__msbctl_repeat"; and set -q __msbctl_slots[1]
+        set kind $__msbctl_slots[-1]
+    end
+    switch $kind
+        case sandbox
+            $tokens[1] _complete names 2>/dev/null
+        case remote
+            $tokens[1] _complete remotes 2>/dev/null
+        case 'words:*'
+            string split , -- (string replace -- words: '' $kind)
+        case dir
+            __fish_complete_directories $cur
+    end
+end
+
+complete -c msbctl -f -a '(__msbctl_complete)'
+"""
+
+COMPLETION_HOWTO = {
+    "bash": "# bash, in ~/.bashrc:                 source <(msbctl completion bash)",
+    "zsh": "# zsh, in ~/.zshrc after compinit:    source <(msbctl completion zsh)",
+    "fish": "# fish, once (and after an upgrade):  "
+            "msbctl completion fish > ~/.config/fish/completions/msbctl.fish",
+}
+
+
+def completion_script(shell):
+    """The script `msbctl completion <shell>` prints."""
+    model = completion_model()
+    if shell == "fish":
+        tables, body = _completion_fish_tables(model), COMPLETION_FISH
+    else:
+        tables = _completion_sh_tables(model)
+        body = COMPLETION_ZSH if shell == "zsh" else COMPLETION_BASH
+    return (f"# msbctl completion for {shell}, generated by `msbctl completion {shell}` "
+            f"of msbctl {version_string()}.\n"
+            f"{COMPLETION_HOWTO[shell]}\n"
+            "# Regenerate it after an upgrade: the verbs and flags are fixed in it,\n"
+            "# the sandbox names are asked for at each Tab.\n\n"
+            f"{tables}\n{body}")
+
+
+def cmd_completion(args):
+    """Print the completion script for a shell; sourcing it is the user's."""
+    sys.stdout.write(completion_script(args.shell))
+
+
+def cmd_complete(args):
+    """What a Tab offers, one per line: `names` is every registered sandbox and
+    each remote's as HOST:name, from the cache `ls` keeps (_remote_cache_path());
+    `remotes` is the remotes' names. Reads files only, never msb or ssh, and
+    says nothing on failure: a Tab that offers nothing is the right outcome."""
+    remotes = configured_remotes()
+    if args.what == "remotes":
+        words = sorted(remotes)
+    else:
+        words = registered()
+        for host in sorted(remotes):
+            rows = read_json(_remote_cache_path(host)).get("sandboxes") or []
+            words += sorted(f"{host}:{r['name']}" for r in rows
+                            if isinstance(r, dict) and SANDBOX_NAME.fullmatch(str(r.get("name", ""))))
+    for word in words:
+        print(word)
+
+
 def preflight(args):
     """Die unless this machine can run sandboxes: `msb` on PATH and /dev/kvm.
 
@@ -14211,6 +14555,17 @@ def build_parser():
     p.add_argument("dest", nargs="?", help="for add: user@host, as ssh takes it")
     p.set_defaults(func=cmd_remote)
 
+    p = sub.add_parser("completion", help="print a shell completion script (bash, zsh or fish) to source",
+                       formatter_class=argparse.RawDescriptionHelpFormatter,
+                       epilog="\n".join(line.lstrip("# ") for line in COMPLETION_HOWTO.values()))
+    p.add_argument("shell", choices=COMPLETION_SHELLS)
+    p.set_defaults(func=cmd_completion)
+
+    # What a Tab offers, for the scripts `completion` prints (cmd_complete()).
+    p = sub.add_parser("_complete", help=argparse.SUPPRESS)
+    p.add_argument("what", choices=["names", "remotes"])
+    p.set_defaults(func=cmd_complete)
+
     p = sub.add_parser("_agent-filter", help=argparse.SUPPRESS)
     p.add_argument("name")
     p.set_defaults(func=cmd_agent_filter)
@@ -14254,6 +14609,10 @@ def parse_cli(argv, parser=None):
 def main():
     keyring_forget()
     args = parse_cli(sys.argv[1:])
+    # Before the preflight and the config: a Tab must answer on a laptop with
+    # no msb, and quickly, and a broken config.toml only costs remote names.
+    if args.func in (cmd_completion, cmd_complete):
+        return args.func(args)
     preflight(args)
 
     try:

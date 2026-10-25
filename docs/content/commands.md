@@ -411,6 +411,29 @@ an older release, which cuts its open connections. `--json` prints
 installer's output on stderr. Under `host serve`, either key, `--version` may
 not name a release older than the running one.
 
+### `msbctl completion`
+
+```text
+msbctl completion bash|zsh|fish
+```
+
+Print a Tab-completion script for your shell. It completes the verbs, their
+flags and fixed choices (`observe . on`, `secret migrate --to keyring`), and the
+sandbox names, including `HOST:name` for each remote's sandboxes. Nothing is
+installed for you. Turn it on with one line:
+
+```console
+$ echo 'source <(msbctl completion bash)' >> ~/.bashrc
+$ echo 'source <(msbctl completion zsh)' >> ~/.zshrc      # after compinit
+$ msbctl completion fish > ~/.config/fish/completions/msbctl.fish
+```
+
+The names are looked up at each Tab from the registry and from what `msbctl ls`
+last cached for each remote. A Tab never starts `msb` or ssh, so a remote shows
+up once `ls` has listed it. The verbs and flags are fixed in the script when
+it's printed. bash and zsh print it again at each new shell. A fish file is
+written once, so write it again after an upgrade.
+
 ## Remote hosts
 
 ### `msbctl host`
