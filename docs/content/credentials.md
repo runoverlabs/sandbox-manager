@@ -5,6 +5,9 @@ order: 30
 description: Tokens a sandbox can use but never see, the filtered SSH agent, and commit signing.
 ---
 
+Read this to give a sandbox a token, an SSH key, a way to push or a signing
+key, and to see why none of them ever enters the VM.
+
 ## Secrets: usable, never visible
 
 msb-manager binds tokens with msb's `--secret ENV@HOST`. Inside the guest the
@@ -269,7 +272,7 @@ push_key = "ssh-ed25519 AAAA..."
 
 `msbctl setup` → "Git identities" picks it, preselecting the signing key,
 because one key registered with GitHub for both uses is common. Sandboxes
-[without a folder](advanced.md#sandboxes-without-a-folder) have no agent and
+[without a folder](repo-sandboxes.md) have no agent and
 always use `"gh"`.
 
 ## Commit signing

@@ -8,7 +8,7 @@ description: Run sandboxes on another Linux machine, driven over ssh by a key th
 A remote host is an ordinary msb-manager install on another Linux machine
 with KVM. `msbctl` there behaves exactly as it does here, and you drive it over
 ssh. Its sandboxes have no folder on your laptop: they are
-[cloned from a repo](advanced.md#sandboxes-without-a-folder), and they keep
+[cloned from a repo](repo-sandboxes.md), and they keep
 running, and start after a reboot, with the laptop switched off.
 
 ## What the setup protects against

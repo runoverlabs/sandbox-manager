@@ -1,7 +1,7 @@
 ---
 title: Compared with alternatives
-section: Guides
-order: 15
+section: Concepts
+order: 20
 description: How msb-manager differs from other coding-agent sandboxes such as jailoc, by which part of the agent threat each one closes.
 ---
 
@@ -36,8 +36,8 @@ msb-manager's answer, in brief (the whole of it is in
 - **The policy can't be widened from inside.** The firewall is msb's, on the
   host, and the project's policy is pinned and approved there.
 
-What remains is anything the agent can reach *through* a host you allowed, and
-the project folder itself. Choose rule groups with that in mind.
+What remains (anything an allowed host accepts, what a token may do, DNS, the
+project folder) is listed in [What it does not protect](how-it-works.md#what-it-does-not-protect).
 
 ## jailoc
 

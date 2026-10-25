@@ -116,7 +116,25 @@ If more than one project needs the same host, make it a group in your
 `config.toml` instead and give it to each sandbox with `msbctl edit` →
 "Features & agents". A group only your machine defines is written to the
 sandbox's registry entry (`extra_rule_groups`), not to the project, so it
-never reaches anyone who clones it; see [Your network](advanced.md#your-network).
+never reaches anyone who clones it; see [Hosts on your network](#hosts-on-your-network).
+
+## Hosts on your network
+
+For hosts on your LAN (a Git server, a package mirror), define a group once in
+`config.toml`, or use `msbctl setup` → "your network". If those names resolve
+to private addresses, list the group under `private_dns_groups`, so sandboxes
+that use it get `allow_private_dns` automatically.
+
+A group of your own stays on your machine. `msbctl add` and `msbctl edit` →
+"Features & agents" put it in the sandbox's registry entry as
+`extra_rule_groups`, which adds to the project's `rule_groups`, rather than
+in the project's committed `.msb/sandbox.toml`: nobody who clones the project
+has that group, and in their copy it would make every create fail with
+"unknown rule group". A shipped group you redefined keeps its name everywhere,
+so it stays in the project. If an older msbctl put one of yours in the
+project, `msbctl show` warns, and `msbctl edit` → "Features & agents" moves
+it. Machine-local groups aren't part of the [policy pin](egress.md#the-policy-pin). See
+[DNS resolution is part of the rule](egress.md#dns-resolution-is-part-of-the-rule).
 
 ## The policy pin
 
@@ -161,12 +179,32 @@ See [which keys are pinned](configuration.md#the-policy-pin).
 
 msb **never logs what it denied**, at any log level. It does log what it
 allows. So the only way to learn what a sandbox needs is to stop blocking for a
-while and write down where it goes. That's **observe mode**, covered in
-[Advanced usage](advanced.md#observe-mode-building-an-allowlist).
+while and write down where it goes. That's **observe mode**:
 
-Observe mode is set per machine, in the sandbox's registry entry, by
-`msbctl observe`. A project's `sandbox.toml` can't turn it on: an
-`egress_mode` there is ignored with a warning.
+```console
+$ msbctl observe . on --rebuild       # stop blocking, start recording
+$ #  … use the sandbox normally for a while …
+$ msbctl observe .                    # every host it reached, and which no rule covers
+$ msbctl allow . <the ones that belong>   # or --from-observe: all of them
+$ msbctl observe . off --rebuild      # back to deny-by-default
+```
+
+While observe mode is on, the sandbox is created with egress allowed by
+default, **no** `--net-rule` at all, debug logging and DNS rebind protection
+off: nothing is blocked and every host is written to the sandbox's runtime
+log. Your rules stay in the config and keep being curated; they're just not
+emitted. The report prints a ready-made `msbctl allow` line for whatever no
+rule covers.
+
+The mode lives in the sandbox's **registry entry only**, set by
+`msbctl observe`, never in `.msb/sandbox.toml`. That file is committed, and an
+unfiltered sandbox must never ship to everyone who clones the project. It's
+also writable from inside the sandbox, which must not be able to switch its
+own filtering off, so an `egress_mode` written there is ignored with a warning.
+
+The report also shows **secret-policy blocks**: requests msb killed because
+they carried a placeholder somewhere substitution isn't allowed. Those are
+logged even in normal (enforce) mode.
 
 > **Warning:** In observe mode nothing is blocked. Secrets stay protected
 > (substitution still happens on the host and only to their named hosts), but

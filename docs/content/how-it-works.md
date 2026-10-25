@@ -1,8 +1,8 @@
 ---
 title: How it works
-section: Guides
+section: Concepts
 order: 10
-description: The security model, the four configuration layers, and what is fixed at create time.
+description: The security model, what it does not protect, the four configuration layers, and what is fixed at create time.
 ---
 
 ## The security model in one table
@@ -17,9 +17,43 @@ description: The security model, the four configuration layers, and what is fixe
 | The agent edits the project's `.msb/sandbox.toml` to widen its own egress or re-aim a secret | the [policy pin](egress.md#the-policy-pin): a changed policy is shown and must be approved on the host before a rebuild applies it, and `.msb/` is read-only in the guest |
 | The central instructions get edited by the agent | `CLAUDE.md` is copied in from a read-only mount on every start |
 
-What it does **not** protect: anything the agent can reach through an allowed
-host, and your project folder itself, which it can read and write by design.
-Choose rule groups the way you'd choose what a new contractor can access.
+## What it does not protect
+
+The table is only half the model. The other half is what an agent in a sandbox
+can still do, by design or because nothing short of taking its network away
+would stop it. Choose rule groups and tokens the way you'd choose what a new
+contractor gets.
+
+- **Anything an allowed host accepts.** An allowlist decides *where* data can
+  go, not *what* goes there. If a host accepts uploads (a package registry, an
+  issue tracker, a paste service, a git server), the agent can send it your
+  code. A rule group is a list of places your project may write to, so keep
+  groups narrow and leave out the ones the project doesn't need.
+- **What a token is allowed to do.** The agent can't read a token, but it can
+  *use* it on the hosts it's bound to, with every permission it carries. A
+  GitHub token for all your repositories lets the agent push to all of them.
+  That's why [Get started](quickstart.md#the-github-token) asks for a
+  fine-grained token for one repository. The same goes for an SSH key you pick
+  with `msbctl keys`, and for the Claude token, which spends your usage.
+- **DNS.** Every sandbox can resolve names, so data spelled into a lookup
+  (`<data>.example.org`) reaches whoever runs that domain's nameservers. It's
+  slow and small, but it is a way out that no egress rule closes.
+- **Your project folder.** It's shared read-write, and anything the agent
+  writes there is yours on the host: source, build scripts, lockfiles, CI
+  workflows. Review what changed before you run or push it from the host. The
+  same is true of an [extra folder](folders.md#extra-folders) mounted
+  read-write. Only `.msb/` is protected, by the policy pin.
+- **Your model provider.** The agent sends its context, which includes your
+  code, to the endpoint it talks to. That's how an agent works, not a leak,
+  but it decides which provider is in the loop.
+- **Observe mode.** While it's on, nothing is blocked. Secrets are still
+  substituted only for their own hosts, but the agent can reach anywhere.
+- **The guest itself.** The agent runs as root in its VM. Nothing inside the
+  guest is protected from it, including its own tools and settings. The
+  central `CLAUDE.md` comes back on every start, and that is all.
+- **The hypervisor.** A bug in msb, libkrun or KVM that lets a guest out is a
+  bug in those projects. msb-manager depends on them to keep the VM a VM.
+
 [Compared with alternatives](alternatives.md) sets this model beside other
 agent sandboxes.
 

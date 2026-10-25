@@ -67,13 +67,14 @@ config, your tokens and your keys.
 
 ## Where to go next
 
-- New here? [Install](install.md), then [Get started](quickstart.md).
-- Already running a sandbox? [Everyday use](everyday.md) covers the commands
-  you'll type every day.
-- Something refused a connection? Read [Network & egress](egress.md), then
-  [Troubleshooting](troubleshooting.md).
-- Looking up a flag? See the [command reference](commands.md) and the
-  [configuration reference](configuration.md).
+The pages come in four kinds, and the menu is grouped the same way:
+
+| You want to | Read | Start with |
+| --- | --- | --- |
+| get going | **Start here**: one path, in order | [Install](install.md), then [Get started](quickstart.md), then [Everyday use](everyday.md) |
+| get one thing done | **Guides**: a task each, named for it | [Network & egress](egress.md) when something is refused, [Troubleshooting](troubleshooting.md) when something else breaks |
+| understand why | **Concepts**: the model, and what it doesn't cover | [How it works](how-it-works.md), [Compared with alternatives](alternatives.md) |
+| look something up | **Reference**: complete and terse | [Commands](commands.md), [Configuration](configuration.md), [Glossary](glossary.md) |
 
 > **Tip:** Pointing an agent at these docs? Every page has a Markdown copy
 > beside it (`install.md` next to `install.html`), [`llms.txt`](llms.txt)

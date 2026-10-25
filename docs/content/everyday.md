@@ -21,7 +21,7 @@ $ msbctl allow . example.com     # "." where more arguments follow
 
 It is designed never to guess:
 
-- **The registry decides.** The sandbox is the registered one whose project
+- **The [registry](glossary.md) decides.** The sandbox is the registered one whose project
   folder contains your current directory. If projects are nested, the deepest
   one wins, the way git finds a repo. A `.msb/` folder on its own isn't enough:
   a fresh clone of a project that commits `.msb/` isn't registered on this
@@ -38,7 +38,7 @@ It is designed never to guess:
 
 `shell` and `exec` also start in the matching subfolder: from `~/proj/src`
 you land in `/work/src` (or in `~/proj/src` itself, if the sandbox uses the
-[host's own path](advanced.md#where-the-project-appears-in-the-sandbox)).
+[host's own path](folders.md#where-the-project-appears-in-the-sandbox)).
 
 ## shell and exec
 
@@ -92,7 +92,7 @@ what's out of date inside it, and binds a key to each action:
 | `space`, `a` | select one, select all; most actions apply to every selected row |
 | `j` / `k`, `q` | move, quit |
 
-Sandboxes marked *autostart* are started when the picker opens, so their state
+Sandboxes marked [*autostart*](maintaining.md#autostart) are started when the picker opens, so their state
 and versions are current by the time the list appears. Set
 `MSB_NO_AUTOSTART=1` to skip that.
 
@@ -116,7 +116,8 @@ $ msbctl update -c claude gh apt      # update in place, no rebuild
 ```
 
 What `update` installs is recorded in the sandbox's registry entry, so a later
-rebuild reproduces it instead of quietly reverting.
+rebuild reproduces it instead of quietly reverting. See [Maintaining a
+sandbox](maintaining.md) for pins, resizing, renaming and autostart.
 
 ## Memory
 

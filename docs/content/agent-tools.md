@@ -5,6 +5,9 @@ order: 40
 description: Give every sandbox a capability your own endpoints back — web search, page reading, anything else — with one folder on the host and nothing in the project.
 ---
 
+Read this when an agent needs web search, page reading or another capability
+that would otherwise need the open internet.
+
 ## Why a tool has to come from the host
 
 An agent inside a sandbox has no internet. That is the design: egress is
