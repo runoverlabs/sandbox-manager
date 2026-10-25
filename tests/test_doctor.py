@@ -124,6 +124,40 @@ class DoctorTest(MsbctlTest):
         self.assertIn("stray", checks["orphans"]["message"])
         self.assertNotIn("api", checks["orphans"]["message"])
 
+    def test_an_entry_that_does_not_parse_is_a_finding(self):
+        self.make_folder_sandbox("web")
+        with open(self.entry_path("web"), "a", encoding="utf-8") as fh:
+            fh.write("autostart = true\n")
+        with open(self.entry_path("bad"), "w", encoding="utf-8") as fh:
+            fh.write("[[[ not toml\n")
+        code, checks, _, err = self.doctor()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(checks["registry"]["status"], "warn")
+        self.assertIn("bad (", checks["registry"]["message"])
+        self.assertIn("1 sandbox(es) marked autostart", checks["autostart"]["message"])
+
+    def test_a_secret_file_that_vanishes_is_skipped(self):
+        os.makedirs(self.m.SECRETS_DIR, mode=0o700, exist_ok=True)
+        os.chmod(self.m.SECRETS_DIR, 0o700)
+        os.symlink("/nonexistent", os.path.join(self.m.SECRETS_DIR, "old.env"))
+        code, checks, _, err = self.doctor()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(checks["secrets"]["status"], "ok")
+
+    def test_an_msb_that_hangs_or_will_not_run(self):
+        real = subprocess.run
+        for exc in (subprocess.TimeoutExpired(["msb"], 15), PermissionError(13, "Permission denied")):
+            with self.subTest(type(exc).__name__):
+                def fake(argv, *a, **kw):
+                    if argv and argv[0] == "msb" and argv[1:] in (["--help"], ["--version"]):
+                        raise exc
+                    return real(argv, *a, **kw)
+                with mock.patch.object(self.m.subprocess, "run", fake):
+                    code, checks, _, err = self.doctor()
+                self.assertEqual(code, 0, err)
+                self.assertEqual(checks["msb"]["status"], "warn")
+                self.assertNotIn("msb-doctor", checks)
+
     def test_ssh_agent_only_when_a_sandbox_may_use_a_key(self):
         self.make_folder_sandbox("web")         # ssh_keys = []: no agent needed
         _, checks, _, _ = self.doctor()
@@ -145,6 +179,7 @@ class DoctorTest(MsbctlTest):
         self.assertEqual(code, 1)
         self.assertEqual(checks["config"]["status"], "fail")
         self.assertNotIn("registry", checks)
+        self.assertNotIn("secret-store", checks)    # one cause, one failure
 
     def test_kandev_key_sees_no_operator_sandbox(self):
         self.make_folder_sandbox("web")
@@ -230,6 +265,19 @@ class RemoteDoctorTest(MsbctlTest):
         self.assertIn("WARN  swap", out)
         self.assertIn("ok    restricted", out)
         self.assertTrue(cached["ok"], cached)
+
+    def test_an_older_host_without_msb_or_kvm_failed(self):
+        check = {"msbctl": self.mine, "restricted": True, "checks": [
+            {"check": "msb", "ok": False, "detail": "no /dev/kvm"}]}
+
+        def answer(argv):
+            if "doctor" in argv[-1]:
+                return subprocess.CompletedProcess(argv, 2, "", "invalid choice: 'doctor'\n")
+            return subprocess.CompletedProcess(argv, 0, json.dumps(check), "")
+        _, out, _, _, cached = self.remote_test(answer)
+        self.assertIn("FAIL  msb", out)
+        self.assertFalse(cached["ok"])
+        self.assertIn("failed: msb", cached["summary"])
 
 
 if __name__ == "__main__":

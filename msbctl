@@ -1365,10 +1365,11 @@ def autostart_names():
     return [n for n in registered() if read_toml(registry_path_for(n)).get("autostart") is True]
 
 
-def autostart_users():
+def autostart_users(names=None):
     """What starts sandboxes with nobody logged in: each registered sandbox
-    with autostart on, and the boot unit if it is installed."""
-    users = autostart_names()
+    with autostart on (`names`, when the caller has them), and the boot unit
+    if it is installed."""
+    users = autostart_names() if names is None else list(names)
     if os.path.exists(os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)):
         users.append(AUTOSTART_UNIT)
     return users
@@ -3835,9 +3836,9 @@ def ensure_git_push(box):
 
 
 def ensure_git_checkstat(box):
-    """Set core.checkStat=minimal in the project's own repo, unless it already
-    sets core.checkStat. Per boot, so an existing sandbox gets it on its next
-    start.
+    """Set core.checkStat=minimal in the project's own repos, unless one
+    already sets core.checkStat. Per boot, so an existing sandbox gets it on
+    its next start.
 
     Without it, `.git/index` vanishes for ~5 s after any git command in the
     guest that writes it, whenever a host editor watches the repo (zed, and
@@ -3852,14 +3853,21 @@ def ensure_git_checkstat(box):
     size, which both sides agree on, leaves nothing to refresh.
 
     It lands in the repo's .git/config, on the host too, where it is equally
-    harmless. Only a top-level `.git` is touched: a linked worktree's `.git`
-    file names a host path that may not exist in the guest.
+    harmless. The project folder itself and each folder one level under it are
+    covered: a project is often a workspace holding several checkouts side by
+    side, and the editor watches every one of them, so stopping at the root
+    would leave them all exposed. Only a real `.git` DIRECTORY is touched: a
+    linked worktree's `.git` file names the gitdir of the repo it belongs to,
+    whose config is shared with it anyway, and which may be a host path that
+    does not exist in the guest.
     """
     if box.is_repo:
         return      # the clone is on a disk volume; no host editor watches it
-    script = ('[ -e .git ] || exit 0; '
-              'git config --local --get core.checkStat >/dev/null '
-              '|| git config --local core.checkStat minimal')
+    script = ('for d in . */; do '
+              '[ -d "$d/.git" ] || continue; '
+              'git -C "$d" config --local --get core.checkStat >/dev/null '
+              '|| git -C "$d" config --local core.checkStat minimal; '
+              'done')
     run(["msb", "exec", box.name, "--no-tty", "--workdir", box.guest_project,
          "--", "sh", "-c", script], check=False, quiet=True)
 
@@ -10629,15 +10637,32 @@ def _doctor(id, status, message, fix=""):
 def doctor_checks(config=None):
     """Every check, in the order `doctor` prints them. `config` None: config.toml
     did not load, which is reported and skips what needs it."""
-    out = runtime_checks() + tool_checks() + storage_checks() + hygiene_checks()
+    entries = doctor_registry()
+    autostart = [n for n, e in entries.items() if isinstance(e, dict) and e.get("autostart") is True]
+    out = (runtime_checks() + tool_checks(entries) + storage_checks(config, autostart)
+           + hygiene_checks(autostart))
     if config is None:
         out.insert(0, _doctor("config", "fail", f"{tilde(CONFIG_FILE)} does not load",
                               "`msbctl config` shows the error; `msbctl setup` → edit the file"))
     elif not kandev_key():
         # The Kandev plugin's key sees Kandev's sandboxes alone; the operator's
         # entries, their folders and keys are none of its business.
-        out += registry_checks(config)
+        out += registry_checks(config, entries)
     return out
+
+
+def doctor_registry():
+    """Each registry entry's table, or for one that does not parse the reason,
+    read once for every check: a broken entry is a finding, never the end of
+    the report (read_toml() would die)."""
+    entries = {}
+    for name in registered():
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                entries[name] = read_toml(registry_path_for(name))
+        except SystemExit as exc:
+            entries[name] = str(exc.code).replace("msbctl: ", "", 1)
+    return entries
 
 
 def runtime_checks():
@@ -10688,6 +10713,9 @@ def msb_doctor_check():
     except subprocess.TimeoutExpired:
         return _doctor("msb-doctor", "warn", "msb doctor did not answer in 60 s",
                        "run `msb doctor` by hand")
+    except OSError as exc:
+        return _doctor("msb-doctor", "fail", f"msb does not run: {exc.strerror or exc}",
+                       f"reinstall it: curl -fsSL {MSB_INSTALLER} | sh")
     lines = [ANSI.sub("", line) for line in (proc.stderr + proc.stdout).splitlines()]
     found = {kind: list(dict.fromkeys(m.group(1).strip() for m in map(rx.match, lines) if m))
              for kind, rx in (("fail", MSB_DOCTOR_FAIL), ("warn", MSB_DOCTOR_WARN))}
@@ -10703,14 +10731,20 @@ def msb_doctor_check():
 
 
 def msb_has_verb(verb):
-    """Whether `msb --help` lists `verb` as a subcommand."""
-    proc = subprocess.run(["msb", "--help"], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    """Whether `msb --help` lists `verb` as a subcommand. An msb that hangs or
+    will not run lists nothing: doctor is how one finds out it is broken."""
+    try:
+        proc = subprocess.run(["msb", "--help"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
     return any(re.match(rf"\s+{re.escape(verb)}\b", line) for line in proc.stdout.splitlines())
 
 
-def tool_checks():
+def tool_checks(entries):
     """The host programs msbctl calls: git is used, fzf and secret-tool only
-    make a feature nicer or possible. Python is the one running this."""
+    make a feature nicer or possible. Python is the one running this.
+    `entries`: doctor_registry()."""
     out = [_doctor("python", "ok", f"Python {sys.version.split()[0]}")]
     out.append(_doctor("git", "ok", "git is on PATH") if shutil.which("git") else
                _doctor("git", "warn", "git is not on PATH",
@@ -10720,7 +10754,7 @@ def tool_checks():
                        "install fzf for the picker (optional)"))
     # The token sandboxes push and use the API with; gh's own login on the host
     # is never used. Names only: stored_env() reads no keyring value.
-    holders = [n for n in registered()
+    holders = [n for n in entries
                if "GH_TOKEN" in stored_env(os.path.join(SECRETS_DIR, f"{n}.env"))]
     if "GH_TOKEN" in stored_env(GLOBAL_ENV):
         out.append(_doctor("github-token", "ok", "GH_TOKEN is stored for every sandbox"))
@@ -10733,8 +10767,9 @@ def tool_checks():
     return out
 
 
-def storage_checks():
-    """Room for sandboxes, and who can change msbctl's configuration."""
+def storage_checks(config, autostart):
+    """Room for sandboxes, and who can change msbctl's configuration. `config`
+    None skips the secret store, which only repeats that config.toml is broken."""
     out = []
     usage = msb_disk_usage()
     if usage is None:
@@ -10755,8 +10790,13 @@ def storage_checks():
     else:
         out.append(_doctor("config-dir", "ok", f"{tilde(CONFIG_DIR)} does not exist yet"))
     if os.path.isdir(SECRETS_DIR):
-        loose = [f for f in sorted(os.listdir(SECRETS_DIR))
-                 if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077]
+        loose = []
+        for f in sorted(os.listdir(SECRETS_DIR)):
+            try:
+                if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077:
+                    loose.append(f)
+            except OSError:
+                pass    # gone since listdir (a `secret rm`), or a dangling link: nothing to read
         dmode = os.stat(SECRETS_DIR).st_mode & 0o777
         out.append(_doctor("secrets", "ok" if dmode == 0o700 and not loose else "warn",
                            f"{tilde(SECRETS_DIR)} {dmode:04o}" +
@@ -10764,18 +10804,20 @@ def storage_checks():
                            f"chmod 700 {tilde(SECRETS_DIR)}; chmod 600 {tilde(SECRETS_DIR)}/*"))
     else:
         out.append(_doctor("secrets", "ok", "no secrets stored yet"))
-    out.append(secret_store_check())
+    if config is not None:
+        out.append(secret_store_check(config, autostart))
     return out
 
 
-def secret_store_check():
+def secret_store_check(config=None, autostart=None):
     """Where secret values are kept and whether that works here. Failed when
     the keyring holds values and there is no Secret Service to read them from;
     with autostart, a warning while it is locked (a boot skips what needs a
     locked one); otherwise ok (a locked keyring asks to unlock on first use,
-    and a file on an encrypted disk is the recommendation for a server anyway)."""
+    and a file on an encrypted disk is the recommendation for a server anyway).
+    `autostart`: the sandboxes marked so, when the caller has read them."""
     try:
-        store = secret_store_setting()
+        store = secret_store_setting(config)
     except SystemExit:
         return _doctor("secret-store", "fail", f"{tilde(CONFIG_FILE)} does not parse",
                        "`msbctl config` shows the error")
@@ -10789,16 +10831,17 @@ def secret_store_check():
     if held and status == "absent":
         return _doctor("secret-store", "fail", detail + " — they cannot be read here",
                        "run msbctl where the keyring is, or `msbctl secret migrate --to file`")
-    if held and autostart_users() and status != "unlocked":
+    if held and autostart_users(autostart) and status != "unlocked":
         return _doctor("secret-store", "warn", detail + " — sandboxes autostart; at boot, those "
                        "needing it are skipped while it is locked",
                        "unlock the keyring at login, or `msbctl secret migrate --to file`")
     return _doctor("secret-store", "ok", detail)
 
 
-def hygiene_checks():
+def hygiene_checks(autostart):
     """The host hygiene report (`host check`). Heuristics: none of these can
-    prove the host is safe, only point at what plainly is not, so none fails."""
+    prove the host is safe, only point at what plainly is not, so none fails.
+    `autostart`: the sandboxes marked to start at boot."""
     out = []
     user = current_user()
     try:
@@ -10829,9 +10872,14 @@ def hygiene_checks():
     check("core-dumps", dumpable == "0", f"fs.suid_dumpable = {dumpable}",
           "sysctl fs.suid_dumpable=0")
     pattern = read("/proc/sys/kernel/core_pattern") or ""
-    check("core-pattern", not pattern.startswith("|"),
-          pattern + (" (a pipe: dumps may land on disk unless its Storage=none)"
-                     if pattern.startswith("|") else ""),
+    # A pipe hands the dump to a program, usually systemd-coredump, which
+    # keeps it on disk unless told Storage=none: the default on most distros,
+    # so a finding only until that is set.
+    piped = pattern.startswith("|")
+    kept = piped and not ("systemd-coredump" in pattern and coredump_storage() == "none")
+    check("core-pattern", not kept,
+          pattern + (" (a pipe: dumps may land on disk)" if kept else
+                     " (systemd-coredump, Storage=none)" if piped else ""),
           "Storage=none in /etc/systemd/coredump.conf")
     swaps = [line.split()[0] for line in (read("/proc/swaps") or "").splitlines()[1:] if line.split()]
     # zram is compressed memory, not a disk; anything else must sit on dm-crypt.
@@ -10864,7 +10912,7 @@ def hygiene_checks():
           if restricted() else "no: this session is unrestricted")
     linger = lingering(user)
     unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
-    wanted = len(autostart_names())
+    wanted = len(autostart)
     # Only a finding when some sandbox is meant to start at boot.
     check("autostart", (linger and unit) or not wanted,
           f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
@@ -10874,14 +10922,42 @@ def hygiene_checks():
     return out
 
 
-def registry_checks(config):
+def coredump_storage():
+    """systemd-coredump's Storage= as configured (`external` when unset):
+    coredump.conf, then its drop-ins in file-name order, the last one set
+    winning, a drop-in in /etc over one of the same name below it."""
+    dropins = {}
+    for d in ("/usr/lib/systemd/coredump.conf.d", "/run/systemd/coredump.conf.d",
+              "/etc/systemd/coredump.conf.d"):
+        try:
+            dropins.update({f: os.path.join(d, f) for f in os.listdir(d) if f.endswith(".conf")})
+        except OSError:
+            pass    # no such directory
+    storage = "external"
+    for path in ["/etc/systemd/coredump.conf"] + [dropins[f] for f in sorted(dropins)]:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    key, eq, value = line.strip().partition("=")
+                    if eq and key.strip() == "Storage":
+                        storage = value.strip()
+        except OSError:
+            pass    # unreadable or absent: the defaults stand
+    return storage
+
+
+def registry_checks(config, entries):
     """Each registry entry loads, its folder is there, the agent its keys need
     is reachable, and msb has no sandbox no entry names. Each is about one
-    sandbox, so a warning: the host itself can still run the rest."""
+    sandbox, so a warning: the host itself can still run the rest.
+    `entries`: doctor_registry()."""
     out = []
-    names = registered()
+    names = list(entries)
     broken, gone, need_agent = [], [], []
     for name in names:
+        if isinstance(entries[name], str):
+            broken.append(f"{name} ({entries[name]})")
+            continue
         try:
             with contextlib.redirect_stderr(io.StringIO()):
                 box = Sandbox(name, config)
@@ -10918,15 +10994,10 @@ def registry_checks(config):
 
 
 def agent_reachable():
-    """Whether SSH_AUTH_SOCK names an agent that answers. `ssh-add -l` exits 2
-    only when it cannot talk to one; 1 is an agent holding no key."""
+    """Whether SSH_AUTH_SOCK names an agent that takes a connection, given up
+    on after a second (_agent_alive)."""
     sock = os.environ.get("SSH_AUTH_SOCK", "")
-    if not sock or not os.path.exists(sock):
-        return False
-    if not shutil.which("ssh-add"):
-        return True
-    return subprocess.run(["ssh-add", "-l"], capture_output=True,
-                          stdin=subprocess.DEVNULL).returncode != 2
+    return bool(sock) and _agent_alive(sock)
 
 
 def print_checks(checks):
@@ -13389,8 +13460,11 @@ def remote_test(name, config, batch=True):
     if data is None and proc.returncode in (2, 126):    # no such verb there, or host serve's refusal
         proc, data = ask("host", "check")
         if data is not None:
+            # Its `msb` check, false, meant no msb or no /dev/kvm: what doctor
+            # calls failed. Every other false one was hygiene; null was info.
             data["checks"] = [{"id": c.get("check", "?"),
-                               "status": {True: "ok", None: "ok"}.get(c.get("ok"), "warn"),
+                               "status": ("ok" if c.get("ok") in (True, None) else
+                                          "fail" if c.get("check") == "msb" else "warn"),
                                "message": c.get("detail", "")} for c in data.get("checks", [])]
     if data is None:
         reason = _short_reason(proc, name) if proc.returncode else "not JSON (host msbctl too old?)"
@@ -13446,7 +13520,11 @@ def local_msb_version():
     """This machine's msb version (`0.7.6`), or None without one."""
     if not shutil.which("msb"):
         return None
-    proc = subprocess.run(["msb", "--version"], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["msb", "--version"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None     # hangs or will not run: as good as none, and doctor says so
     match = MSB_VERSION.search(proc.stdout or "")
     return match.group(0) if match else None
 
