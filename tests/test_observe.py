@@ -47,9 +47,10 @@ class ObserveLoop(MsbctlTest):
     def json_run(self, *argv):
         code, out, err = self.run_main(*argv)
         try:
-            return code, json.loads(out), err
+            doc = json.loads(out)
         except ValueError:
             self.fail(f"stdout is not one JSON document: {out!r}\n{err}")
+        return code, doc, err
 
     # ------------------------------------------------------------ the report
 
