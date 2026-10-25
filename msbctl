@@ -1365,10 +1365,11 @@ def autostart_names():
     return [n for n in registered() if read_toml(registry_path_for(n)).get("autostart") is True]
 
 
-def autostart_users():
+def autostart_users(names=None):
     """What starts sandboxes with nobody logged in: each registered sandbox
-    with autostart on, and the boot unit if it is installed."""
-    users = autostart_names()
+    with autostart on (`names`, when the caller has them), and the boot unit
+    if it is installed."""
+    users = autostart_names() if names is None else list(names)
     if os.path.exists(os.path.join(SYSTEMD_USER_DIR, AUTOSTART_UNIT)):
         users.append(AUTOSTART_UNIT)
     return users
@@ -3835,9 +3836,9 @@ def ensure_git_push(box):
 
 
 def ensure_git_checkstat(box):
-    """Set core.checkStat=minimal in the project's own repo, unless it already
-    sets core.checkStat. Per boot, so an existing sandbox gets it on its next
-    start.
+    """Set core.checkStat=minimal in the project's own repos, unless one
+    already sets core.checkStat. Per boot, so an existing sandbox gets it on
+    its next start.
 
     Without it, `.git/index` vanishes for ~5 s after any git command in the
     guest that writes it, whenever a host editor watches the repo (zed, and
@@ -3852,14 +3853,21 @@ def ensure_git_checkstat(box):
     size, which both sides agree on, leaves nothing to refresh.
 
     It lands in the repo's .git/config, on the host too, where it is equally
-    harmless. Only a top-level `.git` is touched: a linked worktree's `.git`
-    file names a host path that may not exist in the guest.
+    harmless. The project folder itself and each folder one level under it are
+    covered: a project is often a workspace holding several checkouts side by
+    side, and the editor watches every one of them, so stopping at the root
+    would leave them all exposed. Only a real `.git` DIRECTORY is touched: a
+    linked worktree's `.git` file names the gitdir of the repo it belongs to,
+    whose config is shared with it anyway, and which may be a host path that
+    does not exist in the guest.
     """
     if box.is_repo:
         return      # the clone is on a disk volume; no host editor watches it
-    script = ('[ -e .git ] || exit 0; '
-              'git config --local --get core.checkStat >/dev/null '
-              '|| git config --local core.checkStat minimal')
+    script = ('for d in . */; do '
+              '[ -d "$d/.git" ] || continue; '
+              'git -C "$d" config --local --get core.checkStat >/dev/null '
+              '|| git -C "$d" config --local core.checkStat minimal; '
+              'done')
     run(["msb", "exec", box.name, "--no-tty", "--workdir", box.guest_project,
          "--", "sh", "-c", script], check=False, quiet=True)
 
@@ -10396,8 +10404,9 @@ def restricted_problem(argv, kandev=False):
     if argv in (["--version"], ["-V"]):
         return None
     if kandev:
-        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge", "self-update"):
-            return "this key runs `msbctl kandev` verbs, and ls, show, stop, purge and self-update with --json"
+        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge", "self-update", "doctor"):
+            return ("this key runs `msbctl kandev` verbs, and ls, show, stop, purge, self-update "
+                    "and doctor with --json")
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 args = build_parser().parse_args(argv)
@@ -10413,6 +10422,8 @@ def restricted_problem(argv, kandev=False):
         if args.func is cmd_self_update:
             # As for the everyday key: the Update button, never a downgrade.
             return self_update_problem(args.version) if args.version else None
+        if args.func is cmd_doctor:
+            return None         # read-only; leaves the operator's sandboxes out
         if args.func is cmd_ls:
             return None if not (args.refresh or args.porcelain or args.picker) else "ls: only --json"
         names = [args.name] if args.func is cmd_show else list(args.names or [])
@@ -10460,7 +10471,7 @@ def restricted_problem(argv, kandev=False):
     # anything among them that would apply a changed policy (create, rebuild,
     # rename) refuses under MSB_RESTRICTED. `purge` destroys unpushed work and
     # leaks nothing, so it is outside the threat as stated.
-    plain = (cmd_ls, cmd_status, cmd_show, cmd_config, cmd_start, cmd_stop, cmd_reclaim,
+    plain = (cmd_ls, cmd_status, cmd_show, cmd_config, cmd_doctor, cmd_start, cmd_stop, cmd_reclaim,
              cmd_shell, cmd_exec, cmd_update, cmd_resize, cmd_rebuild, cmd_purge, cmd_rename)
     if func in plain:
         return None
@@ -10603,21 +10614,222 @@ def host_authorize(args):
         note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
 
 
-def _check(name, ok, detail):
-    return {"check": name, "ok": ok, "detail": detail}
+# ---------------------------------------------------------------- doctor
+#
+# `msbctl doctor`: whether this machine can run sandboxes, and the fix when it
+# cannot. Read-only and never asks, so a script, `remote test` or Kandev's
+# provisioning can gate on it: exit 1 when a check failed, 0 otherwise. Every
+# check is one record, {id, status, message, fix}, status one of ok, warn,
+# fail. "fail" is kept for what stops every sandbox here (no KVM, no msb, a
+# full disk, secrets nothing can read); what concerns one sandbox, and the
+# hygiene heuristics, are "warn". `host check` is the older name of the same
+# report, kept in its own JSON shape for laptops that ask for it.
+
+# Free space under MSB_HOME, in GiB: a root disk is 16G by default and grows
+# into this space as it is written.
+DISK_WARN_GIB, DISK_FAIL_GIB = 10, 2
 
 
-def secret_store_check():
+def _doctor(id, status, message, fix=""):
+    return {"id": id, "status": status, "message": message, "fix": fix if status != "ok" else ""}
+
+
+def doctor_checks(config=None):
+    """Every check, in the order `doctor` prints them. `config` None: config.toml
+    did not load, which is reported and skips what needs it."""
+    entries = doctor_registry()
+    autostart = [n for n, e in entries.items() if isinstance(e, dict) and e.get("autostart") is True]
+    out = (runtime_checks() + tool_checks(entries) + storage_checks(config, autostart)
+           + hygiene_checks(autostart))
+    if config is None:
+        out.insert(0, _doctor("config", "fail", f"{tilde(CONFIG_FILE)} does not load",
+                              "`msbctl config` shows the error; `msbctl setup` → edit the file"))
+    else:
+        out += registry_checks(config, entries)
+    return out
+
+
+# Under the Kandev plugin's key, doctor reports what decides whether Kandev's
+# sandboxes can run: the host (KVM, msb, disk, its hygiene) and Kandev's own
+# entries. What concerns the operator's sandboxes — their names, how many hold
+# GH_TOKEN or autostart, the secret store, which Kandev never uses — is left
+# out, and a finding about shared files gives a count, never a file name (a
+# secrets file is named after its sandbox). The same line `ls`, `show` and
+# `purge` hold under that key (kandev_guard()).
+
+def doctor_registry():
+    """Each registry entry's table, or for one that does not parse the reason,
+    read once for every check: a broken entry is a finding, never the end of
+    the report (read_toml() would die)."""
+    entries = {}
+    for name in registered():
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                entries[name] = read_toml(registry_path_for(name))
+        except SystemExit as exc:
+            entries[name] = str(exc.code).replace("msbctl: ", "", 1)
+    return entries
+
+
+def runtime_checks():
+    """What every sandbox needs: KVM this user can open, and msb."""
+    kvm, user = kvm_status(), current_user()
+    if kvm == "rw":
+        out = [_doctor("kvm", "ok", "/dev/kvm is usable")]
+    elif kvm == "denied":
+        out = [_doctor("kvm", "fail", f"{user} cannot open /dev/kvm",
+                       f"add {user} to the group that owns it (usually: "
+                       f"sudo usermod -aG kvm {user}), then log in again")]
+    else:
+        out = [_doctor("kvm", "fail", "no /dev/kvm",
+                       "msbctl runs on the host, with KVM: not in a container, and in a VM "
+                       "only with nested virtualization on")]
+    msb = shutil.which("msb")
+    version = local_msb_version() if msb else None
+    if not msb:
+        out.append(_doctor("msb", "fail", "msb is not on PATH", f"install it: curl -fsSL {MSB_INSTALLER} | sh"))
+    elif version not in MSB_TESTED:
+        out.append(_doctor("msb", "warn", f"msb {version or '(unknown version)'} at {tilde(msb)}, "
+                           f"and msbctl is tested on {', '.join(MSB_TESTED)}",
+                           f"it may well work; if something breaks, msb {MSB_TESTED[-1]} is "
+                           "the one to compare with"))
+    else:
+        out.append(_doctor("msb", "ok", f"msb {version} at {tilde(msb)}"))
+    if msb and msb_has_verb("doctor"):
+        out.append(msb_doctor_check())
+    return out
+
+
+# `msb doctor` (0.7.7) writes to stderr, one line per check: `  ✓ label value`,
+# `  ✗ label value`, `warn: label: value`, then per problem `error: headline`
+# with `  → hint` lines (crates/cli/lib/commands/self_cmd.rs, run_doctor()).
+# It exits 1 when the host cannot run sandboxes. No machine-readable form, so
+# the parsing is here and only here.
+MSB_DOCTOR_FAIL = re.compile(r"^\s*(?:✗\s+|error:\s+)(.+)$")
+MSB_DOCTOR_WARN = re.compile(r"^\s*warn:\s+(.+)$")
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def msb_doctor_check():
+    """msb's own host check, as one record: its failures, else its warnings
+    (a filesystem without reflink, an optional KVM feature off), else ok."""
+    try:
+        proc = subprocess.run(["msb", "doctor"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=60)
+    except subprocess.TimeoutExpired:
+        return _doctor("msb-doctor", "warn", "msb doctor did not answer in 60 s",
+                       "run `msb doctor` by hand")
+    except OSError as exc:
+        return _doctor("msb-doctor", "fail", f"msb does not run: {exc.strerror or exc}",
+                       f"reinstall it: curl -fsSL {MSB_INSTALLER} | sh")
+    lines = [ANSI.sub("", line) for line in (proc.stderr + proc.stdout).splitlines()]
+    found = {kind: list(dict.fromkeys(m.group(1).strip() for m in map(rx.match, lines) if m))
+             for kind, rx in (("fail", MSB_DOCTOR_FAIL), ("warn", MSB_DOCTOR_WARN))}
+    fix = ("`msb doctor` explains each" +
+           ("; `msb doctor --fix` applies what it can" if any("doctor --fix" in line for line in lines)
+            else ""))
+    if proc.returncode or found["fail"]:
+        return _doctor("msb-doctor", "fail", "msb doctor: " + ("; ".join(found["fail"])
+                       or f"exit {proc.returncode}"), fix)
+    if found["warn"]:
+        return _doctor("msb-doctor", "warn", "msb doctor: " + "; ".join(found["warn"]), fix)
+    return _doctor("msb-doctor", "ok", "msb doctor: host setup is ready")
+
+
+def msb_has_verb(verb):
+    """Whether `msb --help` lists `verb` as a subcommand. An msb that hangs or
+    will not run lists nothing: doctor is how one finds out it is broken."""
+    try:
+        proc = subprocess.run(["msb", "--help"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return any(re.match(rf"\s+{re.escape(verb)}\b", line) for line in proc.stdout.splitlines())
+
+
+def tool_checks(entries):
+    """The host programs msbctl calls: git is used, fzf and secret-tool only
+    make a feature nicer or possible. Python is the one running this.
+    `entries`: doctor_registry()."""
+    out = [_doctor("python", "ok", f"Python {sys.version.split()[0]}")]
+    out.append(_doctor("git", "ok", "git is on PATH") if shutil.which("git") else
+               _doctor("git", "warn", "git is not on PATH",
+                       "install git: `add --repo` clones with it, and a folder's branch is read with it"))
+    out.append(_doctor("fzf", "ok", "fzf is on PATH") if shutil.which("fzf") else
+               _doctor("fzf", "warn", "fzf is not on PATH: menus are numbered prompts",
+                       "install fzf for the picker (optional)"))
+    if kandev_key():
+        return out      # Kandev delivers its own credentials, through agentctl
+    # The token sandboxes push and use the API with; gh's own login on the host
+    # is never used. Names only: stored_env() reads no keyring value.
+    holders = [n for n in entries
+               if "GH_TOKEN" in stored_env(os.path.join(SECRETS_DIR, f"{n}.env"))]
+    if "GH_TOKEN" in stored_env(GLOBAL_ENV):
+        out.append(_doctor("github-token", "ok", "GH_TOKEN is stored for every sandbox"))
+    elif holders:
+        out.append(_doctor("github-token", "ok", f"GH_TOKEN is stored for {len(holders)} sandbox(es)"))
+    else:
+        out.append(_doctor("github-token", "warn", "no GH_TOKEN stored: sandboxes have no GitHub API, "
+                           "and push only over ssh",
+                           "`msbctl secret set <sandbox> GH_TOKEN` (optional)"))
+    return out
+
+
+def storage_checks(config, autostart):
+    """Room for sandboxes, and who can change msbctl's configuration. `config`
+    None skips the secret store, which only repeats that config.toml is broken."""
+    out = []
+    usage = msb_disk_usage()
+    if usage is None:
+        out.append(_doctor("disk", "warn", f"cannot read the free space under {tilde(MSB_HOME)}"))
+    else:
+        free = usage.free / (1024 * MIB)
+        status = "fail" if free < DISK_FAIL_GIB else "warn" if free < DISK_WARN_GIB else "ok"
+        out.append(_doctor("disk", status, f"{free:.1f} GiB free under {tilde(MSB_HOME)}",
+                           "free some space: `msbctl cache clear`, `msbctl purge` what you no "
+                           "longer need, or `msbctl reclaim`"))
+    if os.path.isdir(CONFIG_DIR):
+        mode = os.stat(CONFIG_DIR).st_mode & 0o777
+        # Whoever can write here can write a registry entry, and an entry
+        # decides what a sandbox mounts.
+        out.append(_doctor("config-dir", "warn" if mode & 0o022 else "ok",
+                           f"{tilde(CONFIG_DIR)} is {mode:04o}",
+                           f"chmod go-w {tilde(CONFIG_DIR)}"))
+    else:
+        out.append(_doctor("config-dir", "ok", f"{tilde(CONFIG_DIR)} does not exist yet"))
+    if os.path.isdir(SECRETS_DIR):
+        loose = []
+        for f in sorted(os.listdir(SECRETS_DIR)):
+            try:
+                if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077:
+                    loose.append(f)
+            except OSError:
+                pass    # gone since listdir (a `secret rm`), or a dangling link: nothing to read
+        dmode = os.stat(SECRETS_DIR).st_mode & 0o777
+        shown = f"{len(loose)} file(s)" if kandev_key() else ", ".join(loose)
+        out.append(_doctor("secrets", "ok" if dmode == 0o700 and not loose else "warn",
+                           f"{tilde(SECRETS_DIR)} {dmode:04o}" +
+                           (f"; not 0600: {shown}" if loose else ", every file 0600"),
+                           f"chmod 700 {tilde(SECRETS_DIR)}; chmod 600 {tilde(SECRETS_DIR)}/*"))
+    else:
+        out.append(_doctor("secrets", "ok", "no secrets stored yet"))
+    if config is not None and not kandev_key():
+        out.append(secret_store_check(config, autostart))
+    return out
+
+
+def secret_store_check(config=None, autostart=None):
     """Where secret values are kept and whether that works here. Failed when
     the keyring holds values and there is no Secret Service to read them from;
-    with autostart, ok only while it is unlocked (a boot skips what needs a
-    locked one); otherwise informational (a locked keyring asks to unlock on
-    first use, and a file on an encrypted disk is the recommendation for a
-    server anyway)."""
+    with autostart, a warning while it is locked (a boot skips what needs a
+    locked one); otherwise ok (a locked keyring asks to unlock on first use,
+    and a file on an encrypted disk is the recommendation for a server anyway).
+    `autostart`: the sandboxes marked so, when the caller has read them."""
     try:
-        store = secret_store_setting()
+        store = secret_store_setting(config)
     except SystemExit:
-        return _check("secret store", False, f"{tilde(CONFIG_FILE)} does not parse")
+        return _doctor("secret-store", "fail", f"{tilde(CONFIG_FILE)} does not parse",
+                       "`msbctl config` shows the error")
     status, why = keyring_status()
     held = sum(len(v) for v in secrets_in_keyring().values())
     detail = (f'[secrets] store = "{store}"'
@@ -10626,41 +10838,38 @@ def secret_store_check():
               + f"; keyring {status}: {why}"
               + (f"; {held} value(s) in the keyring" if held else ""))
     if held and status == "absent":
-        return _check("secret store", False, detail + " — they cannot be read here")
-    if held and autostart_users():
-        return _check("secret store", status == "unlocked" or None,
-                      detail + " — sandboxes autostart; at boot, those needing it are skipped "
-                      "while it is locked")
-    return _check("secret store", None, detail)
+        return _doctor("secret-store", "fail", detail + " — they cannot be read here",
+                       "run msbctl where the keyring is, or `msbctl secret migrate --to file`")
+    if held and autostart_users(autostart) and status != "unlocked":
+        return _doctor("secret-store", "warn", detail + " — sandboxes autostart; at boot, those "
+                       "needing it are skipped while it is locked",
+                       "unlock the keyring at login, or `msbctl secret migrate --to file`")
+    return _doctor("secret-store", "ok", detail)
 
 
-def host_checks():
-    """The hygiene report. Heuristics, each labelled as such: none of these can
-    prove the host is safe, only point at what plainly is not."""
+def hygiene_checks(autostart):
+    """The host hygiene report (`host check`). Heuristics: none of these can
+    prove the host is safe, only point at what plainly is not, so none fails.
+    `autostart`: the sandboxes marked to start at boot."""
     out = []
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+    user = current_user()
     try:
         import grp
         groups = {grp.getgrgid(g).gr_name for g in os.getgroups()}
     except (ImportError, KeyError):
         groups = set()
     admin = sorted(groups & {"sudo", "wheel", "admin"})
-    out.append(_check("user", os.getuid() != 0 and not admin,
-                      f"{user}, uid {os.getuid()}" + (f", in {', '.join(admin)} (can become root)"
-                                                     if admin else "") +
-                      (" — root" if os.getuid() == 0 else "")))
+
+    def check(id, ok, message, fix=""):
+        out.append(_doctor(id, "ok" if ok else "warn", message, fix))
+
+    check("user", os.getuid() != 0 and not admin,
+          f"{user}, uid {os.getuid()}" + (f", in {', '.join(admin)} (can become root)"
+                                         if admin else "") +
+          (" — root" if os.getuid() == 0 else ""),
+          "run sandboxes as a user that cannot become root")
     home_mode = os.stat(HOME).st_mode & 0o777
-    out.append(_check("home", home_mode & 0o077 == 0, f"{tilde(HOME)} is {home_mode:04o}"))
-    if os.path.isdir(SECRETS_DIR):
-        loose = [f for f in sorted(os.listdir(SECRETS_DIR))
-                 if os.stat(os.path.join(SECRETS_DIR, f)).st_mode & 0o077]
-        dmode = os.stat(SECRETS_DIR).st_mode & 0o777
-        out.append(_check("secrets", dmode == 0o700 and not loose,
-                          f"{tilde(SECRETS_DIR)} {dmode:04o}" +
-                          (f"; not 0600: {', '.join(loose)}" if loose else ", every file 0600")))
-    else:
-        out.append(_check("secrets", True, "no secrets stored yet"))
-    out.append(secret_store_check())
+    check("home", home_mode & 0o077 == 0, f"{tilde(HOME)} is {home_mode:04o}", "chmod 700 ~")
 
     def read(path):
         try:
@@ -10669,25 +10878,34 @@ def host_checks():
         except OSError:
             return None
     dumpable = read("/proc/sys/fs/suid_dumpable")
-    out.append(_check("core dumps", dumpable == "0", f"fs.suid_dumpable = {dumpable}"))
+    check("core-dumps", dumpable == "0", f"fs.suid_dumpable = {dumpable}",
+          "sysctl fs.suid_dumpable=0")
     pattern = read("/proc/sys/kernel/core_pattern") or ""
-    out.append(_check("core pattern", None if pattern.startswith("|") else True,
-                      pattern + (" (a pipe: dumps may land on disk unless its Storage=none)"
-                                 if pattern.startswith("|") else "")))
+    # A pipe hands the dump to a program, usually systemd-coredump, which
+    # keeps it on disk unless told Storage=none: the default on most distros,
+    # so a finding only until that is set.
+    piped = pattern.startswith("|")
+    kept = piped and not ("systemd-coredump" in pattern and coredump_storage() == "none")
+    check("core-pattern", not kept,
+          pattern + (" (a pipe: dumps may land on disk)" if kept else
+                     " (systemd-coredump, Storage=none)" if piped else ""),
+          "Storage=none in /etc/systemd/coredump.conf")
     swaps = [line.split()[0] for line in (read("/proc/swaps") or "").splitlines()[1:] if line.split()]
     # zram is compressed memory, not a disk; anything else must sit on dm-crypt.
     plain = [sw for sw in swaps if not sw.startswith("/dev/zram") and not _on_dm_crypt(sw)]
-    out.append(_check("swap", not plain, "none" if not swaps else
-                      f"{', '.join(swaps)}" + (f" — not encrypted: {', '.join(plain)}" if plain
-                                              else " (in memory, or on dm-crypt)")))
+    check("swap", not plain, "none" if not swaps else
+          f"{', '.join(swaps)}" + (f" — not encrypted: {', '.join(plain)}" if plain
+                                  else " (in memory, or on dm-crypt)"),
+          "encrypt swap, or use zram")
     mounts = [line.split()[:2] for line in (read("/proc/mounts") or "").splitlines() if line.split()]
     best = max((m for m in mounts if HOME == m[1] or HOME.startswith(m[1].rstrip("/") + "/")),
                key=lambda m: len(m[1]), default=None)
     crypt = best is not None and _on_dm_crypt(best[0])
-    out.append(_check("disk", crypt, f"{tilde(HOME)} is on {best[0] if best else '?'}"
-                      f" ({best[1] if best else '?'}): "
-                      + ("dm-crypt found below it" if crypt else
-                         "no dm-crypt found below it — is the disk encrypted some other way?")))
+    check("disk-encryption", crypt, f"{tilde(HOME)} is on {best[0] if best else '?'}"
+          f" ({best[1] if best else '?'}): "
+          + ("dm-crypt found below it" if crypt else
+             "no dm-crypt found below it — is the disk encrypted some other way?"),
+          "keep ~ on an encrypted disk: it holds the secrets and every project")
     keys = []
     for line in (read(authorized_keys_path()) or "").splitlines():
         line = line.strip()
@@ -10695,26 +10913,146 @@ def host_checks():
             keys.append(line)
     open_keys = [line for line in keys if "host serve" not in line
                  and not any(part.startswith("sk-") for part in line.split()[:3])]
-    out.append(_check("authorized_keys", not open_keys,
-                      f"{len(keys)} key(s); " + (f"{len(open_keys)} can get a shell and are not sk- keys"
-                                                 if open_keys else "each is host serve or an sk- key")))
-    out.append(_check("restricted", None, "yes: this key runs under host serve"
-                      if restricted() else "no: this session is unrestricted"))
-    linger = os.path.exists(f"/var/lib/systemd/linger/{user}")
+    check("authorized-keys", not open_keys,
+          f"{len(keys)} key(s); " + (f"{len(open_keys)} can get a shell and are not sk- keys"
+                                     if open_keys else "each is host serve or an sk- key"),
+          "`msbctl host authorize` each laptop's key; keep a shell for an sk- key")
+    check("restricted", True, "yes: this key runs under host serve"
+          if restricted() else "no: this session is unrestricted")
+    if kandev_key():
+        return out      # autostart is the operator's sandboxes'
+    linger = lingering(user)
     unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
-    out.append(_check("autostart", linger and unit,
-                      f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
-                      f"{'enabled' if unit else 'not enabled'} (`msbctl host autostart install`)"))
-    msb = shutil.which("msb")
-    version = run(["msb", "--version"], capture=True, check=False).stdout.strip() if msb else ""
-    out.append(_check("msb", bool(msb) and os.path.exists("/dev/kvm"),
-                      f"{version or 'not found'}{' at ' + msb if msb else ''}, "
-                      f"/dev/kvm {'present' if os.path.exists('/dev/kvm') else 'MISSING'}"))
-    out.append(_check("msbctl", True, version_string()))
+    wanted = len(autostart)
+    # Only a finding when some sandbox is meant to start at boot.
+    check("autostart", (linger and unit) or not wanted,
+          f"linger {'on' if linger else 'off'}, {AUTOSTART_UNIT} "
+          f"{'enabled' if unit else 'not enabled'}, {wanted} sandbox(es) marked autostart",
+          "`msbctl host autostart install`, and lingering (as root: "
+          f"loginctl enable-linger {user})")
     return out
 
 
+def coredump_storage():
+    """systemd-coredump's Storage= as configured (`external` when unset):
+    coredump.conf, then its drop-ins in file-name order, the last one set
+    winning, a drop-in in /etc over one of the same name below it."""
+    dropins = {}
+    for d in ("/usr/lib/systemd/coredump.conf.d", "/run/systemd/coredump.conf.d",
+              "/etc/systemd/coredump.conf.d"):
+        try:
+            dropins.update({f: os.path.join(d, f) for f in os.listdir(d) if f.endswith(".conf")})
+        except OSError:
+            pass    # no such directory
+    storage = "external"
+    for path in ["/etc/systemd/coredump.conf"] + [dropins[f] for f in sorted(dropins)]:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    key, eq, value = line.strip().partition("=")
+                    if eq and key.strip() == "Storage":
+                        storage = value.strip()
+        except OSError:
+            pass    # unreadable or absent: the defaults stand
+    return storage
+
+
+def registry_checks(config, entries):
+    """Each registry entry loads, its folder is there, the agent its keys need
+    is reachable, and msb has no sandbox no entry names. Each is about one
+    sandbox, so a warning: the host itself can still run the rest.
+    `entries`: doctor_registry(). Under the Kandev key, Kandev's entries
+    alone: those with source = "kandev", and a k- one that does not parse
+    (`add` keeps k- names for Kandev); orphans are VMs with Kandev's label."""
+    out = []
+    scoped = kandev_key()
+    names = [n for n, e in entries.items()
+             if not scoped or (e.get("source") == "kandev" if isinstance(e, dict) else n.startswith("k-"))]
+    broken, gone, need_agent = [], [], []
+    for name in names:
+        if isinstance(entries[name], str):
+            broken.append(f"{name} ({entries[name]})")
+            continue
+        try:
+            with contextlib.redirect_stderr(io.StringIO()):
+                box = Sandbox(name, config)
+        except SystemExit as exc:
+            broken.append(f"{name} ({str(exc.code).replace('msbctl: ', '', 1)})")
+            continue
+        if not box.is_repo and not box.is_kandev and not os.path.isdir(box.project):
+            gone.append(f"{name} ({tilde(box.project)})")
+        # Every start of one that may use a key goes through the filtering
+        # agent, which dies without an agent to forward to (ensure_agent_filter).
+        if not box.is_kandev and box.ssh_keys != []:
+            need_agent.append(name)
+    out.append(_doctor("registry", "warn" if broken else "ok",
+                       f"{len(names)} {'Kandev ' if scoped else ''}sandbox(es) registered" +
+                       (f"; not loading: {'; '.join(broken)}" if broken else ""),
+                       f"fix or remove the entry under {tilde(REGISTRY_DIR)}"))
+    if gone:
+        out.append(_doctor("project-missing", "warn", f"project folder gone: {', '.join(gone)}",
+                           "`msbctl move <name> <folder>` if it moved, else `msbctl purge <name>`"))
+    if need_agent:
+        agent = agent_reachable()
+        out.append(_doctor("ssh-agent", "ok" if agent else "warn",
+                           "the SSH agent is reachable" if agent else
+                           f"no SSH agent here, and these may use a key: {', '.join(need_agent)}",
+                           "start an agent and ssh-add a key, or `msbctl keys <name>` → none"))
+    if shutil.which("msb") and scoped:
+        try:
+            orphans = sorted(set(kandev_labelled()) - set(entries))
+        except KandevError as exc:
+            out.append(_doctor("orphans", "warn", f"cannot list Kandev's VMs: {exc}",
+                               "run `msb ls` on the host"))
+        else:
+            out.append(_doctor("orphans", "warn" if orphans else "ok",
+                               f"Kandev VMs no entry names: {', '.join(orphans)}" if orphans else
+                               "every Kandev VM has a registry entry",
+                               "`msbctl host kandev reap` removes them once they are old enough"))
+    elif shutil.which("msb"):
+        orphans = sorted(set(msb_table()) - set(names))
+        out.append(_doctor("orphans", "warn" if orphans else "ok",
+                           f"msb has sandboxes no entry names: {', '.join(orphans)}" if orphans else
+                           "every msb sandbox has a registry entry",
+                           "remove what you do not need with `msb rm -f <name>` "
+                           "(`msbctl host kandev reap` for k- names)"))
+    return out
+
+
+def agent_reachable():
+    """Whether SSH_AUTH_SOCK names an agent that takes a connection, given up
+    on after a second (_agent_alive)."""
+    sock = os.environ.get("SSH_AUTH_SOCK", "")
+    return bool(sock) and _agent_alive(sock)
+
+
+def print_checks(checks):
+    for c in checks:
+        mark = {"ok": "ok  ", "warn": "WARN", "fail": "FAIL"}.get(c.get("status"), "?   ")
+        note(f"{mark}  {c.get('id', '?'):<16} {c.get('message', '')}")
+        if c.get("fix"):
+            note(f"{'':<6}{'':<16} {DIM}→ {c['fix']}{RESET}")
+
+
+def cmd_doctor(args, config):
+    checks = doctor_checks(config)
+    failed = [c["id"] for c in checks if c["status"] == "fail"]
+    if args.json:
+        print_json({"msbctl": version_string(), "restricted": restricted(),
+                    "ok": not failed, "checks": checks})
+    else:
+        say(f"Doctor  ({version_string()})")
+        print_checks(checks)
+        warned = sum(c["status"] == "warn" for c in checks)
+        print()
+        note(f"{len(failed)} failed: {', '.join(failed)}" if failed else
+             "this machine can run sandboxes" + (f" ({warned} warning(s) above)" if warned else ""))
+    if failed:
+        sys.exit(1)
+
+
 def _on_dm_crypt(device):
+
     """Whether a block device is, or sits on, a dm-crypt (LUKS) mapping: its
     device-mapper chain, walked through /sys, has a CRYPT- uuid. LVM alone is
     device-mapper too and encrypts nothing, so the name is not enough."""
@@ -10741,15 +11079,18 @@ def _on_dm_crypt(device):
     return False
 
 
-def host_check(args):
-    checks = host_checks()
+def host_check(args, config):
+    """`host check`: doctor's report under its older name, and in its older
+    JSON shape ({check, ok, detail}), which laptops before doctor ask for.
+    It never fails: the verdict is doctor's."""
+    checks = doctor_checks(config)
     if args.json:
-        print_json({"msbctl": version_string(), "restricted": restricted(), "checks": checks})
+        print_json({"msbctl": version_string(), "restricted": restricted(),
+                    "checks": [{"check": c["id"], "ok": c["status"] == "ok",
+                                "detail": c["message"]} for c in checks]})
         return
-    say("Host check (heuristics: they point at what is plainly wrong, and prove nothing)")
-    for c in checks:
-        mark = {True: "ok  ", False: "WARN", None: "info"}[c["ok"]]
-        note(f"{mark}  {c['check']:<16} {c['detail']}")
+    say("Host check (`msbctl doctor` is the same report, and fails when something does)")
+    print_checks(checks)
 
 
 SYSTEMD_USER_DIR = os.path.join(HOME, ".config", "systemd", "user")
@@ -10786,10 +11127,7 @@ WantedBy=default.target
     if shutil.which("systemctl"):
         run(["systemctl", "--user", "daemon-reload"], check=False)
         run(["systemctl", "--user", "enable", AUTOSTART_UNIT], check=False)
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
-    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
-        note("a user unit runs with nobody logged in only with lingering on; once, as root:")
-        note(f"  loginctl enable-linger {user}")
+    note_linger("a user unit")
 
 
 def cmd_host(args, config):
@@ -10807,7 +11145,7 @@ def cmd_host(args, config):
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
-        host_check(args)
+        host_check(args, config)
     elif args.action == "autostart":
         host_autostart(args)
     elif args.action == "kandev":
@@ -11923,6 +12261,19 @@ PROC_MEMINFO = "/proc/meminfo"
 PROC_UPTIME = "/proc/uptime"
 
 
+def msb_disk_usage():
+    """shutil.disk_usage of the filesystem msb keeps its sandboxes and their
+    owned disks on; before msb has made its directory, the one it will be made
+    in. None when it cannot be read."""
+    where = MSB_HOME
+    while not os.path.exists(where) and os.path.dirname(where) != where:
+        where = os.path.dirname(where)
+    try:
+        return shutil.disk_usage(where)
+    except OSError:
+        return None
+
+
 def kandev_host_facts():
     """health.host: this machine as the operator's host list shows it. Not the
     [kandev] limits (placement reads capacity), and nothing secret. Each field
@@ -11953,13 +12304,8 @@ def kandev_host_facts():
                 facts[field] = mem[key] // 1024             # kB
     with contextlib.suppress(OSError):
         facts["load_1m"] = round(os.getloadavg()[0], 2)
-    # The filesystem msb keeps its sandboxes and their owned disks on; before
-    # msb has made its directory, the one it will be made in.
-    where = MSB_HOME
-    while not os.path.exists(where) and os.path.dirname(where) != where:
-        where = os.path.dirname(where)
-    with contextlib.suppress(OSError):
-        usage = shutil.disk_usage(where)
+    usage = msb_disk_usage()
+    if usage:
         facts["disk_total_gib"] = round(usage.total / (1024 * MIB), 2)
         facts["disk_free_gib"] = round(usage.free / (1024 * MIB), 2)
     with contextlib.suppress(OSError, ValueError, IndexError):
@@ -11986,7 +12332,7 @@ def kandev_health(args, config, settings):
         "protocol": KANDEV_PROTOCOL, "features": list(KANDEV_FEATURES),
         "msbctl_version": version_string(),
         "msb_version": local_msb_version() or "",
-        "kvm": os.access("/dev/kvm", os.R_OK | os.W_OK), "enabled": settings["enabled"],
+        "kvm": kvm_status() == "rw", "enabled": settings["enabled"],
         "platform": host_platform(), "base_url": settings["base_url"],
         "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
                      "max_cpus": settings["max_cpus"], "cpus": cpus,
@@ -12875,10 +13221,7 @@ WantedBy=default.target
         # restart, not just --now: an upgrade must run the new code.
         run(["systemctl", "--user", "enable", f"{KANDEV_PROXY_UNIT}.service"], check=False)
         run(["systemctl", "--user", "restart", f"{KANDEV_PROXY_UNIT}.service"], check=False)
-    user = os.environ.get("USER") or os.environ.get("LOGNAME") or "<user>"
-    if not os.path.exists(f"/var/lib/systemd/linger/{user}"):
-        note("a user timer runs with nobody logged in only with lingering on; once, as root:")
-        note(f"  loginctl enable-linger {user}")
+    note_linger("a user timer")
 
 
 # ----------------------------------------------------------- remotes (laptop)
@@ -13125,25 +13468,42 @@ def remote_key_candidates():
 
 
 def remote_test(name, config, batch=True):
-    """Run the host's `host check --json` and say what matters from here."""
+    """Run the host's `doctor --json` and say what matters from here. A host
+    whose msbctl predates doctor is asked for `host check --json` instead."""
     dest = remote_dest(name, config)
-    # Not batch: ssh may need to ask about the host key, on the terminal.
-    proc = subprocess.run(ssh_argv(dest, tty=False, batch=batch)
-                          + [shlex.join([remote_program(name, config), "host", "check", "--json"])],
-                          capture_output=True, text=True,
-                          stdin=subprocess.DEVNULL if batch else None)
-    try:
-        data = json.loads(proc.stdout)
-    except ValueError:
+
+    def ask(*verb):
+        # Not batch: ssh may need to ask about the host key, on the terminal.
+        proc = subprocess.run(ssh_argv(dest, tty=False, batch=batch)
+                              + [shlex.join([remote_program(name, config), *verb, "--json"])],
+                              capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL if batch else None)
+        try:
+            return proc, json.loads(proc.stdout)
+        except ValueError:
+            return proc, None
+    proc, data = ask("doctor")
+    if data is None and proc.returncode in (2, 126):    # no such verb there, or host serve's refusal
+        proc, data = ask("host", "check")
+        if data is not None:
+            # Its `msb` check, false, meant no msb or no /dev/kvm: what doctor
+            # calls failed. Every other false one was hygiene; null was info.
+            data["checks"] = [{"id": c.get("check", "?"),
+                               "status": ("ok" if c.get("ok") in (True, None) else
+                                          "fail" if c.get("check") == "msb" else "warn"),
+                               "message": c.get("detail", "")} for c in data.get("checks", [])]
+    if data is None:
         reason = _short_reason(proc, name) if proc.returncode else "not JSON (host msbctl too old?)"
         write_json(os.path.join(REMOTES_DIR, f"{name}.test.json"),
                    {"at": time.time(), "ok": False, "summary": reason})
         die(f"{name} ({dest}): {reason}")
     say(f"{name}  {dest}")
-    for c in data.get("checks", []):
-        mark = {True: "ok  ", False: "WARN", None: "info"}[c.get("ok")]
-        note(f"{mark}  {c.get('check', '?'):<16} {c.get('detail', '')}")
+    print_checks(data.get("checks", []))
     problems = []
+    failed = [str(c.get("id", "?")) for c in data.get("checks", []) if c.get("status") == "fail"]
+    if failed:
+        problems.append(f"failed: {', '.join(failed)}")
+        warn(f"{name} cannot run sandboxes until these are fixed: {', '.join(failed)}")
     if not data.get("restricted"):
         problems.append("this key is not restricted")
         warn("this key can get a shell on the host: run `msbctl host authorize \"<this key>\"` "
@@ -13176,13 +13536,21 @@ sed 's/^    get_latest_version$/    VERSION="v'"$2"'"/' "$t/install.sh" > "$t/pi
 sh "$t/pinned.sh"
 """
 MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
+# The msb releases msbctl's behaviour has been checked against (the comments
+# that say "verified on 0.7.6" are about these). Another one may well work, but
+# its flags, its log lines and `msb ls` output are unchecked: `doctor` warns.
+MSB_TESTED = ("0.7.6", "0.7.7")
 
 
 def local_msb_version():
     """This machine's msb version (`0.7.6`), or None without one."""
     if not shutil.which("msb"):
         return None
-    proc = subprocess.run(["msb", "--version"], capture_output=True, text=True)
+    try:
+        proc = subprocess.run(["msb", "--version"], capture_output=True, text=True,
+                              stdin=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None     # hangs or will not run: as good as none, and doctor says so
     match = MSB_VERSION.search(proc.stdout or "")
     return match.group(0) if match else None
 
@@ -14310,7 +14678,8 @@ def preflight(args):
     `config` only reads files. One function, so the tests and the screenshot
     harness replace exactly this and nothing else.
     """
-    if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update, cmd_secret_migrate):
+    if args.func in (cmd_agent_filter, cmd_config, cmd_setup, cmd_self_update, cmd_secret_migrate,
+                     cmd_doctor):        # doctor reports a missing msb or /dev/kvm itself
         return
     # `host check` reports a missing msb or /dev/kvm itself; the other host
     # verbs need neither (serve re-runs msbctl, which checks then). `kandev`
@@ -14336,9 +14705,38 @@ def local_problem():
     """Why this machine cannot run sandboxes, or None."""
     if not shutil.which("msb"):
         return "msb is not on PATH"
-    if not os.path.exists("/dev/kvm"):
+    if kvm_status() == "missing":
         return "no /dev/kvm — msbctl runs on the host, not inside a container"
     return None
+
+
+# A name a test can point elsewhere.
+KVM_DEVICE = "/dev/kvm"
+
+
+def kvm_status():
+    """"rw" when this user can open /dev/kvm, "denied" when it exists and they
+    cannot (usually: not in the kvm group), "missing" without one (no KVM, a
+    container, or a VM without nested virtualization). The same three words
+    REMOTE_PROBE prints for a remote host."""
+    if os.access(KVM_DEVICE, os.R_OK | os.W_OK):
+        return "rw"
+    return "denied" if os.path.exists(KVM_DEVICE) else "missing"
+
+
+def current_user():
+    return os.environ.get("USER") or os.environ.get("LOGNAME") or str(os.getuid())
+
+
+def lingering(user=None):
+    """Whether systemd keeps this user's units running with nobody logged in."""
+    return os.path.exists(f"/var/lib/systemd/linger/{user or current_user()}")
+
+
+def note_linger(what):
+    if not lingering():
+        note(f"{what} runs with nobody logged in only with lingering on; once, as root:")
+        note(f"  loginctl enable-linger {current_user()}")
 
 
 def verb_args(verb, **values):
@@ -14473,6 +14871,12 @@ def build_parser():
 
     p = sub.add_parser("config", help="show the merged configuration and where each value is from")
     p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("doctor", help="check that this machine can run sandboxes, and say how "
+                                      "to fix what is not right (exit 1 when a check fails)")
+    p.add_argument("--json", action="store_true",
+                   help='print {"checks": [{id, status, message, fix}, ...]} and nothing else')
+    p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("secret", help="add, remove or list extra secrets for a sandbox, "
                                       "or move every stored value to the keyring or back")
@@ -14696,7 +15100,8 @@ def main():
         try:
             config = load_config()
         except SystemExit:
-            if args.func not in (cmd_setup, cmd_self_update):   # these can still work with a broken config.toml
+            # These can still work with a broken config.toml (doctor reports it).
+            if args.func not in (cmd_setup, cmd_self_update, cmd_doctor):
                 raise
             config = None
         raw_argv = sys.argv[1:]

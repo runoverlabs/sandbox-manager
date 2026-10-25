@@ -44,7 +44,7 @@ $ curl -fsSL https://github.com/runoverlabs/sandbox-manager/releases/latest/down
 $ msbctl host authorize "ssh-ed25519 AAAA... you@laptop"     # the laptop's everyday key
 $ msbctl host authorize "sk-ssh-ed25519@openssh.com AAAA... you@laptop" --admin   # optional
 $ msbctl host autostart install
-$ msbctl host check
+$ msbctl doctor
 ```
 
 `host authorize` writes the `authorized_keys` line:
@@ -61,7 +61,9 @@ forced command is there to contain.
 `msbctl start --autostart` at boot. A user unit runs with nobody logged in only
 with lingering on, once, as root: `loginctl enable-linger msb`.
 
-`host check` reports what it can see, as heuristics: whether the user can
+`doctor` says whether the host can run sandboxes (KVM, msb, disk, the
+registry; see [Commands](commands.md#msbctl-doctor)) and exits 1 when it
+can't. Its last part, also available as `host check`, reports what it can see as heuristics: whether the user can
 become root, the modes of the home and secrets directories, where secret values
 are stored ([file or keyring](credentials.md#keeping-the-values-in-the-keyring)), core dumps, swap,
 whether the disk holding the home sits on dm-crypt, whether every
@@ -109,8 +111,8 @@ Without a terminal, `remote add` records `[remotes.sbx-01]` in your
 `config.toml`, prints the `msbctl host authorize` line to run on the host
 (listing the keys in your agent and `~/.ssh`), and tests the connection.
 `msbctl remote test sbx-01` runs the
-host's `host check` again from here and warns if your key isn't the restricted
-one or the two msbctl versions differ. `remote ls` lists them with the last
+host's `doctor` again from here and warns if a check failed there, if your key
+isn't the restricted one, or if the two msbctl versions differ. `remote ls` lists them with the last
 test's result, `remote rm` forgets one (the host is untouched).
 
 Then `msbctl add` (or the menu's **register a new project**) asks where the
@@ -155,7 +157,7 @@ $ ssh -t msb@host -- 'msbctl shell webshop'
 
 | Command | Allowed |
 | --- | --- |
-| `ls`, `status`, `show`, `config`, `start` (and `--autostart`), `stop`, `reclaim`, `shell`, `exec`, `update`, `resize`, `rebuild`, `purge`, `rename`, `--version` | yes |
+| `ls`, `status`, `show`, `config`, `doctor`, `start` (and `--autostart`), `stop`, `reclaim`, `shell`, `exec`, `update`, `resize`, `rebuild`, `purge`, `rename`, `--version` | yes |
 | `self-update` | with no `--version`, or one not older than the running release (an older one is the way back to a weaker `host serve`) |
 | `cache` | `ls`, `clear` |
 | `observe` | `report`, `off` (`on` turns egress filtering off) |

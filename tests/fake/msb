@@ -10,6 +10,9 @@ refuses anything it does not know so that an unexpected call fails loudly.
     FAKE_MSB_READ_STDIN  if set, `exec` reads its stdin and logs its sha256 and
                        length as "stdin" (never the bytes: they may be a secret)
     FAKE_MSB_FAIL      a verb (`create`, `pull`, …) that fails with exit 1
+    FAKE_MSB_VERSION   what `--version` says (default 0.7.7)
+    FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.7's
+                       does: "ok", "warn" (exit 0 with a warning) or "fail"
 
 `ls` prints the text table msbctl's msb_table() parses (a header, then
 `name image state created`); keep scripts/screenshots/bin/msb on the same shape.
@@ -106,7 +109,23 @@ def main():
     state = load()
     verb = argv[:1]
     if argv == ["--version"]:
-        print("msb 0.7.7")
+        print(f"msb {os.environ.get('FAKE_MSB_VERSION', '0.7.7')}")
+    elif argv == ["--help"]:
+        print("Usage: msb <COMMAND>\n\nCommands:\n  create  Create a sandbox\n  ls      List sandboxes")
+        if os.environ.get("FAKE_MSB_DOCTOR"):
+            print("  doctor  Check this host")
+    elif verb == ["doctor"] and os.environ.get("FAKE_MSB_DOCTOR"):
+        mode = os.environ["FAKE_MSB_DOCTOR"]
+        say = sys.stderr.write
+        say("  • Platform            Linux x86_64\n  ✓ msb                 /x/bin/msb\n")
+        if mode == "fail":
+            say("  ✗ KVM access          permission denied\n"
+                "error: /dev/kvm is not accessible\n  → fix: add your user to the kvm group\n"
+                "  → apply automatically: msb doctor --fix\n")
+            sys.exit(1)
+        if mode == "warn":
+            say("warn: Root clone: copy fallback — reflink unavailable\n")
+        say("  ✓ Host setup is ready.\n")
     elif verb == ["ls"]:
         ls(argv, state)
     elif verb == ["pull"]:

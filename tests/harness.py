@@ -76,7 +76,7 @@ class MsbctlTest(TestCase):
         })
         for var in ("SSH_AUTH_SOCK", "GH_TOKEN", "MSB_RESTRICTED", "SSH_ORIGINAL_COMMAND",
                     "CLAUDE_CODE_OAUTH_TOKEN", "FAKE_MSB_EXEC_OUT", "FAKE_MSB_READ_STDIN",
-                    "FAKE_MSB_FAIL", "MSB_CONFIG_PATH", "FAKE_TAILSCALE_NO_CERTS",
+                    "FAKE_MSB_FAIL", "FAKE_MSB_VERSION", "FAKE_MSB_DOCTOR", "MSB_CONFIG_PATH", "FAKE_TAILSCALE_NO_CERTS",
                     # No keyring unless a test sets one up: the fake busctl
                     # answers "absent" and the fake secret-tool fails loudly.
                     "FAKE_KEYRING", "FAKE_KEYRING_FAIL", "FAKE_KEYRING_PROMPT",

@@ -179,7 +179,7 @@ class RemoteTest(MsbctlTest):
 
     def test_remote_test_warns_about_an_unrestricted_key(self):
         check = {"msbctl": "0.0.1", "restricted": False, "checks": [
-            {"check": "user", "ok": True, "detail": "msb"}]}
+            {"id": "user", "status": "ok", "message": "msb", "fix": ""}]}
         patch, _ = self.ssh_answers(lambda argv: subprocess.CompletedProcess(argv, 0, json.dumps(check), ""))
         with patch:
             code, out, err = self.run_main("remote", "test", "sbx-01")

@@ -47,7 +47,7 @@ class RemoteBase(MsbctlTest):
                 return subprocess.CompletedProcess(argv, probe_code, probe_text, probe_err)
             if "grep -F" in cmd:
                 return subprocess.CompletedProcess(argv, 0 if grep else 1, grep, "")
-            if "host check --json" in cmd:
+            if "doctor --json" in cmd:
                 return subprocess.CompletedProcess(argv, 0, json.dumps(CHECK), "")
             return subprocess.CompletedProcess(argv, 0, "", "")
         return mock.patch.object(self.m.subprocess, "run", fake), calls
@@ -72,7 +72,7 @@ class RemoteSetupTest(RemoteBase):
         self.assertTrue(pinned[0].endswith(f"sh {self.m.MSB_RELEASES} 0.7.7"), pinned[0])
         self.assertTrue(any("get.sh" in c and "| sh" in c for c in cmds), cmds)
         self.assertFalse(any("host autostart" in c or "authorize" in c for c in cmds), cmds)
-        self.assertTrue(any("host check --json" in c for c in cmds))
+        self.assertTrue(any("doctor --json" in c for c in cmds))
 
     def test_a_different_msb_there_is_offered_this_one(self):
         patch, calls = self.ssh(probe(msb="msb 0.7.8", msbctl=f"msbctl {self.mine}"))
@@ -111,7 +111,7 @@ class RemoteSetupTest(RemoteBase):
         self.assertEqual(code, 0, err)
         self.assertEqual(self.program(), found)
         self.assertIn(f"using {found}", out)
-        self.assertEqual(calls[-1][-1], f"{found} host check --json")
+        self.assertEqual(calls[-1][-1], f"{found} doctor --json")
         patch, calls = self.ssh()
         with patch:
             self.run_main("ls")
@@ -288,7 +288,7 @@ class ShareSettingsTest(RemoteBase):
             cmd = argv[-1]
             if "linger=" in cmd:
                 return subprocess.CompletedProcess(argv, 0, probe(msbctl=f"msbctl {self.mine}"), "")
-            if "host check --json" in cmd:
+            if "doctor --json" in cmd:
                 return subprocess.CompletedProcess(argv, 0, json.dumps(CHECK), "")
             if answer and "msbctl setup" in cmd:
                 return answer(argv, kw)
