@@ -14,7 +14,7 @@ what a sandbox actually needs is a round trip:
 $ msbctl observe . on --rebuild       # stop blocking, start recording
 $ #  … use the sandbox normally for a while …
 $ msbctl observe .                    # every host it reached, and which no rule covers
-$ msbctl allow . <the ones that belong>
+$ msbctl allow . <the ones that belong>   # or --from-observe: all of them
 $ msbctl observe . off --rebuild      # back to deny-by-default
 ```
 

@@ -172,3 +172,36 @@ Observe mode is set per machine, in the sandbox's registry entry, by
 > (substitution still happens on the host and only to their named hosts), but
 > the agent can reach anywhere. Turn it off as soon as you've collected what
 > you need.
+
+The whole loop runs without a terminal, so a script or an agent outside the
+sandbox can drive it:
+
+```console
+$ msbctl observe . on -y --rebuild
+$ #  … run the workload …
+$ msbctl observe . --json                     # what was reached, and what covers it
+$ msbctl allow . --from-observe --rebuild     # every uncovered host, one write
+$ msbctl observe . off --rebuild
+```
+
+`--from-observe` takes the hosts seen over TLS, each on the port it was seen
+on. A name seen only as a DNS lookup carries no port, so it's skipped unless
+you add `--with-dns`, which allows it on 443. It also skips a name an earlier
+`deny` rule decides (an added rule can't come before it), plaintext `:80`, and
+anything that isn't a plain DNS name: the log's names are whatever the guest
+put in its requests, and a target like `public` would allow far more than one
+host. That's also why the result is worth a look before it's committed. It's
+what the sandbox reached, not what it ought to reach.
+
+Coverage is judged by name only. A rule on an address, a CIDR, `public` or
+`private` can't be matched against a name without resolving it the way the
+guest would, so it's treated as not deciding anything. A host allowed that way
+gets a redundant rule, which does no harm. A host denied that way, by
+`deny@public` say, gets an allow appended after the deny, and the deny still
+wins, so first take out the rule that blocks it.
+
+`observe --json` prints one document: `hosts` (each with `host`, `port`,
+`null` when seen only in DNS, `seen` as `"tls"` or `"dns"`, `hits`, `first`,
+`last`, `allowed`, and the `rule` that decides it), `secret_blocks`, `logs` and
+`egress_mode`. Like the other `--json` verbs, it exits 3 with `{"error": …}` on
+failure.
