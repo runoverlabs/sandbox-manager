@@ -1619,6 +1619,11 @@ class Sandbox:
         self.identity_name = self._pick("identity", defaults.get("identity"))
         # Registry only, like the identity's keys it may name: how git reaches
         # GitHub is this machine's credentials, not the project's. See GIT_PUSH.
+        # Registry-only, like git_push: whether a host editor watches the
+        # project is a fact about this machine, not about the project.
+        self.git_checkstat = self.entry.get("git_checkstat", defaults.get("git_checkstat", True))
+        if not isinstance(self.git_checkstat, bool):
+            die(f"{self.name}: git_checkstat {self.git_checkstat!r} is not true or false")
         self.git_push = self.entry.get("git_push") or defaults.get("git_push", "gh")
         if self.git_push not in GIT_PUSH:
             die(f"{self.name}: git_push {self.git_push!r} is not one of "
@@ -3301,7 +3306,12 @@ def sandbox_profile_section(box, harness="claude"):
         lines += [f"- **{name}**: {spec['description']}" for name, spec in tools]
         lines += [""]
     lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push],
-              "",
+              ""]
+    if not box.is_repo:
+        # So the agent neither "tidies" the setting away nor, with it off,
+        # goes restoring files that only looked deleted for five seconds.
+        lines += [GIT_CHECKSTAT_PROFILE[box.git_checkstat], ""]
+    lines += [
               f"Your project folder here is **{box.guest_project}**. If it ships agent "
               f"skills they are in `{box.guest_project}/.agents/skills/` — plain files, "
               "readable by any agent, not only the ones that load them by name."]
@@ -3835,6 +3845,19 @@ def ensure_git_push(box):
              f"`msbctl keys {box.name}`, or `msbctl edit {box.name}` → Git push → gh")
 
 
+# What sandbox_profile_section() tells the agent about the shared .git/index,
+# by `git_checkstat` (folder sandboxes only; see ensure_git_checkstat()).
+GIT_CHECKSTAT_PROFILE = {
+    True: "`core.checkStat = minimal` is set in the project's repos' `.git/config` on "
+          "purpose: an editor on the host shares their `.git/index`, and without it the "
+          "host's git rewrites the index after every git command here. Leave it set.",
+    False: "An editor on the host may share this project's `.git/index`. If `git status` "
+           "suddenly reports every file deleted and untracked, the host has just rewritten "
+           "the index: wait about five seconds and run it again. Nothing was lost; do not "
+           "restore or re-add anything because of it.",
+}
+
+
 def ensure_git_checkstat(box):
     """Set core.checkStat=minimal in the project's own repos, unless one
     already sets core.checkStat. Per boot, so an existing sandbox gets it on
@@ -3852,19 +3875,33 @@ def ensure_git_checkstat(box):
     against the work tree ignores it (git 2.55). Comparing only mtime and
     size, which both sides agree on, leaves nothing to refresh.
 
-    It lands in the repo's .git/config, on the host too, where it is equally
-    harmless. The project folder itself and each folder one level under it are
-    covered: a project is often a workspace holding several checkouts side by
-    side, and the editor watches every one of them, so stopping at the root
-    would leave them all exposed. Only a real `.git` DIRECTORY is touched: a
-    linked worktree's `.git` file names the gitdir of the repo it belongs to,
-    whose config is shared with it anyway, and which may be a host path that
-    does not exist in the guest.
+    It lands in the repo's .git/config, which is the point: the git doing
+    the damage is the HOST's, and .git/config is the one file both sides read
+    (the operator's ~/.gitconfig is out of bounds, and a guest-only --system
+    setting would leave the host rewriting the index). Inside the guest it
+    costs nothing: uid, gid and dev are constants there, and git's
+    racily-clean rule still catches a same-size edit in the same second. Set
+    from the guest rather than by msbctl on the host because a guest write
+    keeps the guest's own view coherent, where a host write is exactly what
+    blinds it. Only the value is ever added: a repo that already sets
+    core.checkStat, to anything, is left as it is, and `git_checkstat =
+    false` stops adding it without taking it out again.
+
+    The project folder and two levels under it are covered: a project is
+    often a workspace holding several checkouts side by side, or grouped one
+    folder deeper (`group/repo`), and the editor watches every one of them,
+    so stopping at the root would leave them all exposed. node_modules and
+    .venv are pruned, and so is each .git found, since the walk runs on every
+    `shell`/`exec`. Only a real `.git` DIRECTORY is touched: a linked
+    worktree's `.git` file names the gitdir of the repo it belongs to, whose
+    config is shared with it anyway, and which may be a host path that does
+    not exist in the guest.
     """
-    if box.is_repo:
-        return      # the clone is on a disk volume; no host editor watches it
-    script = ('for d in . */; do '
-              '[ -d "$d/.git" ] || continue; '
+    if box.is_repo or not box.git_checkstat:
+        return      # a repo sandbox's clone is on a disk volume no host editor watches
+    script = ('find . -maxdepth 3 \\( -name node_modules -o -name .venv \\) -prune '
+              '-o -type d -name .git -prune -print | '
+              'while IFS= read -r g; do d=${g%/.git}; '
               'git -C "$d" config --local --get core.checkStat >/dev/null '
               '|| git -C "$d" config --local core.checkStat minimal; '
               'done')
@@ -6971,6 +7008,7 @@ def section_defaults(config, ctx):
             f"egress groups           {', '.join(d.get('rule_groups', [])) or 'none'}",
             f"size                    {d.get('cpus', '?')} cpu, {d.get('memory', '?')}, {d.get('root_disk', '?')} disk",
             f"project path in guest   {d.get('guest_path', GUEST_PROJECT)}",
+            f"host editor git fix     {'on' if d.get('git_checkstat', True) else 'off'}",
             "back"], 0)
         if action.startswith("projects"):
             note("`msbctl add myproject` creates it inside this folder.")
@@ -6991,6 +7029,13 @@ def section_defaults(config, ctx):
         elif action.startswith("project path"):
             chosen = pick_guest_path(None, d.get("guest_path", GUEST_PROJECT))
             set_toml_key(CONFIG_FILE, "guest_path", chosen, table="defaults")
+        elif action.startswith("host editor"):
+            note("core.checkStat=minimal in each mounted project's repos, so a git-aware")
+            note("editor on this machine does not rewrite .git/index under the sandbox's git.")
+            note("A sandbox's own `git_checkstat` (msbctl edit → Host editor) wins.")
+            on = choose_one("set it by default", ["on", "off"],
+                            0 if d.get("git_checkstat", True) else 1) == "on"
+            set_toml_key(CONFIG_FILE, "git_checkstat", on, table="defaults")
         else:
             return
 
@@ -7950,6 +7995,37 @@ def section_git_push(box, config, ctx):
         note("applied on the next start")
 
 
+def _summary_git_checkstat(box):
+    if box.is_repo:
+        return "not needed: the clone is on a disk volume"
+    return ("core.checkStat=minimal set on every start" if box.git_checkstat
+            else "left alone (core.checkStat not set)")
+
+
+def section_git_checkstat(box, config, ctx):
+    if box.is_repo:
+        note("this sandbox's clone is on a disk volume no host editor can watch: nothing to do")
+        return
+    note("A git-aware editor on the host (zed, any IDE that polls git) shares the project's")
+    note(".git/index with the sandbox. Without core.checkStat=minimal in each repo's")
+    note(".git/config, the host rewrites the index after every git command in the sandbox,")
+    note("and for ~5 s git there sees every file as deleted and untracked.")
+    on = choose_one("set core.checkStat=minimal in the project's repos",
+                    ["yes, on every start", "no, leave the repos alone"],
+                    0 if box.git_checkstat else 1).startswith("yes")
+    default = config.get("defaults", {}).get("git_checkstat", True)
+    # Back to following [defaults] when it matches, like the other registry keys.
+    set_toml_key(registry_path(box), "git_checkstat", None if on == default else on)
+    if not on:
+        note("repos that already have it keep it: `git config --local --unset core.checkStat`")
+        note("in one takes it out")
+    elif state_of(box.name) == "running":
+        ensure_git_checkstat(Sandbox(box.name, config))
+        note("applied")
+    else:
+        note("applied on the next start")
+
+
 def _summary_identity(box):
     return f"{box.identity_name or 'no identity'}, autostart {'on' if box.autostart else 'off'}"
 
@@ -8152,6 +8228,7 @@ EDIT_SECTIONS = [
     ("Egress rules", section_egress, _summary_egress),
     ("SSH keys", section_keys, _summary_keys),
     ("Git push", section_git_push, _summary_git_push),
+    ("Host editor", section_git_checkstat, _summary_git_checkstat),
     ("Claude token", section_claude_token, _summary_claude_token),
     ("Models for pi", section_llm, _summary_llm),
     ("Agent tools", section_agent_tools, _summary_agent_tools),
@@ -8597,6 +8674,7 @@ def show_data(box, table=None):
                          "stored": box.claude_token in claude_tokens(shared)},
         "github_token_stored": bool(own.get("GH_TOKEN")),
         "git_push": box.git_push,
+        "git_checkstat": box.git_checkstat and not box.is_repo,
         "secrets": secrets,
         "agents": [key for key, _, _ in AGENTS if box.wants_component(key)],
         "llm": llm_rows(box),
@@ -8742,6 +8820,8 @@ def cmd_show(args, config):
     else:
         note("  git  no identity set; a repo without one cannot commit here")
     note(f"  push {_summary_git_push(box)}  (`msbctl edit {box.name}` → Git push)")
+    if not box.is_repo:
+        note(f"  index {_summary_git_checkstat(box)}  (`msbctl edit {box.name}` → Host editor)")
     if box.claude_auth == "secret":
         missing = "" if box.claude_token in claude_tokens() else f"  {RED}NOT STORED{RESET}"
         note(f"  claude  token {box.claude_token!r}"

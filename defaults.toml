@@ -142,6 +142,27 @@ identity = ""
 # (`add --repo`) has no agent and is always written with "gh".
 git_push = "gh"
 
+# Set core.checkStat = minimal in the .git/config of every repo in a mounted
+# project (the project folder and two levels under it), unless that repo
+# already sets core.checkStat. Re-asserted on every start, so a repo cloned
+# later is covered next time. A registry entry's `git_checkstat` overrides
+# (`msbctl edit <name>` → Host editor).
+#
+# Why: a git-aware editor on the host (zed, any IDE that polls git) and git in
+# the guest share .git/index, but see different uid, gid and device numbers
+# for every file. After the guest writes the index the host's git finds every
+# entry stale and rewrites it, and the guest's view of .git/index answers
+# ENOENT for ~5 s: `git status` there says every file is deleted and
+# untracked. Comparing only mtime and size, which both sides agree on, leaves
+# nothing to rewrite. It has to be .git/config because that is the one file
+# both sides' git reads; the setting is per clone and never committed.
+#
+# Turning it off stops re-asserting it and does NOT remove it from repos that
+# already have it: `git config --local --unset core.checkStat` does that.
+# Sandboxes cloned from a repo (`add --repo`) and Kandev's are never touched:
+# no host editor sees their checkouts.
+git_checkstat = true
+
 [identities]
 
 # Guest environment, emitted as `--env KEY=value` at create time. Every sandbox
