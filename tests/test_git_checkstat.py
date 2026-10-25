@@ -220,9 +220,9 @@ class GitCheckstatScriptTest(MsbctlTest):
 
     def test_a_failed_repo_leaves_no_marker(self):
         self.init(".")
-        os.chmod(os.path.join(self.work, ".git", "config"), 0o444)
-        os.chmod(os.path.join(self.work, ".git"), 0o555)
-        self.addCleanup(os.chmod, os.path.join(self.work, ".git"), 0o755)
+        os.chmod(os.path.join(self.work, ".git", "config"), 0o400)
+        os.chmod(os.path.join(self.work, ".git"), 0o500)
+        self.addCleanup(os.chmod, os.path.join(self.work, ".git"), 0o700)
         if os.access(os.path.join(self.work, ".git"), os.W_OK):
             self.skipTest("running as root: permissions do not stop git")
         self.run_script(self.script())
