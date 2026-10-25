@@ -6,8 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-import unittest
-from unittest import main, mock
+from unittest import main, mock, skipUnless
 
 from tests.harness import MsbctlTest
 
@@ -116,7 +115,7 @@ class GitCheckstatTest(MsbctlTest):
         self.assertTrue(self.m._onoff(1).startswith("invalid"))
 
 
-@unittest.skipUnless(shutil.which("git"), "needs git")
+@skipUnless(shutil.which("git"), "needs git")
 class GitCheckstatScriptTest(MsbctlTest):
     """The guest-side script itself, run by a real sh against real repos."""
 
