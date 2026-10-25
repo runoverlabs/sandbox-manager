@@ -9,7 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
-- Tab completion for bash, zsh and fish: `msbctl completion bash|zsh|fish` prints a script to source, completing verbs, flags and sandbox names (`HOST:name` from what `ls` last cached), without starting `msb` or ssh on a Tab.
+- Tab completion for bash, zsh and fish: `msbctl completion bash|zsh|fish` prints a script to source, completing verbs, flags and sandbox names (`HOST:name` from what `ls` last cached) and handing `exec`'s command to the shell's own completion, without starting `msb` or ssh on a Tab.
 - `msbctl allow . --from-observe` allows every host the observation log shows reached and no rule covers, in one write and one approval (names seen only in DNS with `--with-dns`), and `msbctl observe . --json` prints the report as one JSON document, so the observe → allow → rebuild loop runs from a script.
 - Published tcp ports are clickable in `msbctl port` and `show` (an OSC 8 hyperlink to `http://127.0.0.1:<host>/` on a terminal), and `show --json` adds a `port_urls` map of each port to its URL.
 - Secret values can live in your desktop keyring instead of 0600 files: `msbctl secret migrate --to keyring` moves them (and `--to file` back), and `[secrets] store = "file" | "keyring" | "auto"` in `config.toml` decides where new ones go. A locked keyring asks to unlock with its own prompt, a machine without one keeps the files, a boot-time `start --autostart` skips (and names) the sandboxes whose secrets are in a still-locked keyring, and `msbctl host check` reports which store is in use. Over ssh into a machine whose desktop keyring is locked, msbctl says the unlock prompt is on that desktop's screen; see the docs' "Credentials & SSH" page. Nothing changes until you opt in.

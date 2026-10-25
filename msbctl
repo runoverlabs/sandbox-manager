@@ -13891,6 +13891,11 @@ def cmd_menu(args, config):
 # msb call and no ssh, so a Tab never waits on a VM or a network, and a remote
 # that was never listed simply offers none of its names.
 #
+# exec's command, whether after `--` or straight after the name (`exec box git
+# log`), is handed to the shell's own completion as if typed alone: zsh's
+# _normal, fish's `complete -C`, and in bash bash-completion's command offset
+# where it is loaded (else command names, then files).
+#
 # zsh gets its own function rather than bash's under bashcompinit: that runs
 # the bash function's body as zsh code, where arrays start at 1 and an unquoted
 # variable is not split, and both mattered.
@@ -13900,7 +13905,10 @@ COMPLETION_SHELLS = ("bash", "zsh", "fish")
 
 def _completion_kind(action, func):
     """What a positional or an option's value takes, as the scripts spell it:
-    "sandbox", "remote", "dir", "words:a,b,c", or "-" for nothing to offer."""
+    "sandbox", "remote", "dir", "words:a,b,c", "command" (exec's: from there on
+    the shell completes it as if typed alone), or "-" for nothing to offer."""
+    if action.nargs == argparse.REMAINDER:
+        return "command"
     if action.choices:
         return "words:" + ",".join(map(str, action.choices))
     if action.dest in ("name", "names"):
@@ -13930,7 +13938,7 @@ def completion_model():
             if isinstance(action, argparse._SubParsersAction):
                 hidden = {c.dest for c in action._choices_actions if c.help == argparse.SUPPRESS}
                 for name, child in action.choices.items():
-                    if name not in hidden and not name.startswith("_"):
+                    if name not in hidden:
                         spec["subs"].append(name)
                         walk(child, f"{path} {name}".strip(), func)
             elif action.option_strings:
@@ -13942,7 +13950,7 @@ def completion_model():
                     kind = _completion_kind(action, func)
                     if kind != "-":
                         spec["values"].update(dict.fromkeys(action.option_strings, kind))
-            elif action.nargs != argparse.REMAINDER:      # exec's command is not ours
+            else:
                 spec["slots"].append(_completion_kind(action, func))
                 spec["repeat"] = action.nargs in ("*", "+")
 
@@ -14007,23 +14015,25 @@ COMPLETION_BASH = r"""
 # it, as bash-completion's __ltrim_colon_completions does; without that,
 # host:<Tab> became host::name.
 _msbctl() {
-    local line=${COMP_LINE:0:COMP_POINT} cur= word cmd= pos=0 value= kind=- list=
+    local line=${COMP_LINE:0:COMP_POINT} cur= word cmd= pos=0 value= kind=- list= i flag=
     local prog=${COMP_WORDS[0]/#\~/$HOME}
-    local -a words
+    local -a words slots
     read -r -a words <<<"$line"
     if [[ $line != *[[:space:]] && ${#words[@]} -gt 1 ]]; then
         cur=${words[${#words[@]}-1]}
         unset 'words[${#words[@]}-1]'
     fi
     _msbctl_spec ''
-    for word in "${words[@]:1}"; do
+    for (( i = 1; i < ${#words[@]}; i++ )); do
+        word=${words[i]}
         if [[ -n $value ]]; then value=; continue; fi
-        if [[ $word == -- ]]; then              # exec's command: the shell's own
-            compopt -o bashdefault -o default 2>/dev/null
-            return 0
+        if [[ $word == -- ]]; then              # exec's command follows
+            _msbctl_command $((i + 1))
+            return
         fi
         if [[ $word == -* ]]; then
             [[ $word != *=* && " $_msbctl_valued " == *" $word "* ]] && value=$word
+            flag=1
             continue
         fi
         if [[ $pos == 0 && " $_msbctl_subs " == *" $word "* ]]; then
@@ -14031,9 +14041,14 @@ _msbctl() {
             _msbctl_spec "$cmd"
             continue
         fi
+        slots=($_msbctl_slots)
+        if [[ ${slots[pos]} == command && -z $flag ]]; then  # `exec box git log`
+            _msbctl_command $i
+            return
+        fi
         pos=$((pos + 1))
     done
-    local -a slots=($_msbctl_slots)
+    slots=($_msbctl_slots)
     if [[ -n $value ]]; then
         kind=$(_msbctl_value "$cmd" "$value")
     elif [[ $cur == -* ]]; then
@@ -14044,6 +14059,11 @@ _msbctl() {
         kind=${slots[pos]}
     elif [[ -n $_msbctl_repeat && ${#slots[@]} -gt 0 ]]; then
         kind=${slots[${#slots[@]}-1]}
+    fi
+    if [[ $kind == command ]]; then
+        [[ -n $flag ]] && return 0      # msb's flags: the command comes after `--`
+        _msbctl_command ${#words[@]}
+        return
     fi
     local IFS=$'\n'
     case $kind in
@@ -14064,32 +14084,61 @@ _msbctl() {
         done
     fi
 }
+
+# exec's command, from words[$1] on (the caller's), completed as if typed
+# alone. The index is first mapped onto COMP_WORDS, which `:` cuts further, as
+# bash-completion's _comp__find_original_word does.
+_msbctl_command() {
+    local i=0 j word
+    for (( j = 0; j < $1; j++ )); do
+        word=${words[j]}
+        while [[ $word && i -lt ${#COMP_WORDS[@]} && $word == *"${COMP_WORDS[i]}"* ]]; do
+            word=${word#*"${COMP_WORDS[i++]}"}
+        done
+    done
+    local words cword
+    unset -v words cword        # so bash-completion takes $i as a COMP_WORDS index
+    if declare -F _comp_command_offset >/dev/null; then
+        _comp_command_offset "$i"
+    elif declare -F _command_offset >/dev/null; then
+        _command_offset "$i"
+    elif (( i == COMP_CWORD )); then
+        local IFS=$'\n'
+        COMPREPLY=($(compgen -c -- "${COMP_WORDS[i]}"))
+    else
+        compopt -o bashdefault -o default 2>/dev/null
+    fi
+}
 complete -F _msbctl msbctl
 """
 
 COMPLETION_ZSH = r"""
 _msbctl() {
-    local cmd= word kind=- value= prog=${words[1]/#\~/$HOME} cur=${words[CURRENT]}
+    local cmd= word kind=- value= flag= prog=${words[1]/#\~/$HOME} cur=${words[CURRENT]}
     local -a slots list
     integer pos=0 i
     _msbctl_spec ''
     for (( i = 2; i < CURRENT; i++ )); do
         word=${words[i]}
         if [[ -n $value ]]; then value=; continue; fi
-        if [[ $word == -- ]]; then              # exec's command: as if typed alone
-            shift $i words
-            (( CURRENT -= i ))
-            _normal
+        if [[ $word == -- ]]; then              # exec's command follows
+            _msbctl_command $(( i + 1 ))
             return
         fi
         if [[ $word == -* ]]; then
             [[ $word != *=* && " $_msbctl_valued " == *" $word "* ]] && value=$word
+            flag=1
             continue
         fi
         if (( pos == 0 )) && [[ " $_msbctl_subs " == *" $word "* ]]; then
             cmd=${cmd:+$cmd }$word
             _msbctl_spec "$cmd"
             continue
+        fi
+        slots=(${=_msbctl_slots})
+        if [[ ${slots[pos + 1]} == command && -z $flag ]]; then  # `exec box git log`
+            _msbctl_command $i
+            return
         fi
         (( pos++ ))
     done
@@ -14110,8 +14159,16 @@ _msbctl() {
         remote) list=(${(f)"$($prog _complete remotes 2>/dev/null)"}) ;;
         words:*) list=(${(s:,:)${kind#words:}}) ;;
         dir) _files -/; return ;;
+        command) [[ -z $flag ]] && _msbctl_command $CURRENT; return ;;
     esac
     (( $#list )) && compadd -- $list
+}
+
+# exec's command, from words[$1] on, completed as if typed alone.
+_msbctl_command() {
+    shift $(( $1 - 1 )) words
+    (( CURRENT -= $1 - 1 ))
+    _normal
 }
 compdef _msbctl msbctl
 """
@@ -14124,6 +14181,7 @@ function __msbctl_complete
     set -l pos 0
     set -l value ''
     set -l kind -
+    set -l flag ''
     __msbctl_spec ''
     for i in (seq 2 (count $tokens))
         set -l word $tokens[$i]
@@ -14131,20 +14189,26 @@ function __msbctl_complete
             set value ''
             continue
         end
-        if test "$word" = --                        # exec's command: as if typed alone
-            complete -C (string join ' ' -- $tokens[(math $i + 1)..-1] $cur)
+        if test "$word" = --                        # exec's command follows
+            __msbctl_command (math $i + 1)
             return
         end
         if string match -q -- '-*' $word
             if not string match -q -- '*=*' $word; and contains -- $word $__msbctl_valued
                 set value $word
             end
+            set flag 1
             continue
         end
         if test $pos -eq 0; and contains -- $word $__msbctl_subs
             set cmd (string trim -- "$cmd $word")
             __msbctl_spec "$cmd"
             continue
+        end
+        set -l next (math $pos + 1)
+        if test -z "$flag"; and set -q __msbctl_slots[$next]; and test $__msbctl_slots[$next] = command
+            __msbctl_command $i
+            return
         end
         set pos (math $pos + 1)
     end
@@ -14170,7 +14234,20 @@ function __msbctl_complete
             string split , -- (string replace -- words: '' $kind)
         case dir
             __fish_complete_directories $cur
+        case command                                # after msb's flags only past `--`
+            test -z "$flag"; and __msbctl_command (math (count $tokens) + 1)
     end
+end
+
+# exec's command, from token $argv[1] on, completed as if typed alone.
+function __msbctl_command
+    set -l tokens (commandline -opc)
+    if test $argv[1] -le (count $tokens)
+        set tokens (string escape -- $tokens[$argv[1]..-1])
+    else
+        set tokens
+    end
+    complete -C "$(string join ' ' -- $tokens) $(commandline -ct)"
 end
 
 complete -c msbctl -f -a '(__msbctl_complete)'

@@ -419,8 +419,10 @@ msbctl completion bash|zsh|fish
 
 Print a Tab-completion script for your shell. It completes the verbs, their
 flags and fixed choices (`observe . on`, `secret migrate --to keyring`), and the
-sandbox names, including `HOST:name` for each remote's sandboxes. Nothing is
-installed for you. Turn it on with one line:
+sandbox names, including `HOST:name` for each remote's sandboxes. After `exec
+NAME` (or past its `--`), the command is completed by your shell as if typed
+alone; in bash that takes the bash-completion package, else it offers command
+names and then files. Nothing is installed for you. Turn it on with one line:
 
 ```console
 $ echo 'source <(msbctl completion bash)' >> ~/.bashrc

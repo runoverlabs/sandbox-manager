@@ -12,6 +12,8 @@ from unittest import main, mock, skipUnless
 
 from tests.harness import MSBCTL, MsbctlTest
 
+BASH_COMPLETION = "/usr/share/bash-completion/bash_completion"
+
 
 class Completion(MsbctlTest):
 
@@ -70,8 +72,8 @@ class Completion(MsbctlTest):
         self.assertEqual(model["move"]["slots"], ["sandbox", "dir"])
         self.assertEqual(model["secret migrate"]["values"], {"--to": "words:keyring,file"})
         self.assertEqual(model["add"]["values"]["--remote"], "remote")
-        # exec's command is the shell's to complete, not a slot of msbctl's.
-        self.assertEqual(model["exec"]["slots"], ["sandbox"])
+        # exec's command is the shell's to complete, from that slot on.
+        self.assertEqual(model["exec"]["slots"], ["sandbox", "command"])
 
     def test_scripts_parse(self):
         checks = {"bash": ["bash", "-n"], "zsh": ["zsh", "-n"], "fish": ["fish", "--no-execute"]}
@@ -139,11 +141,8 @@ class Completion(MsbctlTest):
 
     # ------------------------------------------------------------ bash, for real
 
-    @skipUnless(shutil.which("bash"), "no bash")
-    def test_bash_offers_what_the_parser_takes(self):
-        self.make_folder_sandbox("web")
-        self.make_folder_sandbox("api")
-        self.add_remote("box", [{"name": "far"}])
+    def bash_offered(self, preamble=""):
+        """A function giving COMPREPLY for a line, after `preamble` in the same bash."""
         script = os.path.join(self.tmp, "c.bash")
         with open(script, "w", encoding="utf-8") as fh:
             fh.write(self.script("bash"))
@@ -151,13 +150,21 @@ class Completion(MsbctlTest):
         def offered(line):
             """COMPREPLY for `line`, its words split as bash splits them (at `:` too)."""
             words = line.replace(":", " : ").split() + ([""] if line.endswith(" ") else [])
-            body = (f'source "$1"; COMP_LINE="$2"; COMP_POINT=${{#COMP_LINE}}; '
+            body = (f'{preamble}\nsource "$1"; COMP_LINE="$2"; COMP_POINT=${{#COMP_LINE}}; '
                     f'COMP_WORDS=("$3" "${{@:4}}"); COMP_CWORD={len(words) - 1}; '
                     '_msbctl; printf "%s\\n" "${COMPREPLY[@]}"')
             proc = subprocess.run(["bash", "-c", body, "bash", script, line.replace("msbctl", MSBCTL, 1),
                                    MSBCTL, *words[1:]], capture_output=True, text=True)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             return proc.stdout.split()
+        return offered
+
+    @skipUnless(shutil.which("bash"), "no bash")
+    def test_bash_offers_what_the_parser_takes(self):
+        self.make_folder_sandbox("web")
+        self.make_folder_sandbox("api")
+        self.add_remote("box", [{"name": "far"}])
+        offered = self.bash_offered()
 
         self.assertEqual(offered("msbctl st"), ["status", "start", "stop"])
         self.assertEqual(offered("msbctl start "), ["api", "web", "box:far"])
@@ -173,7 +180,41 @@ class Completion(MsbctlTest):
         self.assertEqual(offered("msbctl remote test "), ["box"])
         self.assertEqual(offered("msbctl rename web "), [])
         self.assertEqual(offered("msbctl port --rm 8080 "), ["api", "web", "box:far"])
-        self.assertEqual(offered("msbctl exec web -- "), [])
+        # exec's command, with or without `--`: without bash-completion loaded,
+        # bash's own command names (and files after them).
+        self.assertIn("echo", offered("msbctl exec web ech"))
+        self.assertIn("echo", offered("msbctl exec web -- ech"))
+        self.assertIn("echo", offered("msbctl exec web -u root -- ech"))
+        # After msb's flags the command only starts past `--`, as split_msb_flags() reads it.
+        self.assertEqual(offered("msbctl exec web -u root ech"), [])
+
+    @skipUnless(shutil.which("bash") and os.path.exists(BASH_COMPLETION), "no bash-completion")
+    def test_bash_hands_exec_command_to_bash_completion(self):
+        self.make_folder_sandbox("web")
+        self.add_remote("box", [{"name": "far"}])
+        offered = self.bash_offered(f"source {BASH_COMPLETION}\ncomplete -W 'alpha beta' fakecmd")
+        self.assertEqual(offered("msbctl exec web fakecmd al"), ["alpha"])
+        self.assertEqual(offered("msbctl exec web -u root -- fakecmd b"), ["beta"])
+        # COMP_WORDS cuts box:far in three; the command is still found.
+        self.assertEqual(offered("msbctl exec box:far fakecmd al"), ["alpha"])
+
+    @skipUnless(shutil.which("fish"), "no fish")
+    def test_fish_hands_exec_command_to_fish(self):
+        self.make_folder_sandbox("web")
+        script = os.path.join(self.tmp, "c.fish")
+        with open(script, "w", encoding="utf-8") as fh:
+            fh.write(self.script("fish"))
+
+        def offered(line):
+            proc = subprocess.run(["fish", "--no-config", "-c", 'source $argv[1]; complete -C $argv[2]',
+                                   script, line], capture_output=True, text=True)
+            self.assertEqual(proc.stderr, "")
+            return [row.split("\t")[0] for row in proc.stdout.splitlines()]
+
+        self.assertIn("echo", offered("msbctl exec web ech"))
+        self.assertIn("echo", offered("msbctl exec web -u root -- ech"))
+        self.assertEqual(offered("msbctl exec web -u root ech"), [])
+        self.assertEqual(offered("msbctl observe web o"), ["off", "on"])
 
 
 if __name__ == "__main__":
