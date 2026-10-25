@@ -102,6 +102,15 @@ class RepoTest(MsbctlTest):
         self.assertIn("allow@one.example:tcp:443", argv)
         self.assertIn("webshop-workspace", self.fake_state()["_volumes"])
 
+    def test_git_checkstat_does_not_apply(self):
+        self.add()
+        box = self.m.Sandbox("webshop", self.m.load_config())
+        self.assertIs(box.shares_host_index, False)
+        self.assertIsNone(self.m.show_data(box)["git_checkstat"])
+        self.assertNotIn(self.m.GIT_CHECKSTAT_PROFILE[True], self.m.sandbox_profile_section(box))
+        self.m.ensure_guest_repos(box)
+        self.assertEqual(self.msb_calls("exec"), [])
+
     def test_a_server_error_is_never_a_missing_file(self):
         self.gh.fail["/repos/acme/webshop/contents/.msb/dev.yaml"] = 500
         code, _, err = self.main("add", "--repo", "acme/webshop", "-y")

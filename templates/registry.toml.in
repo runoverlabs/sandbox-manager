@@ -50,6 +50,14 @@ identity = "{{IDENTITY}}"
 # push. Empty follows [defaults] git_push.
 git_push = "{{GIT_PUSH}}"
 
+# Whether msbctl puts core.checkStat = minimal in the .git/config of the
+# project's repos (the folder and two levels under it, and read-write extra
+# mounts) on each shell/exec, so a git-aware host editor (zed, any IDE that
+# polls git) does not rewrite .git/index under the sandbox and leave git here
+# seeing every file deleted for ~5 s. Absent follows [defaults] git_checkstat
+# (on). false only stops adding it. `msbctl edit {{NAME}}` → Host editor.
+# git_checkstat = false
+
 # Which Claude token this sandbox logs in with, by the name it was stored under
 # (`msbctl setup` → Claude login). Empty follows [defaults] claude_token. The
 # value is read on every start, so a change needs a restart, not a rebuild.

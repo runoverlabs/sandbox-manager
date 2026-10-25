@@ -308,7 +308,9 @@ do_safe_directories() {
 	#   <project>/<name>/.git   the project CONTAINS repos, with .msb/ beside them
 	#
 	# One level only, and each checkout is added by name rather than with a
-	# wildcard, so the exemption stays a list of named paths.
+	# wildcard, so the exemption stays a list of named paths. msbctl's
+	# ensure_guest_repos() extends the same list on each start: repos two
+	# levels down, cloned since, or in an extra mount.
 	git config --global --add safe.directory "$PROJECT_DIR" || return 1
 	local repo
 	for repo in "$PROJECT_DIR"/*/; do

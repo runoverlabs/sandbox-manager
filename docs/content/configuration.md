@@ -71,6 +71,7 @@ including a whole egress group, replaces the shipped value.
 | `tools` | list of tool names | `[]` | the [agent tools](agent-tools.md) a new sandbox gets unless its registry entry sets `tools`; each is a folder under `~/.config/msb/tools` |
 | `identity` | identity name | `""` | the `[identities]` entry new sandboxes use |
 | `git_push` | `"gh"` or `"ssh"` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` is https with the GitHub token, `"ssh"` the filtered agent. See [git push](credentials.md#git-push-gh-or-ssh) |
+| `git_checkstat` | boolean | `true` | set `core.checkStat = minimal` in each mounted project's repos on each `shell`/`exec`, so a [host editor](troubleshooting.md#gitindex-disappears-for-a-few-seconds-after-a-git-command) doesn't rewrite `.git/index` under the sandbox |
 | `workspace_disk` | size | `"20G"` | the clone's disk volume for a sandbox [without a folder](repo-sandboxes.md); fixed when created |
 
 ### `[identities.<name>]`
@@ -240,6 +241,7 @@ Any key it sets overrides the project's file.
 | `claude_token` | token name | a stored Claude token's name; absent means `[defaults] claude_token` |
 | `llm` | list of endpoint names | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |
 | `tools` | list of tool names | the [agent tools](agent-tools.md) it gets, by folder name; absent means `[defaults] tools`. Their rules and environment need a rebuild; the adapter files refresh at every start |
+| `git_checkstat` | boolean | absent means `[defaults] git_checkstat`. Applied on each `shell`/`exec`; `false` doesn't remove the value from repos that already have it |
 | `autostart` | boolean | started when the picker opens |
 | `ssh_keys` | list of fingerprints | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | list | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |

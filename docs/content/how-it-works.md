@@ -146,7 +146,8 @@ collects the rest into a single rebuild offer when you're done.
    turned it off, and [pi](models.md) if it turned that on;
 4. installs `gh`, and `bun` and `gitleaks` if asked for, from pinned,
    checksum-verified GitHub releases;
-5. marks the project folder as a git `safe.directory`, then runs the project's own setup
+5. marks the project folder and the repos in it as git `safe.directory`
+   entries (each `shell`/`exec` adds any found since), then runs the project's own setup
    script if it names one.
 
 It's deliberately not `set -e`. Every step records its outcome and the failures

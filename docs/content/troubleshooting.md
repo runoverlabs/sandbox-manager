@@ -119,12 +119,48 @@ differ between the guest and the host, so the host's git rewrites the index
 straight after the sandbox does. The sandbox's view of the file then goes stale
 until it expires.
 
-msbctl prevents this by setting `core.checkStat=minimal` in the project's own
-`.git/config` on every start, unless the repo already sets `core.checkStat`.
-Git then compares only mtime and size, which both sides agree on. For a repo
-that isn't the project's top folder, or before the next start, run
+msbctl prevents this by setting `core.checkStat=minimal` in the `.git/config`
+of every repo in the project, on each `msbctl shell` or `exec`: the project
+folder itself and up to two levels under it (`repo/`, `group/repo/`, symlinked
+ones included), skipping `node_modules` and hidden folders, and the same in
+every read-write extra mount. A repo that already sets `core.checkStat` is left alone. Git then
+compares only mtime and size, which both sides agree on. It has to be
+`.git/config`, because that's the one file the host's git and the sandbox's
+both read; it's per clone and never committed, so no other checkout is
+affected. A repo cloned since is picked up by the next `shell` or `exec`; one
+removed and cloned again in the same place waits for the sandbox's next start.
+For one nested deeper, or to cover a fresh clone straight away, run
 `git config core.checkStat minimal` in it. `GIT_OPTIONAL_LOCKS=0` for the
 editor doesn't help: `git diff` ignores it.
+
+It's on by default. `git_checkstat = false` turns it off: in `[defaults]`
+(`msbctl setup` → "Defaults for new sandboxes") for every sandbox, or in one
+sandbox's registry entry (`msbctl edit .` → "Host editor"). Off only stops
+msbctl adding it; `git config --local --unset core.checkStat` takes it out of
+a repo. Sandboxes [without a folder](repo-sandboxes.md)
+never need it: no host editor sees their clone.
+
+To cover repos on this machine that no sandbox has started yet, you can set
+the same value host-side for a whole folder in your own `~/.gitconfig`;
+msbctl never writes that file:
+
+```ini
+[includeIf "gitdir:~/workspaces/"]
+	path = ~/.config/git/sandboxed.inc
+```
+
+with `[core] checkStat = minimal` in `~/.config/git/sandboxed.inc`.
+
+## `git`: "detected dubious ownership in repository"
+
+Inside the sandbox you're root, but the project's files belong to your user on
+this machine, so git refuses every repo it hasn't been told to trust. The
+bootstrap trusts the project folder and the repos directly in it, and each
+`msbctl shell` or `exec` adds every repo up to two levels under the project
+folder and in every extra mount to git's global `safe.directory`, by name, when
+it finds one it hasn't seen yet this boot. For a repo cloned during a session,
+or nested deeper, run `git config --global --add safe.directory "$(pwd -P)"` in
+it, or start a new `shell`.
 
 ## podman: "boot ID differs from cached boot ID"
 

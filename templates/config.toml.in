@@ -16,6 +16,7 @@
 # identity   = "personal"             # a name from [identities] below
 # claude_token = "work"               # a Claude token stored by `msbctl setup`
 # git_push   = "ssh"                  # "gh" (https + token) or "ssh" (agent)
+# git_checkstat = false              # leave core.checkStat out of project repos
 # rule_groups = ["github", "claude"]  # groups a new sandbox starts with
 # cpus   = 4
 # memory = "8G"
