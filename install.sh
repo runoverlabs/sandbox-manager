@@ -325,6 +325,9 @@ cat <<EOF
      2. cd <a project> && msbctl add
      3. msbctl start <name>        (the first start runs the bootstrap)
 
+   Tab completion: add 'source <(msbctl completion bash)' to ~/.bashrc
+                   (zsh: the same with zsh, after compinit; fish: see 'msbctl completion -h')
+
    Upgrade:   $( [ "$MODE" = package ] && echo "msbctl self-update" || echo "git pull" )
    Remove:    $TOOLDIR/install.sh --uninstall
 
