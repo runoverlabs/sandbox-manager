@@ -127,8 +127,9 @@ every read-write extra mount. A repo that already sets `core.checkStat` is left 
 compares only mtime and size, which both sides agree on. It has to be
 `.git/config`, because that's the one file the host's git and the sandbox's
 both read; it's per clone and never committed, so no other checkout is
-affected. A repo cloned since is picked up by the next `shell` or `exec`. For one
-nested deeper, or to cover a fresh clone straight away, run
+affected. A repo cloned since is picked up by the next `shell` or `exec`; one
+removed and cloned again in the same place waits for the sandbox's next start.
+For one nested deeper, or to cover a fresh clone straight away, run
 `git config core.checkStat minimal` in it. `GIT_OPTIONAL_LOCKS=0` for the
 editor doesn't help: `git diff` ignores it.
 
@@ -149,6 +150,17 @@ msbctl never writes that file:
 ```
 
 with `[core] checkStat = minimal` in `~/.config/git/sandboxed.inc`.
+
+## `git`: "detected dubious ownership in repository"
+
+Inside the sandbox you're root, but the project's files belong to your user on
+this machine, so git refuses every repo it hasn't been told to trust. The
+bootstrap trusts the project folder and the repos directly in it, and each
+`msbctl shell` or `exec` adds every repo up to two levels under the project
+folder and in every extra mount to git's global `safe.directory`, by name, when
+it finds one it hasn't seen yet this boot. For a repo cloned during a session,
+or nested deeper, run `git config --global --add safe.directory "$(pwd -P)"` in
+it, or start a new `shell`.
 
 ## podman: "boot ID differs from cached boot ID"
 

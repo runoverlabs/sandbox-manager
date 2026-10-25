@@ -160,6 +160,8 @@ git_push = "gh"
 #
 # Turning it off stops re-asserting it and does NOT remove it from repos that
 # already have it: `git config --local --unset core.checkStat` does that.
+# Nor does it stop the same walk adding each repo to git's global
+# safe.directory in the guest, which git needs there whatever this says.
 # Sandboxes cloned from a repo (`add --repo`) and Kandev's are never touched:
 # no host editor sees their checkouts.
 git_checkstat = true

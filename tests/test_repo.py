@@ -108,7 +108,7 @@ class RepoTest(MsbctlTest):
         self.assertIs(box.shares_host_index, False)
         self.assertIsNone(self.m.show_data(box)["git_checkstat"])
         self.assertNotIn(self.m.GIT_CHECKSTAT_PROFILE[True], self.m.sandbox_profile_section(box))
-        self.m.ensure_git_checkstat(box)
+        self.m.ensure_guest_repos(box)
         self.assertEqual(self.msb_calls("exec"), [])
 
     def test_a_server_error_is_never_a_missing_file(self):
