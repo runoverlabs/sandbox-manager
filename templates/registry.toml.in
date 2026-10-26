@@ -22,8 +22,10 @@ project = "{{PROJECT}}"
 # the old path stay behind.
 guest_path = "{{GUEST_PATH}}"
 
-# owner/name, used for the PAT binding and shown in the picker. Empty if the
-# project has no GitHub remote.
+# The project's repository: owner/name for GitHub, the clone URL as given for
+# any other forge (Codeberg, a Forgejo of your own...). Decides whether the
+# GitHub token step and binding apply (GitHub only) and is shown in the picker.
+# Empty if the project has no repo.
 repo = "{{REPO}}"
 
 # Git identity, by name from config.toml's [identities]. Applied inside the

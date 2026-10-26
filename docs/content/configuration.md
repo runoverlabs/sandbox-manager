@@ -238,7 +238,7 @@ Any key it sets overrides the project's file.
 | `name`, `project` | string, host path | the sandbox's name and the absolute path of its project folder |
 | `source`, `repo`, `ref` | strings | `source = "repo"` for a sandbox [without a folder](repo-sandboxes.md), which has `repo` and an optional `ref` instead of `project` |
 | `guest_path` | `"/work"`, `"host"` or a guest path | where the project appears inside: `"/work"`, `"host"` (the same path as `project`) or an absolute path. Absent means the `[defaults]` value. Needs a rebuild |
-| `repo` | `owner/name` | `owner/name` on GitHub, for the token binding and the picker |
+| `repo` | `owner/name` or a clone URL | the project's repository: `owner/name` on GitHub, the clone URL (`https://`, `ssh://` or `user@host:path`) anywhere else. Only a GitHub repo gets the token step and binding; shown in the picker |
 | `identity` | identity name | an `[identities]` name; applied at every start |
 | `claude_token` | token name | a stored Claude token's name; absent means `[defaults] claude_token` |
 | `llm` | list of endpoint names | the [model endpoints](models.md) pi gets, first being its default; absent means `[defaults] llm`. Needs a rebuild |

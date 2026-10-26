@@ -51,20 +51,24 @@ The wizard then asks, in order:
 
 1. **Sandbox name**: lowercase letters, digits and dashes. It defaults to the
    folder name.
-2. **GitHub repo**: detected from the checkout's `origin`. If the folder is
-   empty, it offers to clone the repo into a subfolder over SSH.
+2. **Repo**: detected from the checkout's `origin`. Give `owner/name` for
+   GitHub, or the clone URL for any other forge (Codeberg, your own Forgejo).
+   If the folder is empty, it offers to clone the repo into a subfolder. A repo
+   that isn't on GitHub skips every GitHub step below; see
+   [Credentials](credentials.md#a-repo-that-isnt-on-github).
 3. **Git identity** and **SSH keys**: which keys from your host agent this
    sandbox may use. Nothing is ticked by default.
 4. **Features and agents**: what the project needs, not raw egress rules.
    Ticking `python` brings the PyPI egress group *and* the toolchain packages.
-   Features are pre-ticked from the repo's languages on GitHub.
+   For a GitHub repo, features are pre-ticked from the repo's languages.
 5. **Resources and disks**: cpus, memory, the root disk size and, for podman,
    a container disk.
 6. **Package caches, extra folders and secrets**: all optional.
 7. **Image**: offered pinned by digest, so a moving tag can't change the
    sandbox underneath you.
-8. **GitHub token**: a fine-grained PAT for this one repository, read straight
-   into a 0600 file. It's never echoed and never on a command line.
+8. **GitHub token**, for a GitHub repo: a fine-grained PAT for this one
+   repository, read straight into a 0600 file. It's never echoed and never on a
+   command line.
 
 Nothing is started yet. The wizard writes three things:
 

@@ -49,6 +49,10 @@ every session — if a symptom below rings a bell, the fix is one file away.
 ## Layout
 
 Orientation only; the *why* of each area is in the skill named on its row.
+`msbctl` is being split into a package, one area per PR: the decision, the
+module map and the rules for what goes where are in `design/package-layout.md`.
+Its rules already apply to new code in the single file. The most important is
+"one concept, one parser": `repo` is read only through `RepoRef`.
 
 | Path | What it is |
 |---|---|
