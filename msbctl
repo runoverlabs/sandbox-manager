@@ -5748,6 +5748,7 @@ def cmd_observe(args, config):
         _observe_set(box, "observe" if args.action == "on" else "enforce", args, config)
     else:
         _observe_report(box)
+    return None
 
 
 def observe_data(box):
@@ -8625,6 +8626,7 @@ def cmd_ls(args, config):
     print(BOLD + "  ".join(h.ljust(w) for h, w in zip(header, widths, strict=True)) + RESET)
     for row in rows:
         print("  ".join(str(c).ljust(w) for c, w in zip(row, widths, strict=True)))
+    return None
 
 
 def ls_with_remotes(args, config, names):
@@ -8953,6 +8955,7 @@ def cmd_show(args, config):
         note(f"  {binding}")
     for line in ssh_agent_lines(box):
         note(line)
+    return None
 
 
 def agent_binding(box):
@@ -13121,19 +13124,19 @@ def kandev_proxy_conn(raw, listener, ctx, slots):
 def kandev_proxy(stop=None):
     """The accept loop. Runs until killed (or `stop`, an Event, for tests)."""
     os.makedirs(os.path.dirname(KANDEV_PROXY_LOCK), mode=0o700, exist_ok=True)
-    lock = open(KANDEV_PROXY_LOCK, "a", encoding="utf-8")    # held for the proxy's life
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        die("another `msbctl host kandev proxy` is already running on this host")
-    # Who holds it: how health and an update tell this release from the next.
-    lock.truncate(0)
-    lock.write(version_string() + "\n")
-    lock.flush()
     sel = selectors.DefaultSelector()
     listeners, slots = {}, threading.BoundedSemaphore(KANDEV_PROXY_MAX_CONNS)
     ctx, stamp, said, next_scan = None, None, "", 0.0
+    lock = open(KANDEV_PROXY_LOCK, "a", encoding="utf-8")    # held for the proxy's life
     try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            die("another `msbctl host kandev proxy` is already running on this host")
+        # Who holds it: how health and an update tell this release from the next.
+        lock.truncate(0)
+        lock.write(version_string() + "\n")
+        lock.flush()
         while not (stop and stop.is_set()):
             if time.monotonic() >= next_scan:
                 next_scan = time.monotonic() + KANDEV_PROXY_SCAN
@@ -15296,7 +15299,8 @@ def main():
     # Before the preflight and the config: a Tab must answer on a laptop with
     # no msb, and quickly, and a broken config.toml only costs remote names.
     if args.func in (cmd_completion, cmd_complete):
-        return args.func(args)
+        args.func(args)
+        return
     preflight(args)
 
     try:
