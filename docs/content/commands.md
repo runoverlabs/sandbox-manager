@@ -505,7 +505,8 @@ msbctl setup --claude-token NAME [--stdin] [--default]
 msbctl setup --identity KEY --git-name NAME --git-email EMAIL [--default]
 ```
 
-Your machine-level settings as a menu: git identities, Claude login, model
+Your machine-level settings as a menu: git identities, coding agents (the
+`[defaults] agents` a new sandbox gets ticked), Claude login, model
 endpoints (for [pi](models.md)), [agent tools](agent-tools.md), your network,
 new-sandbox defaults, or the config file itself. The options skip the menu;
 they're how `msbctl remote setup` copies your settings to a host, and through

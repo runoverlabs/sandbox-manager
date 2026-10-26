@@ -111,7 +111,9 @@ Outside the wizard, the same agent gating applies:
 
 ## Phases (one PR each, CHANGELOG line + docs page each)
 
-1. **Stop the damage.** Small, and mostly bug fixes.
+1. **Stop the damage.** Small, and mostly bug fixes. **Done:** #125 (the repo), then the agents PR,
+   which also found the Claude token bound in sandboxes without Claude. `ensure_profile()` is
+   skipped without Claude; pi's `[llm]`-empty hint is the existing `pick_llms()` note.
    - `RepoRef` with kind detection by hostname only (no probe yet), every
      `box.repo` reader moved onto it, and a correct clone URL and target folder.
    - For non-GitHub, skip: the GitHub token step, the git push question,

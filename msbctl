@@ -2108,7 +2108,9 @@ class Sandbox:
         shared = read_env_file(GLOBAL_ENV, only=self.global_secret_vars())
         wants_github = self.wants_github
 
-        if self.claude_auth == "secret":
+        # Only where Claude Code is installed: anywhere else the token would be
+        # a credential bound for nothing — usable by whatever runs there.
+        if self.claude_auth == "secret" and self.wants_component("claude"):
             token = claude_tokens(shared).get(self.claude_token)
             if token:
                 env[CLAUDE_TOKEN_VAR] = token
@@ -2125,8 +2127,6 @@ class Sandbox:
                 # it lands as soon as the agent reads it back out of its own
                 # environment and it becomes part of the transcript.
                 flags += ["--secret", with_transcript_passthrough(CLAUDE_SPEC, self.transcript_hosts)]
-            elif not self.wants_component("claude"):
-                pass        # nothing here would use it
             elif claude_tokens():
                 warn(f"{self.name}: no Claude token named {self.claude_token!r} — Claude Code "
                      "will not be logged in. Add it with `msbctl setup` → Claude login, or "
@@ -2485,7 +2485,7 @@ class Sandbox:
         there is looked up for it, so a keyring value it never uses cannot
         prompt at its start or keep it from starting at boot."""
         out = {binding_var(spec) for spec in self.registry_binds}
-        if self.claude_auth == "secret":
+        if self.claude_auth == "secret" and self.wants_component("claude"):
             out.add(claude_token_var(self.claude_token))
         if self.wants_component("pi"):
             out |= {llm_key_var(name) for name in self.llm_names}
@@ -3368,6 +3368,8 @@ def ensure_profile(box):
     """
     if box.claude_auth != "secret":
         return      # "mount" puts the host's real files in place; nothing to do
+    if not box.wants_component("claude"):
+        return      # no Claude Code: pi gets the same text from ensure_pi()
 
     script = []
     if assemble_profile():          # rebuilt per boot, so an edit lands on the next start
@@ -6096,7 +6098,7 @@ def pick_guest_path(project, current):
     say("Project path inside the sandbox")
     note("The same path as on the host makes absolute paths in errors and agent")
     note("output open on the host as they are; /work keeps your folder layout and")
-    note("username out of the sandbox. Claude Code keeps its sessions per path.")
+    note("username out of the sandbox. A coding agent keeps its sessions per path.")
     custom = current if current not in ("host", GUEST_PROJECT) else ""
     options = [f"same as on the host   {project or '(each project its own)'}",
                f"{GUEST_PROJECT}",
@@ -6758,7 +6760,7 @@ def maybe_welcome(config):
     if not (sys.stdin.isatty() and sys.stdout.isatty()) or not needs_welcome(config):
         return config
     choice = choose_one("welcome to msbctl — first run", [
-        "set up now        a few minutes: identities, Claude login, your network",
+        "set up now        a few minutes: identities, your agents, your network",
         "later             ask again next time",
         "no thanks         never ask again (`msbctl setup` still works)"], 0)
     if choice.startswith("set up"):
@@ -7505,8 +7507,24 @@ def _store_llm_key(name):
     note(f"stored {var}; a running sandbox picks it up on its next start")
 
 
+def _summary_agents(config):
+    return ", ".join(default_agents(config)) or "none"
+
+
+def section_agents(config, ctx):
+    """Which coding agents a new sandbox gets ticked: `[defaults] agents`. The
+    first-run walk-through reads it to skip the logins nothing would use."""
+    say("Coding agents")
+    note("Ticked for every new sandbox; `msbctl add` still asks, and `msbctl edit`")
+    note("→ Features changes one sandbox. None is fine: a dev sandbox with no agent.")
+    current = config.get("defaults", {}).get("agents", ["claude"])
+    chosen = [key for key, _ in pick_agents(config, current if isinstance(current, list) else [])]
+    set_toml_key(CONFIG_FILE, "agents", chosen, table="defaults")
+
+
 SETUP_SECTIONS = [
     ("Git identities", section_identities, _summary_identities),
+    ("Coding agents", section_agents, _summary_agents),
     ("Claude login", section_login, _summary_login),
     ("Model endpoints", section_llms, _summary_llms),
     ("Agent tools", section_tools, _summary_tools),
@@ -7517,8 +7535,13 @@ SETUP_SECTIONS = [
 WELCOME_TEXT = """\
 msbctl runs each project in its own microVM: egress is deny-by-default, and your
 tokens never enter the VM — the sandbox holds a placeholder and the real value is
-substituted on the way out. Five one-time settings make it yours. Every one is
+substituted on the way out. A few one-time settings make it yours. Every one is
 optional, and `msbctl setup` brings you back to any of them later."""
+
+# First-run sections that only matter to one agent: skipped in the walk-through
+# when no new sandbox would get it, so a machine without Claude is never asked
+# to log in to it.
+SETUP_NEEDS_AGENT = {"Claude login": "claude", "Model endpoints": "pi"}
 
 
 def release_tuple(text):
@@ -7650,6 +7673,11 @@ def cmd_setup(args, config):
             note(line)
         for title, fn, _ in SETUP_SECTIONS:
             note("")
+            agent = SETUP_NEEDS_AGENT.get(title)
+            if agent and agent not in default_agents(load_config()):
+                note(f"{title}: skipped, as no new sandbox gets {agent} "
+                     "(`msbctl setup` → Coding agents)")
+                continue
             if choose_one(f"next: {title}", ["set it up now", "skip"], 0) == "skip":
                 continue
             try:
@@ -8049,6 +8077,8 @@ def section_github(box, config, ctx):
 
 
 def _summary_claude_token(box):
+    if not box.wants_component("claude"):
+        return "not used: no Claude Code here"
     if box.claude_auth != "secret":
         return f"claude_auth = {box.claude_auth!r}, no token"
     stored = box.claude_token in claude_tokens()
@@ -8061,6 +8091,9 @@ def section_claude_token(box, config, ctx):
     every start, so a change is a restart, never a rebuild."""
     say("Claude token")
     tokens = claude_tokens()
+    if not box.wants_component("claude"):
+        note("this sandbox has no Claude Code, so no token is bound — Features turns it on")
+        return
     if box.claude_auth != "secret":
         note(f"claude_auth is {box.claude_auth!r}, so no token is bound")
         return
@@ -9961,18 +9994,19 @@ FEATURES = [
 # Coding agents: a second, separate list because "which agent runs here" is a
 # different question from "which toolchains it can fetch". Each installs its own
 # agent and opens its own egress. A new one gets a row here plus an installer
-# step in bootstrap.sh (and a GUEST_PROBES/UPDATERS row). Preselected,
-# because this manager exists to run agents — but unticking all is valid, and
-# then nothing agent-shaped is installed. `requires` names FEATURES the agent
-# cannot work without; the wizard asks for agents first and locks those on.
+# step in bootstrap.sh (and a GUEST_PROBES/UPDATERS row). Which are ticked for
+# a new sandbox is the operator's `[defaults] agents` (default_agents()), and
+# unticking all is valid: then nothing agent-shaped is installed, and nothing
+# asks for an agent's login. `requires` names FEATURES the agent cannot work
+# without; the wizard asks for agents first and locks those on.
 AGENTS = [
     # Installed with npm, from a node that comes from deb.nodesource.com — both
     # in the `npm` group — so it cannot be off while claude is on.
     ("claude", "Claude Code", {"groups": ["claude"], "requires": ["npm"]}),
     # No group: its egress is the [llm] endpoints it is given (see PI_PACKAGE).
-    # Opt-in, preselected only once [defaults] llm names an endpoint.
+    # Also preselected once [defaults] llm names an endpoint.
     ("pi", "pi, for your own models or any provider",
-     {"groups": [], "requires": ["npm"], "opt_in": True}),
+     {"groups": [], "requires": ["npm"]}),
 ]
 
 
@@ -10053,10 +10087,40 @@ def _enable_groups(key, spec, groups, plan):
                  "stay refused until you add one — see defaults.toml")
 
 
-def pick_features(groups, default_groups, ref=None, config=None, current=None):
-    """Ask for coding agents first, then features — with whatever the chosen
-    agents depend on locked on — then for egress groups nothing owns (your own,
-    such as one for a LAN). Returns what to write into sandbox.toml.
+def default_agents(config):
+    """The agents a new sandbox gets ticked: `[defaults] agents`, plus pi once
+    `[defaults] llm` names an endpoint (an endpoint is only of use to pi). A
+    name AGENTS does not know is warned about and dropped."""
+    d = config.get("defaults", {})
+    wanted = d.get("agents", ["claude"])
+    if not isinstance(wanted, list):
+        warn(f"[defaults] agents is {wanted!r}, not a list of agent names — ticking none")
+        wanted = []
+    known = [key for key, _, _ in AGENTS]
+    for name in wanted:
+        if name not in known:
+            warn(f"[defaults] agents: no agent called {name!r} (known: {', '.join(known)})")
+    if d.get("llm") and "pi" not in wanted:
+        wanted = [*wanted, "pi"]
+    return [key for key in known if key in wanted]
+
+
+def pick_agents(config, current=None):
+    """Ask which coding agents a sandbox gets. Returns [(key, spec)] in AGENTS
+    order. `current` (a list of keys) preselects an existing sandbox's; without
+    it default_agents() does. Ticking none is valid: a dev sandbox with no agent."""
+    say("Coding agents")
+    alabels = {f"{key:<8} {desc}": (key, spec) for key, desc, spec in AGENTS}
+    on_keys = current if current is not None else default_agents(config)
+    agent_on = [label for label, (key, _) in alabels.items() if key in on_keys]
+    return [alabels[label] for label in toggle_list("agents", list(alabels), agent_on)]
+
+
+def pick_features(groups, default_groups, ref=None, config=None, current=None, agents=None):
+    """Ask for coding agents first (unless `agents`, from pick_agents(), says
+    they were asked already), then features — with whatever the chosen agents
+    depend on locked on — then for egress groups nothing owns (your own, such as
+    one for a LAN). Returns what to write into sandbox.toml.
 
     `current` ({"agents": [...], "features": [...]}) preselects an existing
     sandbox's choices, for editing; without it the defaults and the repo's
@@ -10066,13 +10130,8 @@ def pick_features(groups, default_groups, ref=None, config=None, current=None):
             "root_disk": "", "cpus": 0, "memory": "", "caches": {},
             "containers_disk": "", "containers_storage": ""}
 
-    say("Coding agents")
-    alabels = {f"{key:<8} {desc}": (key, spec) for key, desc, spec in AGENTS}
-    has_llm = bool((config or {}).get("defaults", {}).get("llm"))
-    agent_on = [l for l, (k, spec) in alabels.items()
-                if (k in current["agents"] if current
-                    else not spec.get("opt_in") or (k == "pi" and has_llm))]
-    agents = [alabels[label] for label in toggle_list("agents", list(alabels), agent_on)]
+    if agents is None:
+        agents = pick_agents(config or {}, current["agents"] if current else None)
     plan["agents"] = [key for key, _ in agents]
     for key, spec in agents:
         _enable_groups(key, spec, groups, plan)
@@ -10306,6 +10365,11 @@ def cmd_add(args, config):
             else:
                 note(f"cloned into {tilde(target)}")
 
+    # Asked before anything that depends on it: the Claude token, pi's models
+    # and the agents' egress all follow this one answer.
+    agents = pick_agents(config)
+    agent_keys = [key for key, _ in agents]
+
     guest_path = pick_guest_path(project, config.get("defaults", {})
                                  .get("guest_path", GUEST_PROJECT))
 
@@ -10363,7 +10427,7 @@ def cmd_add(args, config):
 
     groups = sorted(g for g in config.get("rules", {}) if g != "base")
     default_groups = config.get("defaults", {}).get("rule_groups", [])
-    plan = pick_features(groups, default_groups, ref, config)
+    plan = pick_features(groups, default_groups, ref, config, agents=agents)
     llm = None                       # follow [defaults] llm
     if "pi" in plan["agents"]:
         say("Models for pi")
@@ -10397,7 +10461,8 @@ def cmd_add(args, config):
     # ------------------------------------------------------------- the tokens
     claude_token = ""
     tokens = claude_tokens()
-    if len(tokens) > 1 and config.get("defaults", {}).get("claude_auth", "secret") == "secret":
+    if ("claude" in agent_keys and len(tokens) > 1
+            and config.get("defaults", {}).get("claude_auth", "secret") == "secret"):
         say("Claude token")
         default = default_claude_token(config)
         follow = f"the default  (now {default})"

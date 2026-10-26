@@ -67,6 +67,7 @@ including a whole egress group, replaces the shipped value.
 | `private_dns_groups` | list of groups | `[]` | groups whose names resolve to private addresses; projects using one get `allow_private_dns` |
 | `claude_auth` | `"secret"` or `"mount"` | `"secret"` | `"mount"` shares the host's real `~/.claude` instead of a placeholder token. A fallback only |
 | `claude_token` | token name | `"main"` | the stored Claude token a sandbox uses unless its registry entry sets `claude_token` |
+| `agents` | list of `"claude"`, `"pi"` | `["claude"]` | the coding agents ticked for a new sandbox in `msbctl add`; `[]` for none. pi is ticked too whenever `llm` names an endpoint. The first-run setup skips the Claude login and model endpoints when no new sandbox would use them |
 | `llm` | list of endpoint names | `[]` | the [model endpoints](models.md) a sandbox with pi gets unless its registry entry sets `llm`; the first is pi's default |
 | `tools` | list of tool names | `[]` | the [agent tools](agent-tools.md) a new sandbox gets unless its registry entry sets `tools`; each is a folder under `~/.config/msb/tools` |
 | `identity` | identity name | `""` | the `[identities]` entry new sandboxes use |

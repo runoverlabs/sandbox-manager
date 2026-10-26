@@ -108,10 +108,11 @@ your keyring's own tool shows them too.
 ### Claude
 
 `msbctl setup` → "Claude login" stores a long-lived token from
-`claude setup-token` in `secrets/global.env`. Every sandbox gets
-`CLAUDE_CODE_OAUTH_TOKEN` as a placeholder bound to `api.anthropic.com` and
+`claude setup-token` in `secrets/global.env`. Every sandbox with Claude Code
+gets `CLAUDE_CODE_OAUTH_TOKEN` as a placeholder bound to `api.anthropic.com` and
 `platform.claude.com`, plus its own `~/.claude`, kept on the host at
-`~/.local/state/msb/claude/<name>/`.
+`~/.local/state/msb/claude/<name>/`. A sandbox without Claude Code gets neither,
+and its start never reads the token, so a locked keyring isn't asked for it.
 
 You can keep more than one, one per account. "Add a Claude token" asks for a
 name (`work`, `personal`) and stores each under its own variable; "choose the
