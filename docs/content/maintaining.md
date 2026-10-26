@@ -21,7 +21,7 @@ written to the registry entry, so a later rebuild reproduces them.
 ## Versions and updates
 
 Component versions are pinned in `defaults.toml` under `[versions]` (node's
-major, `gh`, `gitleaks`, `bun`), and the image is pinned by digest.
+major, `npm`, `gh`, `gitleaks`, `bun`), and the image is pinned by digest.
 
 ```console
 $ msbctl ls --refresh                  # check upstream (cached for 6 hours)

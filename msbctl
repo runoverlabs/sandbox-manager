@@ -12,7 +12,7 @@
     msbctl purge <name>           destroy, delete state, secret and registration
     msbctl rename <name> <new>    new name; recreates it, everything else moves along
     msbctl move <name> <dir>      point it at another project folder (then rebuild)
-    msbctl update <name>… [-c what…] update claude / pi / gh / gitleaks / bun / apt in place
+    msbctl update <name>… [-c what…] update claude / pi / npm / gh / gitleaks / bun / apt in place
     msbctl shell <name>           interactive shell, ssh-agent wired up
     msbctl keys <name>            choose which host ssh keys it can use
     msbctl config                 the merged configuration, with where each value is from
@@ -4689,7 +4689,8 @@ def bootstrap_payload(box):
     versions = box.versions()
     boot = box.project_cfg.get("bootstrap", {})
     env = {
-        "MSB_NODE_MAJOR": str(versions.get("node", "22")),
+        "MSB_NODE_MAJOR": str(versions.get("node", "24")),
+        "MSB_NPM_VERSION": str(versions.get("npm", "12.2.1")),
         "MSB_GITLEAKS_VERSION": str(versions.get("gitleaks", "8.30.1")),
         "MSB_GH_VERSION": str(versions.get("gh", "2.102.0")),
         "MSB_BUN_VERSION": str(versions.get("bun", "1.4.2")),
@@ -9104,6 +9105,7 @@ GUEST_PROBES = {
     "claude":   ("claude --version", r"([0-9]+\.[0-9]+\.[0-9]+)"),
     "pi":       ("pi --version", r"([0-9]+\.[0-9]+\.[0-9]+)"),
     "node":     ("node --version", r"v?([0-9][0-9.]*)"),
+    "npm":      ("npm --version", r"([0-9][0-9.]*)"),
     "gitleaks": ("gitleaks version", r"([0-9][0-9.]*)"),
     "gh":       ("gh --version", r"gh version ([0-9][0-9.]*)"),
     "bun":      ("bun --version", r"([0-9][0-9.]*)"),
@@ -9150,7 +9152,7 @@ def refresh_versions(names, config, cache):
     def needed(comp):
         return any(b.wants_component(comp) for b in boxes.values())
 
-    upstream = {"gh": available_release("cli/cli", token)}
+    upstream = {"gh": available_release("cli/cli", token), "npm": available_npm("npm")}
     # Only what some selected sandbox actually has: bun would otherwise cost a
     # GitHub call per refresh and show up as "?" in sandboxes that never had it.
     if needed("gitleaks"):
@@ -9169,7 +9171,7 @@ def refresh_versions(names, config, cache):
         previous = cache.get(name, {})
         entry = {"checked": stamp}
 
-        node_major = str(box.versions().get("node", "22"))
+        node_major = str(box.versions().get("node", "24"))
         per_sandbox = {c: v for c, v in upstream.items() if box.wants_component(c)}
         per_sandbox["node"] = available_node(node_major)
 
@@ -9226,7 +9228,7 @@ def cmd_update(args, config):
             note("the image is fixed at create time and cannot be updated in")
             note(f"place. Edit {box.conf}'s digest, then: msbctl rebuild {box.name}")
             continue
-        if comp in ("gh", "gitleaks", "bun"):
+        if comp in ("gh", "gitleaks", "bun", "npm"):
             target = (cache.get(box.name, {}).get(comp, {}) or {}).get("available")
             if not target:
                 note("no known upstream version — run `msbctl ls --refresh` first")
@@ -9236,7 +9238,7 @@ def cmd_update(args, config):
             script = UPDATERS[comp]
         else:
             die(f"nothing knows how to update {comp!r}. "
-                f"Known: claude, pi, gh, gitleaks, bun, apt, image")
+                f"Known: claude, pi, npm, gh, gitleaks, bun, apt, image")
 
         proc = run(["msb", "exec", box.name, "--no-tty", "--", "bash", "-c", script],
                    check=False, capture=True)
@@ -9247,7 +9249,7 @@ def cmd_update(args, config):
 
         # Record it, or the next rebuild silently reverts to bootstrap.sh's pin
         # and "I updated gh" quietly stops being true.
-        if comp in ("gh", "gitleaks", "bun"):
+        if comp in ("gh", "gitleaks", "bun", "npm"):
             write_version_override(box, comp, target)
             note(f"pinned {comp}={target} in the registry entry, so a rebuild "
                  "reproduces it")
@@ -9270,8 +9272,10 @@ def installer_script(comp, version):
 
     Same URLs and the same checksum step; this is the update path for the two
     components the bootstrap pins by hand rather than taking from a package
-    manager.
+    manager. npm is the exception, installed with itself, as bootstrap.sh does.
     """
+    if comp == "npm":
+        return f'npm install -g npm@{version} >/dev/null && hash -r && npm --version\n'
     if comp == "gitleaks":
         return (
             'arch=x64; [ "$(uname -m)" = aarch64 ] && arch=arm64\n'
@@ -15261,7 +15265,7 @@ def build_parser():
     p.add_argument("names", nargs="*", metavar="name", help=NAMES_HELP)
     p.add_argument("-c", "--components", nargs="+", default=["claude"],
                    metavar="component",
-                   help="claude (default), pi, gh, gitleaks, bun, apt")
+                   help="claude (default), pi, npm, gh, gitleaks, bun, apt")
     p.set_defaults(func=cmd_update)
 
     return parser

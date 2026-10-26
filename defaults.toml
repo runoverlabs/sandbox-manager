@@ -302,7 +302,12 @@ PI_OFFLINE = "1"
 # Defaults for bootstrap.sh. A sandbox entry's [versions] table overrides these
 # per component, which is also where `msbctl update` records what it installed
 # so that a later rebuild reproduces it rather than silently reverting.
-node     = "22"
+node     = "24"
+# npm itself, installed over the one node's major line bundles (24 ships npm 11)
+# with `npm install -g npm@<this>`, which checks the registry's sha512 like any
+# package. Mind its `engines`: npm 12 needs node ^22.22.2, ^24.15 or >=26, so a
+# lower node pin needs a lower npm one. "" keeps the npm node came with.
+npm      = "12.2.1"
 gitleaks = "8.30.1"
 gh       = "2.102.0"
 bun      = "1.4.2"

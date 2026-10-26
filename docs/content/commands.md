@@ -489,11 +489,11 @@ msbctl update [name…] [-c component…]
 
 Update components in place, without a rebuild. Versions installed this way are
 recorded so a rebuild reproduces them. Run `msbctl ls --refresh` first for
-`gh`, `gitleaks` and `bun`.
+`npm`, `gh`, `gitleaks` and `bun`.
 
 | Option | Meaning |
 | --- | --- |
-| `-c`, `--components` | any of `claude` (the default), `pi`, `gh`, `gitleaks`, `bun`, `apt`. `pi` also updates pi's packages, except a pinned one |
+| `-c`, `--components` | any of `claude` (the default), `pi`, `npm`, `gh`, `gitleaks`, `bun`, `apt`. `pi` also updates pi's packages, except a pinned one |
 
 ## The machine and msb-manager itself
 
