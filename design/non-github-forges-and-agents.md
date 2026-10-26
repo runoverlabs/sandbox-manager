@@ -1,7 +1,7 @@
 # Non-GitHub forges, and following through on the agent choice
 
 Plan written from a first `msbctl add` against a self-hosted Forgejo
-(`ssh://git@git.vild.party:2222/vincent/cell.git`) with only pi as agent.
+(`ssh://git@git.example.org:2222/you/project.git`) with only pi as agent.
 Line numbers are from `msbctl` at bcdad82.
 
 ## What went wrong, and why
@@ -14,7 +14,7 @@ treats the Forgejo URL as a GitHub slug:
 
 | Symptom in the transcript | Where |
 |---|---|
-| `git clone git@github.com:ssh://git@git.vild.party:2222/vincent/cell.git.git` | `url = f"git@github.com:{repo}.git"` (10178) |
+| `git clone git@github.com:ssh://git@git.example.org:2222/you/project.git.git` | `url = f"git@github.com:{repo}.git"` (10178) |
 | clone target `cell/cell.git` | `repo.split("/")[-1]` keeps `.git` (10168) |
 | "could not read languages from GitHub" | `detect_features()` → `api.github.com/repos/<url>/languages` |
 | `github` feature ticked | `[defaults] rule_groups = ["github", "claude"]` preselects it no matter the remote |
@@ -53,9 +53,9 @@ Add `RepoRef.parse(text) -> RepoRef | None`, the only reader of `repo` (see
 
 ```
 kind      "github" | "forgejo" | "gitlab" | "generic"
-host      git.vild.party
+host      git.example.org
 ssh_port  2222 (None for the default)
-path      vincent/cell                 (owner/name, ".git" stripped)
+path      you/project                (owner/name, ".git" stripped)
 url       the clone URL exactly as typed, or built from github owner/name
 ```
 

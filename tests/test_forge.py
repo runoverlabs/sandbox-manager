@@ -23,13 +23,13 @@ class RepoRefTest(MsbctlTest):
                 self.assertEqual(ref.name, "name")
 
     def test_another_forge_keeps_its_url(self):
-        url = "ssh://git@git.vild.party:2222/vincent/cell.git"
+        url = "ssh://git@git.example.org:2222/you/project.git"
         ref = self.m.RepoRef.parse(url)
         self.assertEqual((ref.kind, ref.host, ref.ssh_port, ref.path, ref.name),
-                         ("generic", "git.vild.party", 2222, "vincent/cell", "cell"))
+                         ("generic", "git.example.org", 2222, "you/project", "project"))
         self.assertEqual(ref.url, url)
         self.assertEqual(ref.stored, url)
-        self.assertEqual(ref.known_hosts_name, "[git.vild.party]:2222")
+        self.assertEqual(ref.known_hosts_name, "[git.example.org]:2222")
         # Stored and read back, it is the same repo.
         self.assertEqual(self.m.RepoRef.parse(ref.stored), ref)
 
@@ -76,7 +76,7 @@ class WizardForgeTest(MsbctlTest):
         return entry, policy, out + err
 
     def test_a_forge_repo_asks_nothing_about_github(self):
-        url = "ssh://git@git.vild.party:2222/vincent/cell.git"
+        url = "ssh://git@git.example.org:2222/you/project.git"
         entry, policy, text = self.add(url)
         self.assertEqual(entry["repo"], url)
         self.assertFalse(policy["secrets"]["github"])

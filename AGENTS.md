@@ -12,6 +12,7 @@ This file provides guidance to coding agents (Claude Code, Codex, and anything e
 
 - **No dependencies.** Python 3.11+ stdlib (`tomllib`) and the `msb` binary only. No pip, no TOML writer. A host tool an opt-in feature calls (`fzf` for the picker, `secret-tool` with `busctl`/`gdbus` for `[secrets] store = "keyring"`) is allowed only if its absence turns that feature off and nothing else: probe with `shutil.which`, never require it. Registry entries are rendered whole from `templates/` and only read back via `tomllib`; the single exception is the `[versions]` table that `update` rewrites (`write_version_override()`).
 - `.gitignore` blocks `*.env` and `secrets/`. Nothing machine-local or generated belongs in the repo.
+- **No real infrastructure in anything public.** The operator's own hostnames, domains, LAN addresses, ports, usernames and repo paths never go into code, tests, comments, docs, commit messages, PR or issue text, or anything else that gets published, even when a bug report or a terminal transcript quoted them. Use reserved placeholders instead: `example.org` / `git.example.org`, `you/project`, `192.0.2.0/24` (RFC 5737), and the like. This repo is public, and a force-push does not take a published name back.
 - Comments in config/templates are the documentation (failure modes are non-obvious and cost debugging sessions). Preserve and extend them when changing behaviour; `msbctl --help` and `defaults.toml` are the user-facing docs.
 
 - **Every behaviour change gets a one-line entry in `CHANGELOG.md`** under
