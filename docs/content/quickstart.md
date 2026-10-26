@@ -24,6 +24,9 @@ them later:
 - **Git identities**: the names and emails a sandbox can commit as, and
   optionally an SSH key to sign with. They're applied inside the guest with
   `git config --system`, so a repo's own identity still wins.
+- **Coding agents**: which agents a new sandbox gets ticked: Claude Code, pi,
+  both or none. The steps below that only one agent uses are skipped when no
+  sandbox would get it.
 - **Claude login**: a long-lived token from `claude setup-token`, stored in
   `~/.config/msb/secrets/global.env` (mode 0600). Sandboxes get a placeholder
   for it; the real token never enters a VM. You can store several under names
@@ -56,17 +59,20 @@ The wizard then asks, in order:
    If the folder is empty, it offers to clone the repo into a subfolder. A repo
    that isn't on GitHub skips every GitHub step below; see
    [Credentials](credentials.md#a-repo-that-isnt-on-github).
-3. **Git identity** and **SSH keys**: which keys from your host agent this
+3. **Coding agents**: ticked from `[defaults] agents`. Every later step follows
+   this answer: without Claude Code there's no Claude token step and no token
+   bound; with pi you pick its model endpoints. None is fine.
+4. **Git identity** and **SSH keys**: which keys from your host agent this
    sandbox may use. Nothing is ticked by default.
-4. **Features and agents**: what the project needs, not raw egress rules.
+5. **Features**: what the project needs, not raw egress rules.
    Ticking `python` brings the PyPI egress group *and* the toolchain packages.
    For a GitHub repo, features are pre-ticked from the repo's languages.
-5. **Resources and disks**: cpus, memory, the root disk size and, for podman,
+6. **Resources and disks**: cpus, memory, the root disk size and, for podman,
    a container disk.
-6. **Package caches, extra folders and secrets**: all optional.
-7. **Image**: offered pinned by digest, so a moving tag can't change the
+7. **Package caches, extra folders and secrets**: all optional.
+8. **Image**: offered pinned by digest, so a moving tag can't change the
    sandbox underneath you.
-8. **GitHub token**, for a GitHub repo: a fine-grained PAT for this one
+9. **GitHub token**, for a GitHub repo: a fine-grained PAT for this one
    repository, read straight into a 0600 file. It's never echoed and never on a
    command line.
 

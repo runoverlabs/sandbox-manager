@@ -8,7 +8,14 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- `[defaults] agents` (`["claude"]` by default; `msbctl setup` → Coding agents) decides which coding agents a new sandbox gets ticked, `[]` for none; pi is still ticked too when `[defaults] llm` names an endpoint. The first-run setup skips the Claude login when no new sandbox gets Claude, and the model endpoints when none gets pi.
+
+### Changed
+- `msbctl add` asks for the coding agents right after the repo, and the steps after follow the answer: no Claude token step without Claude Code, and the guest-path note no longer assumes Claude. `msbctl edit` → Claude token says it is not used in a sandbox without Claude.
+
 ### Fixed
+- A sandbox without Claude Code (pi only, or no agent) no longer has the stored Claude token bound at start, and no longer reads it: before, it got the `CLAUDE_CODE_OAUTH_TOKEN` placeholder whenever a token was stored, and a locked keyring could prompt, or hold up its autostart, for a token nothing in it used.
 - `msbctl add` handles a repo that isn't on GitHub: give it the clone URL (`https://`, `ssh://user@host:port/path` or `user@host:path`) and it is cloned as given, stored in `repo` as given, and the GitHub steps (PAT, `[secrets] github`, the gh/ssh push question, language detection, the pre-ticked `github` feature) are skipped. Before, any such URL was turned into `git@github.com:<url>.git` and treated as a GitHub repo. The agent's CLAUDE.md names the forge, and `add --repo` refuses one, which it cannot clone.
 
 ## [0.9.1] - 2026-10-26
