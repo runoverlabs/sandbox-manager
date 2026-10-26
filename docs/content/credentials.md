@@ -275,6 +275,34 @@ because one key registered with GitHub for both uses is common. Sandboxes
 [without a folder](repo-sandboxes.md) have no agent and
 always use `"gh"`.
 
+## A repo that isn't on GitHub
+
+Give `msbctl add` the clone URL of a repo on Codeberg, a Forgejo of your own,
+or any other forge: `ssh://git@git.example.org:2222/you/thing.git`,
+`git@codeberg.org:you/thing.git` or an `https://` URL. It's stored in the
+registry entry's `repo` as you gave it, and the wizard skips everything that
+is GitHub's: the PAT step, the `[secrets] github` binding, the gh/ssh question
+and the language lookup, and the `github` feature isn't pre-ticked.
+
+Inside the sandbox, git uses the remote as it is. There's no rewrite and no
+token:
+
+- **An ssh URL** pushes through the [filtered agent](#ssh-the-filtered-agent),
+  with the keys the sandbox is allowed. Tick the key that forge knows.
+- **The host and port must be allowed.** An egress rule like
+  `allow@git.example.org:tcp:2222` must be in one of the sandbox's rule groups;
+  otherwise the connection is refused like any other.
+- **The host must be in your `~/.ssh/known_hosts`.** The guest gets a
+  read-only copy, so a host first met inside the sandbox fails host-key
+  checking. The wizard says so when it's missing; cloning on the host once
+  adds it.
+- **An https URL** fetches a public repo but can't push: nothing in the
+  sandbox holds a credential for that host.
+
+A sandbox [without a folder](repo-sandboxes.md) is cloned through GitHub's
+API, so `add --repo` refuses any other forge. Clone it into a folder and add
+the folder.
+
 ## Commit signing
 
 Give an identity in `config.toml` (or in `msbctl setup` → "Git identities") a

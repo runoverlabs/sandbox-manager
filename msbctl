@@ -62,6 +62,7 @@ import argparse
 import base64
 import binascii
 import contextlib
+import dataclasses
 import datetime as dt
 import errno
 import fcntl
@@ -1561,6 +1562,10 @@ class Sandbox:
         self.is_repo = self.source == "repo"
         self.is_kandev = self.source == "kandev"
         self.repo = self.entry.get("repo", "")
+        # The one parsed form of `repo` (see RepoRef): None for no repo, and
+        # for a value no msbctl would have written.
+        self.repo_ref = RepoRef.parse(self.repo)
+        self.on_github = bool(self.repo_ref and self.repo_ref.on_github)
         if self.is_kandev:
             self.project = os.path.join(STATE_DIR, "kandev", name)
         elif self.is_repo:
@@ -2458,7 +2463,7 @@ class Sandbox:
         pushed (there is no agent to forward), and the binding is the fixed
         one, to GitHub only."""
         return bool(self.is_repo or self.project_cfg.get("secrets", {}).get(
-            "github", bool(self.repo)))
+            "github", self.on_github))
 
     def own_secret_vars(self):
         """The variables of this sandbox's own env file a start reads: GH_TOKEN
@@ -3311,6 +3316,15 @@ def sandbox_profile_section(box, harness="claude"):
                   "project's, and they reach sites the sandbox itself cannot:", ""]
         lines += [f"- **{name}**: {spec['description']}" for name, spec in tools]
         lines += [""]
+    if box.repo_ref and not box.on_github:
+        # Said first and plainly: the central CLAUDE.md is written around GitHub,
+        # and an agent told about gh and GH_TOKEN goes looking for both.
+        how = ("over ssh, through the forwarded agent" if box.repo_ref.known_hosts_name
+               else "over https")
+        lines += [f"This project's repository is on **{box.repo_ref.host}**, not GitHub: "
+                  f"`{box.repo}`. git uses that remote as it is, {how}. Nothing here holds "
+                  f"a token for {box.repo_ref.host}'s API, and GH_TOKEN does not reach it.",
+                  ""]
     lines += [f"git reaches GitHub over **{box.git_push}**: " + GIT_PUSH_PROFILE[box.git_push],
               ""]
     if box.shares_host_index:
@@ -4852,7 +4866,7 @@ def cmd_purge(args, config):
     cache.pop(box.name, None)
     write_json(VERSIONS_CACHE, cache)
     note(f"{box.name} purged")
-    if box.repo:
+    if box.on_github:
         note("Revoke its PAT: https://github.com/settings/personal-access-tokens")
     return {"name": box.name, "purged": True}
 
@@ -5065,11 +5079,11 @@ def move_project(box, raw, config):
     path = registry_path(box)
     set_toml_key(path, "project", project)
     note(f"project    {tilde(project)}")
-    repo = github_repo(project)
-    if repo and repo != box.repo:
-        set_toml_key(path, "repo", repo)
-        note(f"repo       {repo}  (was {box.repo or 'none'})")
-        if stored_env(os.path.join(SECRETS_DIR, f"{box.name}.env")).get("GH_TOKEN"):
+    ref = checkout_repo(project)
+    if ref and ref.stored != box.repo:
+        set_toml_key(path, "repo", ref.stored)
+        note(f"repo       {ref}  (was {box.repo or 'none'})")
+        if box.on_github and stored_env(os.path.join(SECRETS_DIR, f"{box.name}.env")).get("GH_TOKEN"):
             warn(f"its GitHub token was made for {box.repo or 'another repo'} — "
                  f"`msbctl edit {box.name}` → GitHub token to replace it")
     return True
@@ -6401,8 +6415,7 @@ def secret_set(box, config, args):
     # A folder sandbox that does not bind GitHub yet: turning that on is
     # `[secrets] github = true` in the project, a pinned key. Checked before
     # anything is read or stored.
-    github_off = var == "GH_TOKEN" and not (
-        box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo)))
+    github_off = var == "GH_TOKEN" and not box.wants_github
     if github_off and restricted():
         die(f"{box.name} does not bind GH_TOKEN, and turning that on changes the project's "
             f"policy — on the host: `msbctl edit {box.name}` → GitHub token")
@@ -7738,7 +7751,7 @@ def section_features(box, config, ctx):
     project = require_project_file(box)
     cur = {"agents": [k for k, _, _ in AGENTS if box.wants_component(k)],
            "features": current_features(box)}
-    plan = pick_features(groups_all, box.rule_groups, "", config, current=cur)
+    plan = pick_features(groups_all, box.rule_groups, None, config, current=cur)
     # Packages a FEATURE brings are rewritten; any the operator added by hand stay.
     managed = {p for _, _, spec in FEATURES for p in spec.get("packages", [])}
     extras = [p for p in boot_cfg(box).get("packages", []) if p not in managed]
@@ -7971,13 +7984,12 @@ GH_SPEC = "GH_TOKEN@github.com,api.github.com"
 
 def _github_state(box):
     own = stored_env(os.path.join(SECRETS_DIR, f"{box.name}.env"))
-    bound = box.is_repo or box.project_cfg.get("secrets", {}).get("github", bool(box.repo))
-    return bool(own.get("GH_TOKEN")), bool(bound)
+    return bool(own.get("GH_TOKEN")), box.wants_github
 
 
 def _summary_github(box):
-    if not box.repo:
-        return "no GitHub repo recorded"
+    if not box.on_github:
+        return f"not used: the repo is on {box.repo_ref.host}" if box.repo_ref else "no GitHub repo recorded"
     stored, bound = _github_state(box)
     if stored and bound:
         return "token stored and bound"
@@ -7994,12 +8006,21 @@ def section_github(box, config, ctx):
     # no project switch to flip.
     project = None if box.is_repo else require_project_file(box)
     say("GitHub token")
+    if box.repo_ref and not box.on_github:
+        # The PAT and its binding are GitHub's; a token for another forge is a
+        # secret binding to that host (Secrets).
+        note(f"the repo is on {box.repo_ref.host}, not GitHub: {box.repo}")
+        note("a token for it is a secret bound to that host — Secrets")
+        return
     if not box.repo:
         raw = ask("GitHub repo this sandbox works on (owner/name or URL, blank to cancel)")
-        repo = parse_github_url(raw) or raw
-        if not repo:
+        if not raw.strip():
             return
-        set_toml_key(registry_path(box), "repo", repo)
+        ref = RepoRef.parse(raw)
+        if not ref or not ref.on_github:
+            warn(f"{raw!r} is not a GitHub repo (owner/name, or its URL) — nothing changed")
+            return
+        set_toml_key(registry_path(box), "repo", ref.stored)
         box = Sandbox(box.name, config)
     stored, bound = _github_state(box)
     note(f"repository: {box.repo}")
@@ -8853,7 +8874,8 @@ def cmd_show(args, config):
         note(f"project    {tilde(box.project)}")
     note(f"in guest   {box.guest_project}")
     if not box.is_repo:
-        note(f"repo       {box.repo or '(no GitHub remote)'}")
+        note(f"repo       {box.repo or '(none)'}"
+             + (f"  ({box.repo_ref.kind})" if box.repo_ref and not box.on_github else ""))
     note(f"conf       {box.conf}  (read for the image only)")
     for problem in conf_problems(box.conf_path):
         warn(f"{box.conf} {problem} — ignored by msbctl, and a rebuild will refuse")
@@ -9386,32 +9408,110 @@ def checkouts(project):
     return found
 
 
-def parse_github_url(url):
-    """owner/name from a GitHub URL, or "" .
+# A sandbox's repository is ONE registry key, `repo`, and RepoRef.parse() is its
+# only reader: nothing else looks inside the string. It holds owner/name for a
+# GitHub repo (what every entry before other forges were supported holds, so
+# those parse unchanged) and the URL as given for any other forge. Anything
+# that depends on where the repo lives — the clone URL, the PAT step, the
+# GitHub binding, language detection — asks the parsed value, never the string,
+# because a bare `bool(repo)` used to read as "on GitHub" and turned a Forgejo
+# URL into `git@github.com:ssh://...`.
+#
+# The kind is known from the host name alone, and only for the hosts below.
+# Any other host is "generic": git over the URL as it is, and nothing assumed
+# about an API.
+FORGE_KINDS = {"github.com": "github", "codeberg.org": "forgejo"}
+_REPO_HOST = r"[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?"
+_REPO_PATH = r"[\w.~+-]+(?:/[\w.~+-]+)*"
+_REPO_USER = r"[\w.+-]+"
+# What a `repo` value may be. The value is rendered into a registry entry
+# between double quotes, so a strict character set here is also what keeps
+# that file valid TOML.
+_REPO_SCHEMED = re.compile(
+    rf"(?P<scheme>https|ssh)://(?:(?P<user>{_REPO_USER})@)?(?P<host>{_REPO_HOST})"
+    rf"(?::(?P<port>[0-9]{{1,5}}))?/(?P<path>{_REPO_PATH})/?")
+_REPO_SCP = re.compile(rf"(?P<user>{_REPO_USER})@(?P<host>{_REPO_HOST}):(?P<path>{_REPO_PATH})/?")
+_REPO_SLUG = re.compile(r"[\w.-]+/[\w.-]+")
+REPO_HELP = ("owner/name for GitHub, or the clone URL: https://host/path, "
+             "ssh://user@host[:port]/path or user@host:path")
 
-    Handles the three forms a GitHub remote takes (https, ssh://, scp-style). A
-    repository identity has to be derived rather than typed, or it is wrong
-    exactly when it matters.
-    """
-    url = url.strip()
-    for prefix in ("https://github.com/", "ssh://git@github.com/",
-                   "git@github.com:"):
-        if url.startswith(prefix):
-            return url[len(prefix):].removesuffix(".git").rstrip("/")
-    # Already in owner/name form.
-    if re.fullmatch(r"[\w.-]+/[\w.-]+", url):
-        return url.removesuffix(".git")
-    return ""
+
+@dataclasses.dataclass(frozen=True)
+class RepoRef:
+    kind: str           # "github", "forgejo" or "generic"
+    host: str           # github.com, codeberg.org, git.example.org
+    path: str           # owner/name (more segments on some forges), no .git
+    url: str            # what `git clone` gets on the host
+    ssh_port: int = 0   # an ssh:// URL's port, 0 when it names none
+
+    @classmethod
+    def parse(cls, text):
+        """The repo `text` names, or None when it is empty or not a repo."""
+        text = (text or "").strip()
+        if _REPO_SLUG.fullmatch(text):
+            path = text.removesuffix(".git")
+            return cls("github", "github.com", path, f"git@github.com:{path}.git")
+        m = _REPO_SCHEMED.fullmatch(text) or _REPO_SCP.fullmatch(text)
+        if not m:
+            return None
+        host = m["host"].lower()
+        path = m["path"].removesuffix(".git")
+        port = int(m.groupdict().get("port") or 0)
+        if not path or port > 65535:
+            return None
+        kind = FORGE_KINDS.get(host, "generic")
+        if kind == "github":
+            # Stored as owner/name, so a GitHub repo reads the same whichever
+            # form was typed, and the host clones it over ssh, as it always has.
+            if not _REPO_SLUG.fullmatch(path):
+                return None
+            return cls("github", host, path, f"git@github.com:{path}.git")
+        return cls(kind, host, path, text, port)
+
+    @property
+    def on_github(self):
+        return self.kind == "github"
+
+    @property
+    def stored(self):
+        """What the registry's `repo` holds for it."""
+        return self.path if self.on_github else self.url
+
+    @property
+    def name(self):
+        """The repository's own name: the folder a clone goes into."""
+        return self.path.rsplit("/", 1)[-1]
+
+    @property
+    def known_hosts_name(self):
+        """How ~/.ssh/known_hosts names the host for an ssh URL, or "" for https."""
+        if self.url.startswith("https://"):
+            return ""
+        return f"[{self.host}]:{self.ssh_port}" if self.ssh_port not in (0, 22) else self.host
+
+    def __str__(self):
+        return self.stored
 
 
-def github_repo(project):
-    """owner/name for a project, looking in every checkout it contains."""
+def checkout_repo(project):
+    """The repo a project's checkouts come from, or None: the first origin (or
+    upstream) remote that parses, looking in every checkout it contains."""
     for checkout in checkouts(project):
         for remote in ("origin", "upstream"):
-            repo = parse_github_url(git(checkout, "remote", "get-url", remote))
-            if repo:
-                return repo
-    return ""
+            ref = RepoRef.parse(git(checkout, "remote", "get-url", remote))
+            if ref:
+                return ref
+    return None
+
+
+def known_host(ref):
+    """Whether this machine's known_hosts already has `ref`'s ssh host. True for
+    an https URL, which needs none."""
+    name = ref.known_hosts_name
+    if not name or not shutil.which("ssh-keygen"):
+        return True
+    proc = subprocess.run(["ssh-keygen", "-F", name], capture_output=True, text=True)
+    return proc.returncode == 0
 
 
 def ask(prompt, default=""):
@@ -9921,12 +10021,13 @@ def _detected_tag(share):
     return f"  ({pct} detected)"
 
 
-def detect_features(repo, config):
-    """Say what GitHub reports for `repo`; return {feature key: share} for every
-    feature whose languages appear in it, however small."""
-    if not repo:
+def detect_features(ref, config):
+    """Say what GitHub reports for `ref` (a RepoRef, or None); return {feature
+    key: share} for every feature whose languages appear in it, however small.
+    Only GitHub is asked: for a repo elsewhere this returns {} without a word."""
+    if not ref or not ref.on_github:
         return {}
-    languages = github_languages(repo, config)
+    languages = github_languages(ref.path, config)
     if not languages:
         note("could not read languages from GitHub (offline, private or rate "
              "limited) — using the defaults")
@@ -9952,14 +10053,15 @@ def _enable_groups(key, spec, groups, plan):
                  "stay refused until you add one — see defaults.toml")
 
 
-def pick_features(groups, default_groups, repo="", config=None, current=None):
+def pick_features(groups, default_groups, ref=None, config=None, current=None):
     """Ask for coding agents first, then features — with whatever the chosen
     agents depend on locked on — then for egress groups nothing owns (your own,
     such as one for a LAN). Returns what to write into sandbox.toml.
 
     `current` ({"agents": [...], "features": [...]}) preselects an existing
     sandbox's choices, for editing; without it the defaults and the repo's
-    detected languages decide."""
+    detected languages decide. `ref` is the RepoRef, or None: a repo that is not
+    on GitHub keeps the github feature from being preselected by the defaults."""
     plan = {"groups": set(), "packages": [], "bun": False, "gitleaks": False, "agents": [], "features": [],
             "root_disk": "", "cpus": 0, "memory": "", "caches": {},
             "containers_disk": "", "containers_storage": ""}
@@ -9978,7 +10080,7 @@ def pick_features(groups, default_groups, repo="", config=None, current=None):
     say("Features")
     note("Each ticked feature installs what it needs and opens the egress it")
     note("needs. base (DNS, the :80 deny, Ubuntu mirrors) is always applied.")
-    hints = detect_features(repo, config or {})
+    hints = detect_features(ref, config or {})
     flabels = {f"{key:<8} {desc}" + (_detected_tag(hints[key]) if key in hints else ""):
                (key, spec) for key, desc, spec in FEATURES}
     locked = {}
@@ -9989,9 +10091,10 @@ def pick_features(groups, default_groups, repo="", config=None, current=None):
     if current:
         on = [label for label, (key, _) in flabels.items() if key in current["features"]]
     else:
+        elsewhere = bool(ref and not ref.on_github)
         on = [label for label, (key, spec) in flabels.items()
               if hints.get(key, 0) >= LANGUAGE_THRESHOLD
-              or (not spec.get("opt_in")
+              or (not spec.get("opt_in") and not (key == "github" and elsewhere)
                   and all(g in default_groups for g in spec["groups"]))]
     picked = [flabels[label] for label in
               toggle_list("features", list(flabels), on, locked)]
@@ -10085,11 +10188,10 @@ def add_on_remote(remote, args, config):
     say(f"A sandbox on {remote}")
     note("There is no folder of yours on that machine, so the code is cloned inside")
     note("the sandbox, from GitHub, and work leaves it by `git push`.")
-    here = parse_github_url(git(os.getcwd(), "remote", "get-url", "origin")) or ""
-    raw = args.repo or ask("GitHub repo (owner/name or URL)", here)
-    repo = (parse_github_url(raw) or raw).strip().removesuffix(".git")
-    if not REPO_NAME.fullmatch(repo) or ".." in repo:
-        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    here = RepoRef.parse(git(os.getcwd(), "remote", "get-url", "origin"))
+    raw = args.repo or ask("GitHub repo (owner/name or URL)",
+                           here.stored if here and here.on_github else "")
+    repo = github_repo_arg(raw)
     default_name = re.sub(r"[^a-z0-9-]+", "-", repo.split("/")[1].lower()).strip("-")
     name = args.new_name or ask("sandbox name", default_name)
     if not SANDBOX_NAME.fullmatch(name):
@@ -10159,23 +10261,39 @@ def cmd_add(args, config):
     entry_path = os.path.join(REGISTRY_DIR, f"{name}.toml")
 
     found = checkouts(project)
-    repo = ask("GitHub repo (owner/name or URL, blank for none)",
-               github_repo(project))
-    repo = parse_github_url(repo) or repo
+    here = checkout_repo(project)
+    raw = ask("repo (owner/name for GitHub, or its clone URL; blank for none)",
+              here.stored if here else "")
+    ref = RepoRef.parse(raw)
+    if raw.strip() and not ref:
+        die(f"{raw!r} is not a repo: {REPO_HELP}")
+    repo = ref.stored if ref else ""
+    on_github = bool(ref and ref.on_github)
 
-    if repo and not found:
+    if ref and not found:
         # Nothing checked out yet, so this is the "new project" case: clone
         # into a subfolder named after the repo, leaving the project folder
         # itself free to hold .msb/ and anything else alongside it.
-        target = os.path.join(project, repo.split("/")[-1])
+        target = os.path.join(project, ref.name)
         say("Clone")
         note(f"nothing checked out in {tilde(project)} yet")
         note(f"clone into {tilde(target)}?")
         note("")
-        note("SSH, on this machine with your own key. Inside the sandbox git rewrites")
-        note("the URL to however it pushes (the Git push step below), so the checkout's")
-        note("origin stays one this machine can use.")
-        url = f"git@github.com:{repo}.git"
+        if on_github:
+            note("SSH, on this machine with your own key. Inside the sandbox git rewrites")
+            note("the URL to however it pushes (the Git push step below), so the checkout's")
+            note("origin stays one this machine can use.")
+        else:
+            note("On this machine, with your own key. Inside the sandbox git uses this URL")
+            note("as it is: over ssh, through the forwarded agent, with the keys you allow")
+            note("below, and to a host the sandbox's egress rules must allow.")
+        if not known_host(ref):
+            # The guest's known_hosts is this machine's, read-only: a host first
+            # met inside the sandbox cannot be added there, and ssh refuses it.
+            note("")
+            note(f"{ref.known_hosts_name} is not in your ~/.ssh/known_hosts yet: the clone asks you")
+            note("to check its key, and the sandbox can reach it only once it is there.")
+        url = ref.url
         if os.path.exists(target):
             note(f"{tilde(target)} already exists — leaving it alone")
         elif confirm(f"git clone {url}"):
@@ -10210,8 +10328,18 @@ def cmd_add(args, config):
         if identity and identity not in idents:
             die(f"unknown identity: {identity}")
 
-    git_push = pick_git_push(config.get("defaults", {}).get("git_push", "gh"),
-                             identity, idents.get(identity, {}) if identity else {})
+    # gh/ssh only ever rewrites github.com URLs: for a repo elsewhere there is
+    # nothing to choose, and the default is kept for any GitHub repo it meets.
+    git_push = config.get("defaults", {}).get("git_push", "gh")
+    if ref and not on_github:
+        say("Git push")
+        note(f"git uses the remote as it is: {ref.url}")
+        if ref.known_hosts_name:
+            note("over ssh, through the forwarded agent, with the keys ticked below")
+        else:
+            note("over https, which pushes only with a credential for that host")
+    else:
+        git_push = pick_git_push(git_push, identity, idents.get(identity, {}) if identity else {})
 
     say("SSH keys")
     note("Which keys in your host ssh-agent this sandbox may use, for git over")
@@ -10222,7 +10350,10 @@ def cmd_add(args, config):
     if sign_fp:
         note(f"{identity} signs commits with the key marked{SIGNS_MARK.strip()}; it is ticked")
         note("for you, and without it this sandbox commits unsigned.")
-    push_pub = idents.get(identity, {}).get("push_key") if identity and git_push == "ssh" else None
+    # The push key is ticked when git will push over ssh: GitHub in ssh mode,
+    # or a repo elsewhere with an ssh URL.
+    ssh_push = git_push == "ssh" if on_github or not ref else bool(ref.known_hosts_name)
+    push_pub = idents.get(identity, {}).get("push_key") if identity and ssh_push else None
     push_fp = (_parse_pub_line(push_pub) or (None,))[0] if push_pub else None
     if push_fp and push_fp != sign_fp:
         note(f"{identity} pushes with the other key ticked for you; without it git push fails.")
@@ -10232,7 +10363,7 @@ def cmd_add(args, config):
 
     groups = sorted(g for g in config.get("rules", {}) if g != "base")
     default_groups = config.get("defaults", {}).get("rule_groups", [])
-    plan = pick_features(groups, default_groups, repo, config)
+    plan = pick_features(groups, default_groups, ref, config)
     llm = None                       # follow [defaults] llm
     if "pi" in plan["agents"]:
         say("Models for pi")
@@ -10260,7 +10391,8 @@ def cmd_add(args, config):
         if digest and confirm(f"pin to {digest}?"):
             image = f"{image}@{digest}"
         elif not digest:
-            warn("could not resolve a digest — leaving the tag unpinned")
+            warn("could not resolve a digest (offline, or a registry that refuses anonymous "
+                 "pulls, as a private one does) — leaving the tag unpinned")
 
     # ------------------------------------------------------------- the tokens
     claude_token = ""
@@ -10272,7 +10404,7 @@ def cmd_add(args, config):
         choice = choose_one("which Claude account this sandbox uses", [follow] + list(tokens), 0)
         claude_token = "" if choice == follow else choice
 
-    want_github = bool(repo)
+    want_github = on_github
     if want_github:
         say("GitHub token")
         github_token_help(repo)
@@ -10388,6 +10520,18 @@ def cmd_add(args, config):
     note("The first start runs the bootstrap and takes a few minutes.")
 
 
+def github_repo_arg(raw):
+    """owner/name for `add --repo`, or die. A sandbox with no folder is cloned
+    and its policy fetched through GitHub's API, so it is GitHub's only."""
+    ref = RepoRef.parse(raw)
+    if ref and not ref.on_github:
+        die(f"{ref.host} is not GitHub: a sandbox cloned from a repo is GitHub-only for now. "
+            "Clone it into a folder and `msbctl add` that folder instead")
+    if not ref or not REPO_NAME.fullmatch(ref.path) or ".." in ref.path:
+        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    return ref.path
+
+
 def cmd_add_repo(args, config):
     """add --repo OWNER/NAME: a sandbox with no host folder. Its code is cloned
     inside the sandbox at the first create; its policy is the repo's .msb/,
@@ -10396,10 +10540,7 @@ def cmd_add_repo(args, config):
     Nothing is written into any folder."""
     if args.dir:
         die("give a folder or --repo, not both")
-    raw = args.repo.strip()
-    repo = (parse_github_url(raw) or raw).removesuffix(".git")
-    if not REPO_NAME.fullmatch(repo) or ".." in repo:
-        die(f"{raw!r} is not a GitHub repo (owner/name, or its URL)")
+    repo = github_repo_arg(args.repo)
     interactive = sys.stdin.isatty() and sys.stdout.isatty()
     defaults = config.get("defaults", {})
     say(f"Register a sandbox cloned from {repo}")
