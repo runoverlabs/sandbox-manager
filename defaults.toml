@@ -560,6 +560,12 @@ go = [
     "allow@sum.golang.org:tcp:443",
     # The Go vulnerability database, which govulncheck reads.
     "allow@vuln.go.dev:tcp:443",
+    # proxy.golang.org answers a module's .zip (and a GOTOOLCHAIN download)
+    # with a redirect to its Google Cloud Storage bucket, so without this
+    # `go mod download` fails on the first zip with an error naming only the
+    # proxy. It is all of GCS, not just the proxy's bucket: a host rule cannot
+    # narrow by path.
+    "allow@storage.googleapis.com:tcp:443",
 ]
 
 # `playwright install` downloads its browser builds from here, for the npm and
