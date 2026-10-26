@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-10-26
+
 ### Changed
 - New sandboxes get node 24 (the active LTS) instead of 22, which is in maintenance until April 2027; a sandbox whose own `[versions]` pins `node` keeps it, and an existing one changes on its next rebuild.
 - Sandboxes get npm 12.2.1 instead of the npm that node ships (11 on node 24): a new `npm` pin in `[versions]` (`""` keeps node's own), shown by `ls --refresh` and updated in place with `msbctl update . -c npm`; existing sandboxes need a rebuild or that update.
