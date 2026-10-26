@@ -24,6 +24,7 @@ A group is a named list of rules. msb-manager ships these in `defaults.toml`:
 | `go` | the Go module proxy and checksum database |
 | `containers` | Docker Hub (all three hosts it needs), ghcr.io, codeberg.org |
 | `playwright` | Playwright's browser downloads (the `browsers` feature) |
+| `codeberg` | codeberg.org over HTTPS and SSH, for a repo there; `msbctl add` ticks it for one |
 
 New sandboxes start with `github` and `claude`, and the wizard adds whatever
 the chosen features need. A project lists its groups in `.msb/sandbox.toml`:
@@ -124,6 +125,13 @@ For hosts on your LAN (a Git server, a package mirror), define a group once in
 `config.toml`, or use `msbctl setup` → "your network". If those names resolve
 to private addresses, list the group under `private_dns_groups`, so sandboxes
 that use it get `allow_private_dns` automatically.
+
+A project whose repo is on a forge of your own needs no step here. `msbctl add`
+reads the host and port from the repo's URL. When no group allows them, it
+writes a `forge-<host>` group into `config.toml`: `:443`, plus the SSH port for
+an `ssh://` or `user@host:` URL. If the name resolves to a private address on
+this machine, it also lists the group under `private_dns_groups`. The next
+sandbox on that forge gets the group preselected.
 
 A group of your own stays on your machine. `msbctl add` and `msbctl edit` →
 "Features & agents" put it in the sandbox's registry entry as

@@ -92,7 +92,7 @@ get a plain dev sandbox.
 | Git push | gh / ssh, as today | no question. Note: "git uses the remote as it is: ssh through the forwarded agent". With an identity `push_key`, write a `Host <host>` stanza (with `Port`) with `IdentitiesOnly`, i.e. `GUEST_PUSH_SSH_CONFIG` generalised to the forge host. An https remote with no token is fetch-only, so say that |
 | SSH keys | unchanged | unchanged, plus a hint that the push key must be ticked |
 | Features: `github` | preselected per defaults | not preselected. Only ticked by hand, for gh against other repos |
-| Forge egress | `github` group | if a configured rule group already allows `host:443` / `host:ssh_port` (here, `forgejo`), preselect it under "Other egress groups". If none does, offer to write `allow@<host>:443` and `allow@<host>:<ssh_port>` into the registry's `extra_rules` (machine-local, not pinned). If the host resolves to a private address on this machine, say that `allow_private_dns` is needed too, and why (msb drops LAN answers, which reads as NXDOMAIN). Ship a `codeberg` group in defaults.toml |
+| Forge egress | `github` group | if a configured rule group already allows `host:443` / `host:ssh_port` (here, `forgejo`), preselect it under "Other egress groups". If none does, write a machine-local `forge-<host>` group (`allow@<host>:tcp:443`, `allow@<host>:tcp:<ssh_port>`) and give it to the sandbox (see Decisions). If the host resolves to a private address on this machine, say that `allow_private_dns` is needed too, and why (msb drops LAN answers, which reads as NXDOMAIN). Ship a `codeberg` group in defaults.toml |
 | Languages | GitHub API | Forgejo/Gitea `GET /api/v1/repos/{path}/languages` has the same `{lang: bytes}` shape, so it slots straight into `suggest_features()`. GitLab `/api/v4/projects/{urlenc path}/languages` gives percentages; normalise them. Fallback for every forge, private repos included: after a clone, or with a checkout present, total `git ls-files` bytes by extension → linguist name (a small map for the languages `FEATURES` already names) |
 | Models for pi | if pi ticked | same. If pi is ticked and `[llm]` is empty, say pi has nothing to talk to and point at `msbctl setup` |
 | Claude token | only if `claude` ticked (and >1 token, as today) | same |
@@ -124,7 +124,8 @@ Outside the wizard, the same agent gating applies:
    - Tests (stdin-piped wizard): Forgejo ssh URL with port, pi-only, no
      agents, GitHub unchanged.
 2. **Make a forge work, not just stop asking.**
-   - Forge egress preselect / `extra_rules` offer + private-DNS hint.
+   - Forge egress: preselect a covering group, else a `forge-<host>` group,
+     + private DNS. **Done** (the forge-egress PR).
    - Per-host push key ssh stanza.
    - Forgejo/GitLab languages + the local-checkout fallback.
    - API kind probe + `[forges]` override.
@@ -140,11 +141,32 @@ Outside the wizard, the same agent gating applies:
    - `add --repo` for Forgejo (raw file API for the policy fetch, https clone
      with the token).
 
-## Open questions
+## Decisions
 
-(Decided: `repo` holds a full URL for a non-GitHub forge, with no new key;
-see `package-layout.md`.)
-
-- GitLab in scope, or Forgejo/Gitea (Codeberg + self-hosted) only for now?
-- Should the wizard write `extra_rules` for an unknown forge host, or only
-  suggest the `msbctl allow` command?
+- `repo` holds a full URL for a non-GitHub forge, with no new key; see
+  `package-layout.md`.
+- **GitLab is out of scope here.** It is tracked in #127 (kind detection,
+  nested groups, the languages API in percentages, a `gitlab` group, a token
+  step, `glab`). This plan covers Forgejo/Gitea: Codeberg and self-hosted.
+- **The wizard writes the forge's egress rules itself**, rather than only
+  suggesting `msbctl allow`. A repo whose host no rule allows would fail at the
+  first fetch, and then the wizard would have asked a question it already knew
+  the answer to. Details:
+  - The rules are `allow@<host>:tcp:443`, plus `allow@<host>:tcp:<ssh port>`
+    for an ssh URL. They go only where no configured rule group already allows
+    them: a group that does is preselected under "Other egress groups"
+    instead.
+  - They go in a **machine-local group, `forge-<host>`, in `config.toml`**,
+    which reaches the sandbox through the registry's `extra_rule_groups`. It is
+    machine-local, not pinned, and adds to the project's groups. Never the
+    project's `sandbox.toml`: a self-hosted forge's hostname is this machine's
+    knowledge, and a committed file would carry it to every clone of a
+    possibly public repo. Not the registry's `extra_rules` either: for a
+    folder sandbox that key *replaces* the project's list rather than adding
+    to it. The group is found again, and preselected, for the next sandbox on
+    the same forge.
+  - Codeberg gets a shipped `codeberg` group in `defaults.toml` instead, which
+    the project may name.
+  - When the host resolves to a private address here, the group is listed
+    under `private_dns_groups`, which brings `allow_private_dns` (the existing
+    mechanism for a LAN group).
