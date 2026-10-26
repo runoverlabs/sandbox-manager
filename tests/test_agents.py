@@ -9,7 +9,7 @@ import unittest.mock
 
 from tests.harness import MsbctlTest
 
-TOKEN = "sk-ant-oat01-placeholder-for-tests"   # noqa: S105  not a real token
+TOKEN = "sk-ant-oat01-placeholder-for-tests"   # not a real token
 
 
 class AgentsTest(MsbctlTest):
