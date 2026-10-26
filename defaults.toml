@@ -591,6 +591,17 @@ playwright = [
     "allow@cdn.playwright.dev:tcp:443",
 ]
 
+# Codeberg (Forgejo), for a repo there: https and git over ssh. `msbctl add`
+# preselects it for a codeberg.org repo. Any other forge gets a group of the
+# machine's own instead (forge-<host> in config.toml), made by the wizard,
+# because a self-hosted forge's name does not belong in a committed policy.
+# :22 is a name rule on a non-TLS port, so it is enforced as the addresses
+# codeberg.org resolved to at create; a move of theirs needs a rebuild here.
+codeberg = [
+    "allow@codeberg.org:tcp:443",
+    "allow@codeberg.org:tcp:22",
+]
+
 # ---------------------------------------------------------------------------
 # Secret presets
 #

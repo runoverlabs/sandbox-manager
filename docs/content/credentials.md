@@ -290,9 +290,13 @@ token:
 
 - **An ssh URL** pushes through the [filtered agent](#ssh-the-filtered-agent),
   with the keys the sandbox is allowed. Tick the key that forge knows.
-- **The host and port must be allowed.** An egress rule like
-  `allow@git.example.org:tcp:2222` must be in one of the sandbox's rule groups;
-  otherwise the connection is refused like any other.
+- **The host and port must be allowed.** The wizard takes care of it: a group
+  that already allows them is preselected. With none, it writes a
+  `forge-<host>` group into your `config.toml` (`:443` and the SSH port) and
+  gives it to the sandbox. That group is machine-local, so the forge's name
+  never reaches the project's committed `sandbox.toml`. See
+  [Hosts on your network](egress.md#hosts-on-your-network). Codeberg has a
+  shipped `codeberg` group.
 - **The host must be in your `~/.ssh/known_hosts`.** The guest gets a
   read-only copy, so a host first met inside the sandbox fails host-key
   checking. The wizard says so when it's missing; cloning on the host once

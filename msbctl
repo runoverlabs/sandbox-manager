@@ -10116,7 +10116,8 @@ def pick_agents(config, current=None):
     return [alabels[label] for label in toggle_list("agents", list(alabels), agent_on)]
 
 
-def pick_features(groups, default_groups, ref=None, config=None, current=None, agents=None):
+def pick_features(groups, default_groups, ref=None, config=None, current=None, agents=None,
+                  prefer=()):
     """Ask for coding agents first (unless `agents`, from pick_agents(), says
     they were asked already), then features — with whatever the chosen agents
     depend on locked on — then for egress groups nothing owns (your own, such as
@@ -10125,7 +10126,9 @@ def pick_features(groups, default_groups, ref=None, config=None, current=None, a
     `current` ({"agents": [...], "features": [...]}) preselects an existing
     sandbox's choices, for editing; without it the defaults and the repo's
     detected languages decide. `ref` is the RepoRef, or None: a repo that is not
-    on GitHub keeps the github feature from being preselected by the defaults."""
+    on GitHub keeps the github feature from being preselected by the defaults.
+    `prefer` names groups to preselect as well, such as one that already allows
+    the repo's forge (forge_groups())."""
     plan = {"groups": set(), "packages": [], "bun": False, "gitleaks": False, "agents": [], "features": [],
             "root_disk": "", "cpus": 0, "memory": "", "caches": {},
             "containers_disk": "", "containers_storage": ""}
@@ -10169,9 +10172,94 @@ def pick_features(groups, default_groups, ref=None, config=None, current=None, a
     if rest:
         say("Other egress groups")
         plan["groups"].update(
-            toggle_list("groups", rest, [g for g in default_groups if g in rest]))
+            toggle_list("groups", rest, [g for g in rest if g in default_groups or g in prefer]))
     plan["groups"] = [g for g in groups if g in plan["groups"]]
     return plan
+
+
+# ------------------------------------------------------------- forge egress
+#
+# A repo's forge has to be reachable or the first fetch is refused, and the
+# wizard knows the host from the URL, so it does not leave that to a failed
+# fetch and `msbctl allow`. GitHub has its feature; Codeberg a shipped group;
+# any other host gets a group of this machine's own, created once and found
+# again by the next sandbox on the same forge.
+#
+# A GROUP, in config.toml, and never a project's extra_rules or the entry's:
+# a self-hosted forge's name is this machine's knowledge, and in a committed
+# sandbox.toml it would travel with every clone of what may be a public repo;
+# and the entry's extra_rules REPLACES the project's rather than adding to it.
+# A machine-local group lands in the entry's extra_rule_groups (split_groups()),
+# which adds, and listed in private_dns_groups it brings allow_private_dns.
+
+def forge_ports(ref):
+    """The tcp ports git needs on `ref`'s host: 443, and the ssh port for an ssh URL."""
+    ports = [443]
+    if ref.known_hosts_name:
+        ports.append(ref.ssh_port or 22)
+    return list(dict.fromkeys(ports))
+
+
+def group_allows(rules, host, port):
+    """Whether the first rule in `rules` that decides `host` on `port` allows it."""
+    rule = deciding_rule(rules, host, port)
+    return bool(rule) and rule.startswith("allow")
+
+
+def forge_groups(ref, config):
+    """The configured groups that allow every port git needs on `ref`'s host."""
+    if not ref or ref.on_github:
+        return []
+    rules = config.get("rules", {})
+    return [g for g in sorted(rules) if g != "base"
+            and all(group_allows(rules[g], ref.host, port) for port in forge_ports(ref))]
+
+
+def forge_group_name(host):
+    return "forge-" + re.sub(r"[^a-z0-9]+", "-", host.lower()).strip("-")
+
+
+def ensure_forge_egress(ref, chosen, config):
+    """After the groups are picked: when none of `chosen` lets git reach `ref`'s
+    forge, add the group that does — creating it in config.toml when no group
+    does. Returns the group to add to the sandbox, or None. Never asks: a forge
+    the sandbox cannot reach is a sandbox that cannot fetch its own repo."""
+    if not ref or ref.on_github:
+        return None
+    rules = config.get("rules", {})
+    picked = [r for g in chosen for r in rules.get(g, [])]
+    if all(group_allows(picked, ref.host, port) for port in forge_ports(ref)):
+        return None
+    existing = forge_groups(ref, config)
+    if existing:
+        # Offered, and unticked: the operator's call, but not a silent one.
+        warn(f"no group picked allows {ref.host} ({', '.join(existing)} would) — "
+             "git fetch and push will be refused")
+        return None
+    name = forge_group_name(ref.host)
+    if not NAME_SLUG.fullmatch(name) or name in rules:
+        warn(f"{ref.host} is allowed by no rule group, and {name!r} cannot be made for it — "
+             f"`msbctl allow` it, or git fetch and push will be refused")
+        return None
+    new = [f"allow@{ref.host}:tcp:{port}" for port in forge_ports(ref)]
+    ensure_local_config()           # a machine that never ran setup has none yet
+    set_toml_key(CONFIG_FILE, name, new, table="rules")
+    say("Forge egress")
+    note(f"no rule group allows {ref.host}, so this machine has one now: {name}")
+    for rule in new:
+        note(f"  {rule}")
+    note(f"in {tilde(CONFIG_FILE)}; the next sandbox on {ref.host} gets it preselected.")
+    if len(new) > 1:
+        note("A name on a port other than 443 is enforced as the addresses it resolved to,")
+        note("so a forge that moves address needs a rebuild to follow it.")
+    if _resolves_privately(ref.host):
+        # msb drops LAN answers (DNS-rebind protection), and the failure reads as
+        # a missing rule, so the group brings allow_private_dns with it.
+        private = list(config.get("defaults", {}).get("private_dns_groups", []))
+        set_toml_key(CONFIG_FILE, "private_dns_groups", private + [name], table="defaults")
+        note(f"{ref.host} resolves to a private address here: sandboxes using {name}")
+        note("get allow_private_dns, or the name would not resolve inside them.")
+    return name
 
 
 def workspaces_root(config):
@@ -10427,7 +10515,12 @@ def cmd_add(args, config):
 
     groups = sorted(g for g in config.get("rules", {}) if g != "base")
     default_groups = config.get("defaults", {}).get("rule_groups", [])
-    plan = pick_features(groups, default_groups, ref, config, agents=agents)
+    plan = pick_features(groups, default_groups, ref, config, agents=agents,
+                         prefer=forge_groups(ref, config))
+    forge_group = ensure_forge_egress(ref, plan["groups"], config)
+    if forge_group:
+        plan["groups"].append(forge_group)
+        config = load_config()      # it may be new: what follows must know it
     llm = None                       # follow [defaults] llm
     if "pi" in plan["agents"]:
         say("Models for pi")

@@ -51,6 +51,14 @@ close egress.
   around it.
 - A wildcard suffix does not cover the apex — list `*.example.com` and
   `example.com`.
+- **A host only this machine knows goes in a machine-local group, never in a
+  project.** A group defined only in the operator's `config.toml`
+  (`machine_only_groups()`) is written to the registry's `extra_rule_groups`,
+  which adds to the project's groups, and `private_dns_groups` brings
+  `allow_private_dns` with it. That is how `msbctl add` lets a self-hosted
+  forge through (`ensure_forge_egress()` writes `forge-<host>`). Don't use the
+  registry's `extra_rules` for this: in a folder sandbox it *replaces* the
+  project's list instead of adding to it.
 - Published ports (`--port`) are **inbound**; the egress policy has no say in
   them, in either mode. The guest server must listen on `0.0.0.0`.
 

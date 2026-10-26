@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `msbctl add` lets a repo on another forge through egress: a rule group that already allows its host and port is preselected, and when none does, the wizard writes a machine-local `forge-<host>` group into `config.toml` (`:443`, plus the SSH port for an ssh URL), listed under `private_dns_groups` when the name resolves to a LAN address, and gives it to the sandbox. It never goes into the project's `sandbox.toml`. A shipped `codeberg` group covers Codeberg.
 - `[defaults] agents` (`["claude"]` by default; `msbctl setup` → Coding agents) decides which coding agents a new sandbox gets ticked, `[]` for none; pi is still ticked too when `[defaults] llm` names an endpoint. The first-run setup skips the Claude login when no new sandbox gets Claude, and the model endpoints when none gets pi.
 
 ### Changed
