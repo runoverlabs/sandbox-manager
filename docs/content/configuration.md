@@ -127,8 +127,10 @@ as `LLM_KEY_<NAME>`. See [Your own models](models.md).
 
 ### `[versions]`
 
-Component pins for the bootstrap: `node` (major), `gh`, `gitleaks`, `bun`. A
-sandbox's own `[versions]` overrides these.
+Component pins for the bootstrap: `node` (major), `npm`, `gh`, `gitleaks`, `bun`. A
+sandbox's own `[versions]` overrides these. `npm` is installed over the one
+node's major line ships (node 24 comes with npm 11); `""` keeps that one. npm
+12 needs node 22.22.2 or later, so a lower `node` needs a lower `npm` too.
 
 ### `[version_check]`
 

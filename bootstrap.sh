@@ -7,7 +7,8 @@
 # msbctl from the sandbox's resolved [versions] table and its project's
 # [bootstrap] section:
 #
-#   MSB_NODE_MAJOR        node major line                      (default 22)
+#   MSB_NODE_MAJOR        node major line                      (default 24)
+#   MSB_NPM_VERSION       pinned, over node's own; empty keeps node's
 #   MSB_GITLEAKS_VERSION  pinned
 #   MSB_GH_VERSION        pinned; checksum-verified below
 #   MSB_BUN_VERSION       pinned; checksum-verified below
@@ -36,7 +37,8 @@
 # of round trips.
 set -uo pipefail
 
-NODE_MAJOR="${MSB_NODE_MAJOR:-22}"
+NODE_MAJOR="${MSB_NODE_MAJOR:-24}"
+NPM_VERSION="${MSB_NPM_VERSION-12.2.1}"
 GITLEAKS_VERSION="${MSB_GITLEAKS_VERSION:-8.30.1}"
 GH_VERSION="${MSB_GH_VERSION:-2.102.0}"
 BUN_VERSION="${MSB_BUN_VERSION:-1.4.2}"
@@ -178,6 +180,23 @@ do_node() {
 	rm -rf "$tmp"
 	[ "$rc" -eq 0 ] || return 1
 	node --version
+}
+
+# The npm node's major line bundles lags (24 ships 11), and the agents and the
+# project's own `npm ci` all run with whichever is on PATH. Installed from
+# registry.npmjs.org, which the agents need anyway; npm checks the tarball
+# against the registry's sha512. Optional: on failure node's own npm remains,
+# and everything after this still installs with it.
+do_npm() {
+	if ! command -v npm >/dev/null; then
+		echo "   npm is absent because the node step did not succeed" >&2
+		return 1
+	fi
+	[ "$(npm --version)" = "$NPM_VERSION" ] && { npm --version; return 0; }
+	npm install -g "npm@${NPM_VERSION}" >/dev/null || return 1
+	# A shell remembers the old npm's path; a fresh lookup proves the new one runs.
+	hash -r
+	npm --version
 }
 
 do_claude() {
@@ -413,6 +432,7 @@ if [ "$WANT_CLAUDE" = 1 ] || [ "$WANT_PI" = 1 ]; then
 else
 	step optional "node ${NODE_MAJOR}" -- do_node
 fi
+[ -n "$NPM_VERSION" ] && step optional "npm ${NPM_VERSION}" -- do_npm
 if [ "$WANT_CLAUDE" = 1 ]; then
 	step optional "claude-code"        -- do_claude
 	step optional "claude-agent-acp"   -- do_claude_acp
