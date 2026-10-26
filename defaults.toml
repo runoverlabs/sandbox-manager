@@ -490,12 +490,14 @@ github = [
     # Where `gh run view --log` / `--log-failed` fetch Actions logs from; without
     # it they fail with "connection refused" and CI failures can't be read here.
     "allow@results-receiver.actions.githubusercontent.com:tcp:443",
-    # `gh attestation verify` needs both: Sigstore's TUF trust root, and the
-    # signed bundle, which the attestations API points at in GitHub's own blob
-    # storage account. That account name is GitHub's to change; if verification
-    # starts failing with a refused blob.core.windows.net host, update it.
+    # The log itself is then served from GitHub's Azure blob storage, from a
+    # storage account that varies by run and region, so it is a wildcard. It
+    # also covers the bundle `gh attestation verify` fetches (GitHub's
+    # tmaproduction account). The cost: it reaches every Azure storage account,
+    # anyone's included, so a sandbox with `github` can upload to one.
+    "allow@*.blob.core.windows.net:tcp:443",
+    # `gh attestation verify` also needs Sigstore's TUF trust root.
     "allow@tuf-repo-cdn.sigstore.dev:tcp:443",
-    "allow@tmaproduction.blob.core.windows.net:tcp:443",
 ]
 
 npm = [
