@@ -544,6 +544,24 @@ class Proxy(TlsTest):
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
 
+    def test_an_unforeseen_error_keeps_what_is_open(self):
+        # Whatever a scan raises, the proxy goes on: it keeps the ports whose
+        # sandboxes are still there, says so once, and never closes them all.
+        port, token = self.lease("e1", 8765)
+        held = len(self.public("k-e1")) + len(self.public("k-e2"))
+        line = (f"keeping {held} ports open: unexpected TypeError reading the config or registry: "
+                "cannot use 'list' as a dict key")
+        with mock.patch.object(self.m, "kandev_proxy_wanted",
+                               side_effect=TypeError("cannot use 'list' as a dict key")):
+            self.wait_for_log(line)
+            time.sleep(0.6)                 # a few more scans: still said once
+            self.assertTrue(self.thread.is_alive())
+            tls, got = self.request(port, token)
+            tls.close()
+            self.assertEqual(got, "k-e1:8765\n")
+        self.assertEqual(self.logs.count(line), 1)
+        self.wait_for_log(f"serving {held} ports")
+
     def test_logs_hold_no_token(self):
         port, token = self.lease("e1", 8765)
         tls, _ = self.request(port, token)
@@ -734,6 +752,9 @@ class ProxySummary(KandevTest):
     def test_the_count_is_always_said(self):
         say = self.m.kandev_proxy_summary
         self.assertEqual(say(0, 0, None), "serving 0 ports: no Kandev sandbox is published through the proxy")
+        # A host with clients other than Kandev says what it means.
+        self.assertEqual(say(0, 0, None, shared=True),
+                         "serving 0 ports: no managed sandbox is published through the proxy")
         self.assertEqual(say(1, 1, None), "serving 1 port")
         self.assertEqual(say(2, 4, None), "serving 2 ports (2 could not be bound)")
         self.assertEqual(say(0, 0, "no certificate"), "listening on nothing: no certificate")

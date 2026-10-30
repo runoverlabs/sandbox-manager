@@ -393,5 +393,69 @@ class Settings(MsbctlTest):
                      'address:port ("192.0.2.6:8788"', 'CIDRs ("192.0.2.0/24")')
 
 
+class Dialects(MsbctlTest):
+    """Protocol 1 is a constant; protocol 2 is built from a client's table."""
+
+    def test_kandev_is_protocol_1(self):
+        d = self.m.KANDEV_DIALECT
+        self.assertEqual((d.protocol, d.client, d.row_key, d.callback_keys, d.callback_required,
+                          d.env_prefix, d.default_ports, d.guest_ports_settable, d.agentctl_path,
+                          d.record_has_client, d.name_prefix),
+                         (1, "kandev", "kandev", ("kandev_api",), True, "AGENTCTL_",
+                          (8765, 41001, 41002, 41003), False, "/opt/kandev/agentctl", False, "k-"))
+        self.assertEqual(d.body_secret_hosts, self.m.AGENT_TRANSCRIPT_HOSTS)
+
+    def test_a_client_is_protocol_2(self):
+        os.makedirs(self.m.CONFIG_DIR, exist_ok=True)
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write('[clients.ci]\nenv_prefix = "CI_"\nguest_ports = [8765]\nrequire_callback = true\n')
+        d = self.m.managed_dialect(self.m.clients_settings(self.m.load_config())["ci"])
+        self.assertEqual((d.protocol, d.client, d.row_key, d.callback_keys, d.callback_required,
+                          d.env_prefix, d.default_ports, d.agentctl_path, d.record_has_client,
+                          d.name_prefix, d.body_secret_hosts),
+                         (2, "ci", "record", ("callback", "kandev_api"), True, "CI_", (8765,),
+                          "/opt/ci/agentctl", True, "c-", ()))
+
+    def test_names_and_labels(self):
+        m = self.m
+        self.assertEqual(m.managed_name("c-", "e1"), "c-e1")
+        self.assertEqual(m.kandev_name("e1"), "k-e1")
+        long = "x" * 60
+        self.assertEqual(m.managed_name("c-", long), "c-" + m.hashlib.sha256(long.encode()).hexdigest()[:24])
+        self.assertEqual(m.managed_name("c-", "E1"), "c-" + m.hashlib.sha256(b"E1").hexdigest()[:24])
+        self.assertEqual(m.owner_labels("kandev", "e1"), ["msbctl.owner=kandev", "kandev.env=e1"])
+        self.assertEqual(m.owner_labels("ci", "e1"), ["msbctl.owner=ci", "msbctl.env=e1"])
+
+    def test_kandev_in_protocol_2_keeps_its_ports(self):
+        # Its agentctl is protocol 1's first port: a request may not move it.
+        os.makedirs(self.m.CONFIG_DIR, exist_ok=True)
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write("[clients.ci]\n")
+        clients = self.m.clients_settings(self.m.load_config())
+        d = self.m.managed_dialect(clients["kandev"])
+        self.assertEqual((d.protocol, d.guest_ports_settable, d.default_ports),
+                         (2, False, self.m.KANDEV_GUEST_PORTS))
+        self.assertTrue(self.m.managed_dialect(clients["ci"]).guest_ports_settable)
+
+    def test_messages_name_the_table_a_host_key_is_in(self):
+        m = self.m
+        # Kandev's say [kandev], as protocol 1 always has; another client's, where it is.
+        self.assertEqual(m.host_table({"client": "kandev", "host_tables": {"base_url": "managed"}}, "base_url"),
+                         "kandev")
+        self.assertEqual(m.host_table({"base_url": ""}, "base_url"), "kandev")
+        self.assertEqual(m.host_table({"client": "ci", "host_tables": {"base_url": "kandev"}}, "base_url"),
+                         "kandev")
+        self.assertEqual(m.host_table({"client": "ci", "host_tables": {}}, "base_url"), "managed")
+        full = {"port_pool": (1, 0), "proxy_port_pool": (1, 0), "proxy_listen": ""}
+        for settings, table in ((full, "kandev"), ({**full, "client": "ci", "host_tables": {}}, "managed")):
+            with self.subTest(table=table):
+                with self.assertRaises(m.KandevError) as caught:
+                    m.alloc_ports(settings, 1)
+                self.assertIn(f"[{table}] port_pool", caught.exception.message)
+                with self.assertRaises(m.KandevError) as caught:
+                    m.alloc_proxy_ports(settings, 1)
+                self.assertIn(f"[{table}] proxy_port_pool", caught.exception.message)
+
+
 if __name__ == "__main__":
     main()
