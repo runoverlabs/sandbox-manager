@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "kandev",
+  "restart-proxy"
+ ],
+ "exit": 0,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"proxy\": {\n    \"state\": \"not_running\"\n  }\n}\n"
+}

@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "kandev",
+  "provision",
+  "e1"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"conflict\",\n    \"message\": \"this environment was provisioned by another operation or with different input\"\n  }\n}\n"
+}

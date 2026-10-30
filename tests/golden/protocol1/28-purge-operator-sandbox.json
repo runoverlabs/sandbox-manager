@@ -1,0 +1,12 @@
+{
+ "argv": [
+  "purge",
+  "web",
+  "-y",
+  "--json"
+ ],
+ "exit": 0,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"absent\": [\n    \"web\"\n  ],\n  \"purged\": []\n}\n"
+}

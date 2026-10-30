@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "self-update",
+  "--json"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"unsupported\",\n    \"message\": \"this is a git checkout: `git pull` updates it\"\n  }\n}\n"
+}

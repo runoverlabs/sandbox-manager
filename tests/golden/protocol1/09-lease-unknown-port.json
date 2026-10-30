@@ -1,0 +1,12 @@
+{
+ "argv": [
+  "kandev",
+  "lease",
+  "e1",
+  "22"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"that port is not one of this sandbox's\"\n  }\n}\n"
+}

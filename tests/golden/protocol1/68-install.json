@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "host",
+  "kandev",
+  "install"
+ ],
+ "exit": 0,
+ "key": null,
+ "msb": [],
+ "stdout": "   wrote ~/.config/systemd/user/msb-kandev-reap.service, ~/.config/systemd/user/msb-kandev-reap.timer and ~/.config/systemd/user/msb-kandev-proxy.service\n   a user timer runs with nobody logged in only with lingering on; once, as root:\n     loginctl enable-linger <USER>\n"
+}

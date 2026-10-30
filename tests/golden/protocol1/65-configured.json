@@ -1,0 +1,3 @@
+{
+ "file": "[defaults]\ncpus = 4\n\n[kandev]\nenabled = true\nserve = \"proxy\"\nproxy_listen = \"192.0.2.1\"\nbase_url = \"https://sbx-01.example.org\"\nallow_extra = [\n    \"pypi.org\",\n]\nprivate_names = [\n    \"git.example.org\",\n]\n"
+}

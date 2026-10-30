@@ -1,0 +1,23 @@
+{
+ "argv": [
+  "host",
+  "kandev",
+  "configure",
+  "--enabled",
+  "--serve",
+  "proxy",
+  "--proxy-listen",
+  "192.0.2.1",
+  "--base-url",
+  "https://sbx-01.example.org",
+  "--allow-extra",
+  "pypi.org",
+  "--private-name",
+  "git.example.org",
+  "--json"
+ ],
+ "exit": 0,
+ "key": null,
+ "msb": [],
+ "stdout": "{\n  \"changed\": [\n    \"enabled\",\n    \"serve\",\n    \"proxy_listen\",\n    \"base_url\",\n    \"allow_extra\",\n    \"private_names\"\n  ],\n  \"kandev\": {\n    \"allow_extra\": [\n      \"pypi.org\"\n    ],\n    \"base_url\": \"https://sbx-01.example.org\",\n    \"enabled\": true,\n    \"max_cpus\": 32,\n    \"max_memory_mib\": 98304,\n    \"max_sandboxes\": 12,\n    \"port_pool\": \"20000-29999\",\n    \"private_names\": [\n      \"git.example.org\"\n    ],\n    \"proxy_listen\": \"192.0.2.1\",\n    \"proxy_port_pool\": \"30000-39999\",\n    \"rule_groups\": [\n      \"github\",\n      \"npm\",\n      \"python\",\n      \"claude\"\n    ],\n    \"serve\": \"proxy\"\n  },\n  \"warnings\": []\n}\n"
+}

@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "kandev",
+  "agentctl",
+  "e1"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"env keys are AGENTCTL_*, values one line\"\n  }\n}\n"
+}

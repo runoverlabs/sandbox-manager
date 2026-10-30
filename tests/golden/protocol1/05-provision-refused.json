@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "kandev",
+  "provision",
+  "e9"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"example.com is not allowed by [kandev] allow_extra\"\n  }\n}\n"
+}

@@ -1,0 +1,43 @@
+{
+ "argv": [
+  "host",
+  "kandev",
+  "reap"
+ ],
+ "exit": 0,
+ "key": null,
+ "msb": [
+  [
+   "ls"
+  ],
+  [
+   "ls",
+   "--label",
+   "msbctl.owner=kandev",
+   "--format",
+   "json"
+  ],
+  [
+   "ls"
+  ],
+  [
+   "rm",
+   "-f",
+   "k-e1"
+  ],
+  [
+   "ls"
+  ],
+  [
+   "rm",
+   "-f",
+   "k-e3"
+  ],
+  [
+   "rm",
+   "-f",
+   "k-gone"
+  ]
+ ],
+ "stdout": "{\n  \"destroyed\": [\n    \"k-e1\",\n    \"k-e3\"\n  ],\n  \"errors\": [],\n  \"marked_absent\": [],\n  \"orphans_removed\": [\n    \"k-gone\"\n  ]\n}\n"
+}

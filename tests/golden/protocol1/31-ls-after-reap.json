@@ -1,0 +1,14 @@
+{
+ "argv": [
+  "ls",
+  "--json"
+ ],
+ "exit": 0,
+ "key": "kandev",
+ "msb": [
+  [
+   "ls"
+  ]
+ ],
+ "stdout": "{\n  \"msbctl\": \"0.0.0-golden\",\n  \"sandboxes\": []\n}\n"
+}

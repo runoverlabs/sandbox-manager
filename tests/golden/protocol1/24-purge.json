@@ -1,0 +1,30 @@
+{
+ "argv": [
+  "purge",
+  "k-e2",
+  "-y",
+  "--json"
+ ],
+ "exit": 0,
+ "key": "kandev",
+ "msb": [
+  [
+   "ls"
+  ],
+  [
+   "ls",
+   "--label",
+   "msbctl.owner=kandev",
+   "-q"
+  ],
+  [
+   "ls"
+  ],
+  [
+   "rm",
+   "-f",
+   "k-e2"
+  ]
+ ],
+ "stdout": "{\n  \"absent\": [],\n  \"purged\": [\n    \"k-e2\"\n  ]\n}\n"
+}

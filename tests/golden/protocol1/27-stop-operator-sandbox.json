@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "stop",
+  "web",
+  "--json"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"not_found\",\n    \"message\": \"no sandbox named 'web' \\u2014 `msbctl ls` to see what exists\"\n  }\n}\n"
+}
