@@ -524,6 +524,43 @@ class Proxy(TlsTest):
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
 
+    def test_another_clients_sandbox_is_served_while_it_is_enabled(self):
+        table = ('\n[clients.ci]\nenabled = {}\nguest_ports = [8765]\nallow_extra = ["pypi.org"]\n'
+                 'rule_groups = []\n')
+        with open(self.m.CONFIG_FILE, encoding="utf-8") as fh:
+            config = fh.read()
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(config + table.format("true"))
+        os.environ["MSB_RESTRICTED"] = "client:ci"
+        try:
+            code, doc = self._msbctl_json(("managed", "provision", "e1"), (json.dumps({
+                "operation_id": "op-c", "input_digest": "d", "image": "ghcr.io/acme/api-sbx@sha256:" + "a" * 64,
+                "cpus": 1, "memory_mib": 512, "workspace_gib": 1, "expires_at": "2099-01-01T00:00:00Z"})
+                + "\n").encode())
+            self.assertEqual(code, 0, doc)
+            self.backends.append(EchoBackend(doc["record"]["ports"]["8765"], "c-e1:8765"))
+            [public] = self.public("c-e1").values()
+            self.wait_for(public, listening=True)
+            code, doc = self._msbctl_json(("managed", "lease", "e1", "8765"), b"")
+            self.assertEqual(code, 0, doc)
+            token = doc["lease"]["headers"]["X-Msb-Lease"]
+        finally:
+            os.environ.pop("MSB_RESTRICTED", None)
+        tls, line = self.request(public, token)
+        tls.close()
+        self.assertEqual(line, "c-e1:8765\n")
+        # Kandev's token is for Kandev's sandbox, never through ci's port.
+        _, kandev_token = self.lease("e1", 8765)
+        self.assert_refused(public, kandev_token)
+        # Disabled: its ports close; Kandev's stay.
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(config + table.format("false"))
+        self.wait_for(public, listening=False)
+        port, token = self.lease("e1", 8765)
+        tls, line = self.request(port, token)
+        tls.close()
+        self.assertEqual(line, "k-e1:8765\n")
+
     def test_a_destroyed_sandboxs_port_refuses(self):
         ports = self.public("k-e2")
         port, token = self.lease("e2", 8765)
