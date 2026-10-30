@@ -11900,58 +11900,231 @@ def parse_iso(text, what="a timestamp"):
     return when.astimezone(dt.timezone.utc)
 
 
-def kandev_settings(config):
-    """[kandev], checked. Every problem is invalid_config, naming the key."""
-    raw = config.get("kandev", {})
+# ------------------------------------------------------------- settings
+#
+# Two scopes. Host-wide keys exist once whatever the clients: there is one
+# proxy, one listen address, one certificate, one lease key and one pair of
+# port pools. They live in [managed]; [kandev] still holds them for a host set
+# up before clients existed, and one key in both is refused. Per-client keys
+# live in [clients.<name>], and Kandev's in [kandev] (or [clients.kandev], but
+# not both). Every client starts from the shipped [kandev] values: today's
+# caps and groups, and enabled = false.
+#
+# Conflicts are read from the OPERATOR's config.toml alone: defaults.toml
+# ships a full [kandev], so the merged config always has one.
 
-    def bad(key, why):
-        raise KandevError("invalid_config", f"[kandev] {key}: {why} (`msbctl config` shows where it is set)")
+MANAGED_HOST_KEYS = ("serve", "proxy_listen", "base_url", "port_pool", "proxy_port_pool")
+# Optional caps summed over every client's sandboxes; only [managed] has them
+# ([kandev] max_sandboxes is Kandev's own cap). Unset: no host-wide cap.
+MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
+CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
+               "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
+               "body_secret_hosts")
+# What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
+KANDEV_FIXED = {"name_prefix": "k-", "env_prefix": "AGENTCTL_", "guest_ports": list(KANDEV_GUEST_PORTS),
+                "require_callback": True, "body_secret_hosts": list(AGENT_TRANSCRIPT_HOSTS)}
+# The keys kandev_settings() has always returned (`host kandev configure --json`).
+KANDEV_SETTINGS_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory_mib", "port_pool",
+                        "proxy_port_pool", "proxy_listen", "base_url", "serve", "rule_groups",
+                        "allow_extra", "allow_extra_entries", "private_names")
+CLIENT_PREFIX = re.compile(r"[a-z][a-z0-9]{0,6}-")
+CLIENT_ENV_PREFIX = re.compile(r"[A-Z][A-Z0-9]*_")
+CLIENT_ENV_PREFIX_REFUSED = ("MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
+CLIENT_MAX_PORTS = 4
 
-    out = {"enabled": raw.get("enabled", False)}
-    if not isinstance(out["enabled"], bool):
-        bad("enabled", "true or false")
-    for key in ("max_sandboxes", "max_cpus"):
-        value = raw.get(key, 0)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            bad(key, "a whole number, 0 or more")
-        out[key] = value
-    memory = str(raw.get("max_memory", "0M"))
+
+def _settings_bad(table, key, why):
+    raise KandevError("invalid_config", f"[{table}] {key}: {why} (`msbctl config` shows where it is set)")
+
+
+def _operator_layer(operator):
+    """The operator's own config.toml, as given or read now."""
+    return read_toml(CONFIG_FILE) if operator is None else operator
+
+
+def _shipped_layer():
+    return read_toml(DEFAULTS_FILE)
+
+
+def _table(layer, *path):
+    for key in path:
+        layer = layer.get(key) if isinstance(layer, dict) else None
+    return layer if isinstance(layer, dict) else {}
+
+
+def _int_setting(table, key, value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        _settings_bad(table, key, "a whole number, 0 or more")
+    return value
+
+
+def _memory_setting(table, value):
+    memory = str(value)
     if not re.fullmatch(r"\d+[MGT]", memory.upper()):
-        bad("max_memory", f"{memory!r} is not a size like 96G")
-    out["max_memory_mib"] = size_bytes(memory) // MIB
+        _settings_bad(table, "max_memory", f"{memory!r} is not a size like 96G")
+    return size_bytes(memory) // MIB
+
+
+# The tracebacks _only_invalid_config() has printed in this process: the
+# proxy reads the config every scan, and says each one once.
+_CONFIG_TRACES = set()
+
+
+def _only_invalid_config(where):
+    """Decorator: a value of a type no check foresaw (a list where a string
+    belongs, an inline table, ...) is invalid_config naming `where(*args,
+    **kwargs)` and the exception's type, never an internal error that would
+    stop every client and the proxy. It may as well be a bug in the check:
+    at the host (the operator's terminal, the reaper's and the proxy's
+    journal) the traceback goes to stderr, once per process. Never under a
+    key, where stderr crosses ssh to a client, and never into the JSON."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def checked(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except KandevError:
+                raise
+            except Exception as exc:
+                trace = traceback.format_exc()
+                if not restricted() and trace not in _CONFIG_TRACES:
+                    _CONFIG_TRACES.add(trace)
+                    print(trace, end="", file=sys.stderr)
+                raise KandevError("invalid_config", f"{where(*args, **kwargs)} does not check out "
+                                  f"({type(exc).__name__}; `msbctl config` shows where it is "
+                                  "set)") from None
+        return checked
+    return wrap
+
+
+@_only_invalid_config(lambda *_, **__: "the host keys ([managed], or [kandev] before it)")
+def managed_host_settings(config, operator=None):
+    """The host-wide keys, checked: from the operator's [managed], else the
+    operator's [kandev] (a host from before [managed]), else what ships. One
+    key in both of the operator's tables is invalid_config, naming both."""
+    op = _operator_layer(operator)
+    op_managed, op_kandev = _table(op, "managed"), _table(op, "kandev")
+    merged_managed, merged_kandev = _table(config, "managed"), _table(config, "kandev")
+    for key in MANAGED_HOST_KEYS:
+        if key in op_managed and key in op_kandev:
+            raise KandevError("invalid_config", f"{key} is set in both [managed] and [kandev]: keep "
+                              "it in [managed] (`msbctl config` shows where it is set)")
+
+    out = {"host_tables": {}}       # where each host key is set: messages name that table
+
+    def get(key, default):
+        if key in op_managed or key in merged_managed:
+            out["host_tables"][key] = "managed"
+            return "managed", merged_managed.get(key, op_managed.get(key))
+        if key in op_kandev:
+            out["host_tables"][key] = "kandev"
+            return "kandev", merged_kandev.get(key, default)
+        return "kandev", merged_kandev.get(key, default)
 
     def pool(key, default):
-        found = re.fullmatch(r"(\d+)-(\d+)", str(raw.get(key, default)))
+        table, value = get(key, default)
+        found = re.fullmatch(r"(\d+)-(\d+)", str(value))
         if not found or not 1024 <= int(found.group(1)) <= int(found.group(2)) <= 65535 \
-                or int(found.group(2)) - int(found.group(1)) + 1 < len(KANDEV_GUEST_PORTS):
-            bad(key, f"a range like {default}, within 1024-65535, of at least 4 ports")
+                or int(found.group(2)) - int(found.group(1)) + 1 < CLIENT_MAX_PORTS:
+            _settings_bad(table, key, f"a range like {default}, within 1024-65535, of at least 4 ports")
         return int(found.group(1)), int(found.group(2))
 
     out["port_pool"] = pool("port_pool", "20000-29999")
     out["proxy_port_pool"] = pool("proxy_port_pool", "30000-39999")
     if out["port_pool"][0] <= out["proxy_port_pool"][1] and out["proxy_port_pool"][0] <= out["port_pool"][1]:
-        bad("proxy_port_pool", "must not overlap port_pool")
-    listen = str(raw.get("proxy_listen", "")).strip()
+        _settings_bad(get("proxy_port_pool", "")[0], "proxy_port_pool", "must not overlap port_pool")
+    table, listen = get("proxy_listen", "")
+    listen = str(listen).strip()
     if listen:
         try:
             listen = str(ipaddress.ip_address(listen))
         except ValueError:
-            bad("proxy_listen", f"{listen!r} is not an IP address (the tailnet or LAN one to bind)")
+            _settings_bad(table, "proxy_listen", f"{listen!r} is not an IP address (the tailnet or LAN one to bind)")
     out["proxy_listen"] = listen
-    base = str(raw.get("base_url", "")).rstrip("/")
+    table, base = get("base_url", "")
+    base = str(base).rstrip("/")
     if base:
-        parts = urllib.parse.urlsplit(base)
-        if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+        try:
+            parts = urllib.parse.urlsplit(base)
+            hostname = parts.hostname
+        except ValueError:              # "https://[x": not a URL at all
+            parts = hostname = None
+        if (parts is None or parts.scheme != "https" or not hostname or parts.username or parts.password
                 or parts.path or parts.query or parts.fragment):
-            bad("base_url", "https://host[:port] with no path, query or credentials — Kandev "
-                "refuses any other lease URL")
+            _settings_bad(table, "base_url", "https://host[:port] with no path, query or credentials — Kandev "
+                          "refuses any other lease URL")
     out["base_url"] = base
-    out["serve"] = raw.get("serve", "proxy")
+    table, out["serve"] = get("serve", "proxy")
     if out["serve"] not in KANDEV_SERVE_MODES:
-        bad("serve", '"proxy", "tailscale" or "none"')
+        _settings_bad(table, "serve", '"proxy", "tailscale" or "none"')
+    # Host totals: [managed] only, each optional (None: no cap).
+    for key in ("max_sandboxes", "max_cpus"):
+        out[f"host_{key}"] = (_int_setting("managed", key, merged_managed[key])
+                              if key in merged_managed else None)
+    out["host_max_memory_mib"] = (_memory_setting("managed", merged_managed["max_memory"])
+                                  if "max_memory" in merged_managed else None)
+    return out
+
+
+def _client_table(config, op, name):
+    """(the table name to report, the operator's raw table) for a client."""
+    if name == "kandev":
+        legacy, new = _table(op, "kandev"), _table(op, "clients", "kandev")
+        if any(k in legacy for k in CLIENT_KEYS) and new:
+            raise KandevError("invalid_config", "Kandev is configured in both [kandev] and "
+                              "[clients.kandev]: keep one (`msbctl config` shows where it is set)")
+        if not new:
+            # [kandev] as merged: the shipped values under the operator's.
+            return "kandev", {k: v for k, v in _table(config, "kandev").items() if k in CLIENT_KEYS}
+        return "clients.kandev", _with_shipped(_table(config, "clients", "kandev"))
+    return f"clients.{name}", _with_shipped(_table(config, "clients", name))
+
+
+def _with_shipped(raw):
+    """A client table over the shipped [kandev] client defaults."""
+    shipped = _table(_shipped_layer(), "kandev")
+    return {**{k: v for k, v in shipped.items() if k in CLIENT_KEYS}, **raw}
+
+
+@_only_invalid_config(lambda config, name, operator=None: "[kandev]" if name == "kandev" else f"[clients.{name}]")
+def client_settings(config, name, operator=None):
+    """One client's keys, checked: Kandev's from [kandev] (or [clients.kandev]),
+    another's from [clients.<name>], each over the shipped [kandev] defaults.
+    Kandev's name_prefix, env_prefix, guest_ports, require_callback and
+    body_secret_hosts are fixed (protocol 1 is frozen); another value for any
+    of them is refused."""
+    problem = client_name_problem(name) if name != "kandev" else None
+    if problem:
+        raise KandevError("invalid_config", f"[clients.{name}]: {problem}")
+    listed = config.get("clients")
+    if isinstance(listed, dict) and name in listed and not isinstance(listed[name], dict):
+        raise KandevError("invalid_config", f"[clients] {name}: a client is a table, [clients.{name}]")
+    op = _operator_layer(operator)
+    table, raw = _client_table(config, op, name)
+
+    def bad(key, why):
+        _settings_bad(table, key, why)
+
+    if table.startswith("clients."):
+        # One proxy, one address, one pair of pools for every client: a host
+        # key here would be silently someone else's, so it is refused.
+        stray = sorted(k for k in raw if k in MANAGED_HOST_KEYS)
+        if stray:
+            bad(stray[0], "a host key, shared by every client: put it in [managed] (or in [kandev] "
+                "on a host set up before [managed])")
+        unknown = sorted(k for k in raw if k not in CLIENT_KEYS)
+        if unknown:
+            bad(unknown[0], f"not a client key; one of {', '.join(CLIENT_KEYS)}")
+    out = {"client": name, "table": table, "enabled": raw.get("enabled", False)}
+    if not isinstance(out["enabled"], bool):
+        bad("enabled", "true or false")
+    for key in ("max_sandboxes", "max_cpus"):
+        out[key] = _int_setting(table, key, raw.get(key, 0))
+    out["max_memory_mib"] = _memory_setting(table, raw.get("max_memory", "0M"))
     groups = raw.get("rule_groups", [])
     known = config.get("rules", {})
-    if not isinstance(groups, list) or any(g not in known for g in groups):
+    known = known if isinstance(known, dict) else {}
+    if not isinstance(groups, list) or any(not isinstance(g, str) or g not in known for g in groups):
         bad("rule_groups", f"a list of rule groups; known: {', '.join(sorted(known))}")
     out["rule_groups"] = [g for g in groups if g != "base"]
     extra = raw.get("allow_extra", [])
@@ -11959,8 +12132,8 @@ def kandev_settings(config):
                for p in (extra if isinstance(extra, list) else [None])]
     if None in entries:
         bad("allow_extra", 'a list of "*", hostname patterns ("pypi.org", "*.example.com"), '
-            'addresses ("192.168.2.6"), address:port ("192.168.2.6:8788", "[fd00::1]:22") '
-            'and CIDRs ("192.168.2.0/24")')
+            'addresses ("192.0.2.6"), address:port ("192.0.2.6:8788", "[fd00::1]:22") '
+            'and CIDRs ("192.0.2.0/24")')
     for entry, text in zip(entries, extra, strict=True):
         if entry[0] == "net" and entry[1].prefixlen < KANDEV_CIDR_MIN[entry[1].version]:
             bad("allow_extra", f"{text} is wider than /{KANDEV_CIDR_MIN[entry[1].version]}")
@@ -11972,7 +12145,158 @@ def kandev_settings(config):
             or n.strip().startswith("*.") for n in names):
         bad("private_names", 'a list of exact hostnames ("git.example.com"), no patterns or addresses')
     out["private_names"] = [n.strip().lower() for n in names]
+
+    if name == "kandev":
+        for key, fixed in KANDEV_FIXED.items():
+            if key in raw and raw[key] != fixed:
+                bad(key, f"fixed for Kandev at {toml_literal(fixed)} (protocol 1 does not change)")
+        out.update({k: (list(v) if isinstance(v, list) else v) for k, v in KANDEV_FIXED.items()})
+        return out
+
+    prefix = raw["name_prefix"] if "name_prefix" in raw else default_client_prefix(name)
+    if prefix is None:
+        bad("name_prefix", "set one: the default, k-, is Kandev's")
+    if not isinstance(prefix, str) or not CLIENT_PREFIX.fullmatch(prefix):
+        bad("name_prefix", 'a-z, then up to 6 of a-z 0-9, then "-" (like "c-")')
+    if prefix == KANDEV_FIXED["name_prefix"]:
+        # Kandev's on every host, its table set or not: never a clash Kandev is at fault for.
+        bad("name_prefix", 'k- is always Kandev\'s: pick another (like "kb-")')
+    out["name_prefix"] = prefix
+    env_prefix = raw.get("env_prefix", "AGENTCTL_")
+    if not isinstance(env_prefix, str) or not CLIENT_ENV_PREFIX.fullmatch(env_prefix) \
+            or env_prefix.startswith(CLIENT_ENV_PREFIX_REFUSED) or len(env_prefix) > 32:
+        bad("env_prefix", 'A-Z first, then A-Z 0-9, ending in "_" (like "CI_"); never MSB_, '
+            "MSBCTL_, LD_, SSH_, XDG_ or LC_")
+    out["env_prefix"] = env_prefix
+    ports = raw.get("guest_ports", list(KANDEV_GUEST_PORTS))
+    problem = guest_ports_problem(ports)
+    if problem:
+        bad("guest_ports", problem)
+    out["guest_ports"] = list(ports)
+    out["require_callback"] = raw.get("require_callback", False)
+    if not isinstance(out["require_callback"], bool):
+        bad("require_callback", "true or false")
+    hosts = raw.get("body_secret_hosts", [])
+    if not isinstance(hosts, list) or any(
+            not isinstance(h, str) or not HOSTNAME.fullmatch(h) or h.startswith("*.") for h in hosts):
+        bad("body_secret_hosts", "a list of exact, lowercase hostnames")
+    # Reachable on some port: an address:port in allow_extra reaches that address.
+    any_port = [(kind, value, None) for kind, value, _ in entries]
+    for host in hosts:
+        if host not in out["private_names"] and not kandev_target_allowed(host, any_port) \
+                and not rule_groups_allow(host, ["base", *groups], known):
+            bad("body_secret_hosts", f"{host} is in none of allow_extra, rule_groups or private_names: "
+                "a placeholder may only travel to a host this client can reach")
+    out["body_secret_hosts"] = list(hosts)
     return out
+
+
+def default_client_prefix(name):
+    """A client's name_prefix when its table names none: its first letter and
+    "-", but never Kandev's k-: a name starting with k takes its next letter
+    or digit too (kube: ku-). None when there is none (k must set one)."""
+    if name[0] != "k":
+        return f"{name[0]}-"
+    rest = name[1:].replace("-", "")
+    return f"k{rest[0]}-" if rest else None
+
+
+def client_prefix_wanted(config, name):
+    """The name_prefix [clients.<name>] asks for, read even when the rest of
+    its table does not check out (so no other client may take it meanwhile),
+    or None when it names none that could be one."""
+    if name == "kandev":
+        return KANDEV_FIXED["name_prefix"]
+    if client_name_problem(name):
+        return None
+    raw = _table(config, "clients", name)
+    prefix = raw["name_prefix"] if "name_prefix" in raw else default_client_prefix(name)
+    return prefix if isinstance(prefix, str) and CLIENT_PREFIX.fullmatch(prefix) else None
+
+
+def rule_groups_allow(host, groups, rules):
+    """Whether one of these [rules] groups allows `host`, on any port: an
+    allow@ rule naming it, or a *.suffix it is under."""
+    for group in groups:
+        lines = rules.get(group, [])
+        for line in lines if isinstance(lines, list) else []:
+            for rule in str(line).split(","):
+                action, _, target = rule.strip().partition("@")
+                fields = _split_rule_target(target) if action == "allow" else None
+                pattern = fields[0].lower() if fields else ""
+                if "." in pattern and (host == pattern or (
+                        pattern.startswith("*.") and host.endswith(pattern[1:]))):
+                    return True
+    return False
+
+
+def guest_ports_problem(ports):
+    """Why `ports` is not a list of guest ports to publish, or None."""
+    if not isinstance(ports, list) or not 1 <= len(ports) <= CLIENT_MAX_PORTS or any(
+            not isinstance(p, int) or isinstance(p, bool) or not 1024 <= p <= 65535 for p in ports):
+        return f"1 to {CLIENT_MAX_PORTS} guest ports, each 1024-65535"
+    if len(set(ports)) != len(ports):
+        return "a port is listed twice"
+    return None
+
+
+def configured_clients(config):
+    """Every client name this host knows: kandev, and each [clients.<name>]."""
+    names = ["kandev"]
+    for name in _table(config, "clients"):
+        if name != "kandev":
+            names.append(name)
+    return names
+
+
+def clients_settings(config, operator=None):
+    """{name: settings, or the KandevError that client's table has}, for
+    Kandev and every [clients.<name>]. Every problem is the problem of the
+    client(s) it concerns, and stops no one else: a table whose name is not a
+    client name, an entry under [clients] that is not a table, and one name
+    prefix shared by two clients make each client involved invalid_config.
+    Kandev's k- is no one else's (client_settings() refuses it there, as that
+    client's own problem), so a clash between other clients never stops
+    Kandev. A [clients] that is not a table at all names no client: Kandev
+    alone."""
+    def clash(message):
+        # A client's key sees nothing of the others, their names and prefixes included.
+        if key_client():
+            message = ("this client's name_prefix clashes with another client's: the operator's "
+                       "`msbctl doctor` names it")
+        return KandevError("invalid_config", message)
+
+    out = {}
+    for name in configured_clients(config):
+        try:
+            out[name] = client_settings(config, name, operator)
+        except KandevError as exc:
+            out[name] = exc
+        except Exception:               # a value no check foresaw: still this client's alone
+            out[name] = KandevError("invalid_config", f"[{'kandev' if name == 'kandev' else 'clients.' + name}] "
+                                    "does not check out (`msbctl config` shows where it is set)")
+    # Every prefix a table asks for, its table checking out or not: a broken
+    # one keeps its prefix, so no other client takes it while it is fixed.
+    asked = [(n, s["name_prefix"] if isinstance(s, dict) else client_prefix_wanted(config, n))
+             for n, s in out.items() if n != "kandev"]
+    asked = [(n, p) for n, p in asked if p and p != KANDEV_FIXED["name_prefix"]]
+    for name, prefix in asked:
+        for other, theirs in asked:
+            # Equal or not at all: each prefix ends at its one "-". A table
+            # with a problem of its own keeps that one, the more specific.
+            if name != other and theirs == prefix and isinstance(out[name], dict):
+                out[name] = clash(f"[clients.{name}] name_prefix {prefix!r} is also "
+                                  f"[clients.{other}]'s: one client's names would be another's")
+                break
+    return out
+
+
+def kandev_settings(config, operator=None):
+    """Kandev's view, checked: the host-wide keys and Kandev's own, as one
+    dict of exactly the keys it has always had. Every problem is
+    invalid_config, naming the key."""
+    merged = {**managed_host_settings(config, operator), **client_settings(config, "kandev", operator)}
+    return {k: merged[k] for k in KANDEV_SETTINGS_KEYS}
 
 
 # The widest CIDR [kandev] allow_extra may name, per IP version, as the
@@ -13811,8 +14135,20 @@ def kandev_configure(args):
         with os.fdopen(fd, "w", encoding="utf-8") as out, open(target, encoding="utf-8") as src:
             out.write(src.read())
         shutil.copymode(target, tmp)
-        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table="kandev")]
-        settings = kandev_settings(merge_config(read_toml(DEFAULTS_FILE), read_toml(tmp)))
+        # Each key into the table that already holds it, so a host moved to
+        # [managed] or [clients.kandev] is not given a conflicting second copy.
+        op = read_toml(tmp)
+
+        def table_for(key):
+            if key in MANAGED_HOST_KEYS and key in _table(op, "managed"):
+                return "managed"
+            if key not in MANAGED_HOST_KEYS and _table(op, "clients", "kandev"):
+                return "clients.kandev"
+            return "kandev"
+
+        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table=table_for(key))]
+        settings = kandev_settings(merge_config(read_toml(DEFAULTS_FILE), read_toml(tmp)),
+                                   operator=read_toml(tmp))
         if changed:
             os.replace(tmp, target)
     finally:
