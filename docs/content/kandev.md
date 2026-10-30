@@ -65,7 +65,9 @@ Kandev's sandboxes are kept apart from yours:
 
    `--allow-extra` gives the whole list, one entry per flag (`--allow-extra ''`
    empties it), and `--no-enabled` turns Kandev off. With `--json` it prints
-   `{"changed": [keys], "kandev": {…}}`, the section as verbs now load it.
+   `{"changed": [keys], "kandev": {…}, "warnings": [...]}`, the section as verbs
+   now load it. A warning names your own sandboxes that publish a port inside
+   `port_pool` or `proxy_port_pool` (see [the port pools](#checking-a-host)).
    Neither restricted key may run it: what the plugin's sandboxes may reach is
    yours to decide, from the host or an admin login.
 3. Authorize the plugin's public key, which the plugin's Sandbox Hosts page
@@ -81,6 +83,39 @@ Then add the host on the plugin's Sandbox Hosts page. Its test runs
 installs it with [`kandev tls install`](#the-tls-proxy). `health` reports
 `serve.ok` once the proxy runs with it.
 
+## Checking a host
+
+With `serve = "proxy"` there is **nothing listening on `base_url`'s port, and
+no `/health` URL**. `base_url` only supplies the host name a lease's URL and the
+certificate use; every lease points at a port of its own from
+`proxy_port_pool`. So `curl https://<base_url's host>/health` fails (refused,
+or answered by whatever else holds that port) even on a host that works, and while no Kandev sandbox exists the proxy holds no
+port at all: that is an idle proxy, not a failed one.
+
+To check a host, use what the plugin uses:
+
+1. `ssh <host> msbctl kandev health` (or the plugin's Test on its Sandbox Hosts
+   page): `serve.ok`, `serve.running`, and `serve.ports`, the public ports the
+   proxy has open right now (`[]` when no sandbox is live).
+2. A real lease: provision a sandbox from Kandev, then reach the port its lease
+   names with the lease's `X-Msb-Lease` header. Only that tests the network
+   path, the certificate and the token together.
+
+The proxy's journal (`journalctl --user -u msb-kandev-proxy`) says the same:
+a `serving N ports` line whenever the count changes (`serving 0 ports: no
+Kandev sandbox is published through the proxy` when idle), and a line for each
+port it opens or closes, with the sandbox and the guest port behind it.
+
+**The port pools.** Every Kandev sandbox takes four ports from `port_pool` (on
+127.0.0.1, one per guest port) and, with the proxy, four from
+`proxy_port_pool` (on `proxy_listen`, the ones its leases name). Both skip every
+host port any registry entry publishes, yours included and whether that sandbox
+runs or not, so Kandev never takes one of your ports. The other way round is
+up to you: a port you publish later inside a pool may be one Kandev already
+holds. `host kandev configure` names your sandboxes with ports inside either
+pool, and `health` counts the ones in `proxy_port_pool` as
+`serve.pool_overlap`; move them, or the pool.
+
 ## The `[kandev]` section
 
 | Key | Default | Meaning |
@@ -89,11 +124,11 @@ installs it with [`kandev tls install`](#the-tls-proxy). `health` reports
 | `max_sandboxes` | `12` | Kandev sandboxes that exist at once. Yours don't count |
 | `max_cpus` | `32` | summed over them |
 | `max_memory` | `"96G"` | summed over them |
-| `port_pool` | `"20000-29999"` | host ports published on 127.0.0.1, four per sandbox |
+| `port_pool` | `"20000-29999"` | host ports published on 127.0.0.1, four per sandbox. Ports your own sandboxes publish are skipped |
 | `base_url` | `""` | the HTTPS address Kandev reaches this host's sandboxes at. With `serve = "proxy"`, only its host name counts, and the certificate must name it |
 | `serve` | `"proxy"` | what serves `base_url`: the [TLS proxy](#the-tls-proxy), `"tailscale"` for `tailscale serve`, or `"none"` to route it yourself. A change applies to new sandboxes |
 | `proxy_listen` | `""` | the address the proxy's ports bind: this host's tailnet or LAN IP. Required for `"proxy"` |
-| `proxy_port_pool` | `"30000-39999"` | the proxy's public TLS ports, four per sandbox. Must not overlap `port_pool` |
+| `proxy_port_pool` | `"30000-39999"` | the proxy's public TLS ports, four per sandbox, each opened only while that sandbox exists. Must not overlap `port_pool`; ports your own sandboxes publish are skipped |
 | `rule_groups` | `["github", "npm", "python", "claude"]` | egress every Kandev sandbox gets, after `base` |
 | `allow_extra` | `[]` | what a profile's extra egress may add: hostname patterns (`"pypi.org"`, `"*.example.com"`, any port), addresses (`"192.168.2.6"`, any port), `address:port` (`"192.168.2.6:8788"`, `"[fd00::1]:22"`) and CIDRs (`"192.168.2.0/24"`, any port, no wider than /8 or IPv6 /32). A hostname pattern never matches an address. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
 | `private_names` | `[]` | exact hostnames a profile may ask to have resolved to a private address (a LAN forge published as `192.168.x.x`). See [names on your LAN](#names-on-your-lan) |
@@ -206,7 +241,7 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 
 | Verb | Stdin | Does |
 | --- | --- | --- |
-| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `egress.private_names`, `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
+| `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `egress.private_names`, `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`; with the `serve_ports` feature also `ports`, the public ports the proxy has open, `[]` when idle and absent from a proxy too old to say, and `pool_overlap`, how many ports in `proxy_port_pool` your own sandboxes publish, absent when none), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
 | `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `private_names`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
@@ -267,7 +302,9 @@ one port per lease means a connection can only ever reach one VM port.
   their open connections are cut. It also re-reads the entry on every
   connection, so a destroyed sandbox refuses at once.
 - **What it logs:** the sandbox, the guest port and the outcome, one line per
-  connection, in the service's journal. Never a token, a request head or
+  connection, in the service's journal; a line for each port it opens or
+  closes, with the sandbox and guest port behind it; and `serving N ports`
+  whenever that count changes, 0 included. Never a token, a request head or
   anything that passes through.
 
 ## The reaper

@@ -11725,7 +11725,10 @@ KANDEV_WORKSPACE_MAX_GIB = 500
 # What `health` lists for the plugin to require, within protocol 1. 0.4.0
 # ignored unknown request keys, so the plugin cannot tell from a provision that
 # went through whether it got what it asked for: it asks here first.
-KANDEV_FEATURES = ("workspace_disk", "private_names")
+# `serve_ports`: in proxy mode, `serve.ports` lists the public ports the running
+# proxy has open (absent for a proxy too old to say), and `serve.pool_overlap`
+# counts ports in proxy_port_pool that the operator's own sandboxes publish.
+KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -11756,6 +11759,13 @@ KANDEV_LEASE_KEY_PREV = KANDEV_LEASE_KEY + ".prev"
 KANDEV_LEASE_HEADER = "X-Msb-Lease"
 # Held by the running proxy: one proxy per host, and how `health` knows it runs.
 KANDEV_PROXY_LOCK = os.path.join(STATE_DIR, "kandev", "proxy.lock")
+# What the running proxy has open, {"version", "ports": [public ports]}, written
+# (atomically) at start and whenever that changes. Nothing listens on
+# base_url's own port in proxy mode, and with no sandbox live nothing listens at
+# all, which from outside looks just like a failed bind: `health` reads this to
+# tell them apart. Believed only while a proxy holds the lock and the release
+# in it matches, so a file a killed proxy left behind is never reported.
+KANDEV_PROXY_STATE = os.path.join(STATE_DIR, "kandev", "proxy.ports")
 KANDEV_HEAD_MAX = 16 * 1024
 KANDEV_HEAD_WAIT = 10
 KANDEV_TOKEN_SKEW = 30
@@ -12311,10 +12321,11 @@ def kandev_pin_api(name, entry):
         raise KandevError("unavailable", "could not write the Kandev API host into the guest")
 
 
-def registry_host_ports():
-    """Every host port a registry entry publishes or proxies, of any source,
-    running or not: a stopped sandbox's ports are taken again when it starts."""
-    used = set()
+def registry_port_claims():
+    """(name, entry, host port) for every host port a registry entry publishes
+    (`ports`) or, for a Kandev entry, proxies (`proxy_ports`), of any source,
+    running or not: a stopped sandbox's ports are taken again when it starts.
+    An entry that does not parse claims nothing; its own start reports it."""
     for name in registered():
         try:
             entry = read_toml(registry_path_for(name))
@@ -12322,12 +12333,32 @@ def registry_host_ports():
             continue
         for spec in entry.get("ports", []):
             try:
-                used.add(int(parse_port_spec(spec)[2]))
+                yield name, entry, int(parse_port_spec(spec)[2])
             except (SystemExit, ValueError):
                 continue
         if entry.get("source") == "kandev":
-            used.update(kandev_proxy_ports(entry).values())
-    return used
+            for port in kandev_proxy_ports(entry).values():
+                yield name, entry, port
+
+
+def registry_host_ports():
+    """Every host port any registry entry claims (registry_port_claims()).
+    Both Kandev pools skip all of them, so neither can hand out a port one of
+    the operator's sandboxes publishes, whether it runs or not."""
+    return {port for _, _, port in registry_port_claims()}
+
+
+def kandev_pool_overlap(settings, key):
+    """{port: [sandbox names]}: the ports in [kandev] `key` (a pool) that the
+    operator's own (non-Kandev) sandboxes publish. Allocation skips them, so
+    they only shrink the pool; but the operator's port and a Kandev one would
+    collide the other way round, so configure and health warn about them."""
+    low, high = settings[key]
+    out = {}
+    for name, entry, port in registry_port_claims():
+        if entry.get("source") != "kandev" and low <= port <= high:
+            out.setdefault(port, []).append(name)
+    return {port: sorted(set(names)) for port, names in sorted(out.items())}
 
 
 def kandev_alloc_ports(settings):
@@ -12442,6 +12473,20 @@ def kandev_proxy_version():
         return None
 
 
+def kandev_proxy_open_ports(version):
+    """The public ports the running proxy (of release `version`) says it has
+    open, sorted, or None when it says nothing: a release from before it did,
+    or a file left by another one."""
+    state = read_json(KANDEV_PROXY_STATE)
+    if not isinstance(state, dict) or state.get("version") != version:
+        return None
+    ports = state.get("ports")
+    if not isinstance(ports, list) or not all(isinstance(p, int) and not isinstance(p, bool)
+                                              for p in ports):
+        return None
+    return sorted(ports)
+
+
 def kandev_restart_proxy(installed, wait=10.0):
     """Restart the proxy's service if it runs another release than `installed`,
     so an update reaches it: systemd keeps the old process, and its old code,
@@ -12491,8 +12536,17 @@ def kandev_serve_ok(settings, tls):
         # The proxy's own release: one behind msbctl_version missed a restart
         # after an update (`kandev restart-proxy`).
         version = kandev_proxy_version() if running else None
+        # The ports it has open right now (feature `serve_ports`). There is no
+        # /health URL to probe in this mode: nothing listens on base_url's own
+        # port, and nothing at all while no Kandev sandbox exists, so an empty
+        # list with `running` is a healthy, idle proxy.
+        ports = kandev_proxy_open_ports(version) if running else None
+        # Counted, never named: the plugin's key sees none of the operator's sandboxes.
+        overlap = len(kandev_pool_overlap(settings, "proxy_port_pool"))
         return {"ok": not reasons, "mode": "proxy", "listen": settings["proxy_listen"],
                 "running": running, **({"version": version} if version is not None else {}),
+                **({"ports": ports} if ports is not None else {}),
+                **({"pool_overlap": overlap} if overlap else {}),
                 **({"reason": reasons[0]} if reasons else {})}
     if not shutil.which("tailscale"):
         return {"ok": False, "mode": "tailscale", "reason": "tailscale is not on PATH"}
@@ -13254,8 +13308,10 @@ def kandev_tls(args, config, settings):
 # a destroyed sandbox refuses at once, and a token minted before a stop and
 # start still works, while one from before a destroy and re-provision does not.
 #
-# Logged: the sandbox, the guest port and the outcome. Never a token, a
-# request head or a byte of what passes through.
+# Logged: the sandbox, the guest port and the outcome of each connection; each
+# listener as it opens or closes (sandbox, guest port, public port); and a
+# "serving N ports" line whenever that count or the reason for it changes, 0
+# included. Never a token, a request head or a byte of what passes through.
 
 class _ProxyListener:
     def __init__(self, sock, name, guest):
@@ -13294,6 +13350,20 @@ def kandev_proxy_wanted():
             for guest, public in kandev_proxy_ports(entry).items():
                 want[(settings["proxy_listen"], public)] = (name, guest)
     return want, None
+
+
+def kandev_proxy_summary(count, wanted, why):
+    """The proxy's one-line state: how many public ports it has open, of how
+    many the Kandev entries want, and why that is none (or few) when it is."""
+    plural = "" if count == 1 else "s"
+    if why:
+        return f"listening on nothing: {why}" if not count else f"keeping {count} port{plural} open: {why}"
+    line = f"serving {count} port{plural}"
+    if wanted > count:
+        line += f" ({wanted - count} could not be bound)"
+    elif not count:
+        line += ": no Kandev sandbox is published through the proxy"
+    return line
 
 
 def kandev_tls_context():
@@ -13420,21 +13490,38 @@ def kandev_proxy_conn(raw, listener, ctx, slots):
         kandev_proxy_log(f"{listener.name} {listener.guest} {outcome}")
 
 
+def kandev_proxy_on_sigterm(stop):
+    """systemd stops the proxy with SIGTERM: set `stop`, so the loop ends within
+    one select() and kandev_proxy()'s `finally` closes the listeners and removes
+    the state file. Never raise from here: SIGTERM lands at any line, and the
+    scan catches SystemExit (die() is how a bad TOML file is reported), so an
+    exit raised mid-scan would be swallowed. A second SIGTERM only sets it again."""
+    signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+
 def kandev_proxy(stop=None):
-    """The accept loop. Runs until killed (or `stop`, an Event, for tests)."""
+    """The accept loop. Runs until `stop` (an Event) is set, or until killed."""
     os.makedirs(os.path.dirname(KANDEV_PROXY_LOCK), mode=0o700, exist_ok=True)
     sel = selectors.DefaultSelector()
     listeners, slots = {}, threading.BoundedSemaphore(KANDEV_PROXY_MAX_CONNS)
-    ctx, stamp, said, next_scan = None, None, "", 0.0
+    ctx, stamp, said, told, next_scan, owned = None, None, None, None, 0.0, False
+    # Once: the lock and every state write name the same release, even if a
+    # checkout moves under the running proxy (and no `git` per port change).
+    me = version_string()
     lock = open(KANDEV_PROXY_LOCK, "a", encoding="utf-8")    # held for the proxy's life
     try:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             die("another `msbctl host kandev proxy` is already running on this host")
+        # Ours now. A file left by the last proxy (killed, or of this same
+        # release) would be believed until our first write: drop it first.
+        owned = True
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(KANDEV_PROXY_STATE)
         # Who holds it: how health and an update tell this release from the next.
         lock.truncate(0)
-        lock.write(version_string() + "\n")
+        lock.write(me + "\n")
         lock.flush()
         while not (stop and stop.is_set()):
             if time.monotonic() >= next_scan:
@@ -13456,12 +13543,11 @@ def kandev_proxy(stop=None):
                         kandev_proxy_log("certificate loaded" if ctx else "no certificate")
                 if ctx is None:
                     want, why = {}, why or "no certificate (`kandev tls install`)"
-                if why != said:
-                    kandev_proxy_log(f"listening on nothing: {why}" if why else "serving")
-                    said = why
                 for key in [k for k, v in listeners.items() if want.get(k) != (v.name, v.guest)]:
                     sel.unregister(listeners[key].sock)
-                    listeners.pop(key).close()
+                    gone = listeners.pop(key)
+                    gone.close()
+                    kandev_proxy_log(f"{gone.name} {gone.guest} closed port {key[1]}")
                 for key, (name, guest) in want.items():
                     if key in listeners:
                         continue
@@ -13478,6 +13564,20 @@ def kandev_proxy(stop=None):
                     sock.setblocking(False)
                     listeners[key] = _ProxyListener(sock, name, guest)
                     sel.register(sock, selectors.EVENT_READ, listeners[key])
+                    kandev_proxy_log(f"{name} {guest} listening on port {key[1]}")
+                # One line whenever the picture changes, with the count even at
+                # 0: "serving" with nothing open looked like a failed bind.
+                summary = kandev_proxy_summary(len(listeners), len(want), why)
+                if summary != said:
+                    kandev_proxy_log(summary)
+                    said = summary
+                ports = sorted(key[1] for key in listeners)
+                if ports != told:
+                    try:
+                        write_json(KANDEV_PROXY_STATE, {"version": me, "ports": ports})
+                        told = ports
+                    except OSError:
+                        pass    # not told: the next scan tries again
             for key, _ in sel.select(timeout=0.5):
                 listener = key.data
                 try:
@@ -13493,6 +13593,9 @@ def kandev_proxy(stop=None):
     finally:
         for listener in listeners.values():
             listener.close()
+        if owned:                      # written under our lock: no one else's to remove
+            with contextlib.suppress(OSError):
+                os.remove(KANDEV_PROXY_STATE)
         sel.close()
         lock.close()
 
@@ -13641,7 +13744,24 @@ def kandev_configure(args):
     effective = {k: v for k, v in settings.items() if k != "allow_extra_entries"}
     for key in ("port_pool", "proxy_port_pool"):
         effective[key] = "%d-%d" % effective[key]
-    return {"changed": changed, "kandev": effective}
+    return {"changed": changed, "kandev": effective, "warnings": kandev_pool_warnings(settings)}
+
+
+def kandev_pool_warnings(settings):
+    """A line per Kandev pool that ports the operator's own sandboxes publish
+    fall in, naming them (configure runs on the host, never under the plugin's
+    key). Kandev never takes those ports, but the pool is smaller by them, and
+    a sandbox of yours given a port Kandev already holds would collide."""
+    out = []
+    for key in ("port_pool", "proxy_port_pool"):
+        overlap = kandev_pool_overlap(settings, key)
+        if overlap:
+            names = sorted({n for found in overlap.values() for n in found})
+            shown = ", ".join(map(str, list(overlap)[:8])) + (", …" if len(overlap) > 8 else "")
+            out.append(f"[kandev] {key} {'%d-%d' % settings[key]} holds {len(overlap)} port(s) your "
+                       f"own sandboxes publish ({shown}: {', '.join(names)}). Kandev skips them; "
+                       f"move them, or the pool, to keep the two apart")
+    return out
 
 
 def host_kandev(args, config):
@@ -13653,8 +13773,10 @@ def host_kandev(args, config):
     if args.arg == "reap":
         json_document(lambda: kandev_reap(args, config, kandev_settings(config)))
     if args.arg == "proxy":
+        stop = threading.Event()
+        kandev_proxy_on_sigterm(stop)
         with contextlib.suppress(KeyboardInterrupt):       # ^C in a terminal: just stop
-            kandev_proxy()
+            kandev_proxy(stop)
         return
     if args.arg == "rotate-lease-key":
         kandev_rotate_lease_key()
@@ -13668,6 +13790,8 @@ def host_kandev(args, config):
             die(f"{exc.message}; {tilde(CONFIG_FILE)} is unchanged")
         note(f"[kandev] in {tilde(CONFIG_FILE)}: " +
              (f"set {', '.join(done['changed'])}" if done["changed"] else "nothing to change"))
+        for line in done["warnings"]:
+            warn(line)
         return
     if args.arg != "install":
         die("host kandev: install, reap, proxy, rotate-lease-key or configure")

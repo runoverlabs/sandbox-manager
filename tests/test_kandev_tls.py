@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -186,8 +187,25 @@ class Health(TlsTest):
                 self.configure(**{key: value})
                 self.assertIn(key, self.error("invalid_config", "health")["message"])
 
-    def lock_held(self):
-        """Hold the proxy's lock as a running proxy does."""
+    def test_open_ports_are_believed_only_from_the_proxy_holding_the_lock(self):
+        self.install()
+        self.assertIn("serve_ports", self.ok("health")["features"])
+        self.m.write_json(self.m.KANDEV_PROXY_STATE, {"version": "0.0.1", "ports": [30000]})
+        # Not running: a file a killed proxy left says nothing.
+        self.assertNotIn("ports", self.serve_doc())
+        with self.lock_held(version="0.0.1"):
+            self.assertEqual(self.serve_doc()["ports"], [30000])
+        # Another release holds the lock: the file is not its.
+        with self.lock_held(version="0.0.2"):
+            self.assertNotIn("ports", self.serve_doc())
+        # Idle is an empty list, and still ok.
+        self.m.write_json(self.m.KANDEV_PROXY_STATE, {"version": "0.0.2", "ports": []})
+        with self.lock_held(version="0.0.2"):
+            doc = self.serve_doc()
+        self.assertEqual((doc["ok"], doc["ports"]), (True, []))
+
+    def lock_held(self, version=""):
+        """Hold the proxy's lock as a running proxy does, with `version` in it."""
         import fcntl
 
         @contextlib.contextmanager
@@ -195,8 +213,64 @@ class Health(TlsTest):
             os.makedirs(os.path.dirname(self.m.KANDEV_PROXY_LOCK), exist_ok=True)
             with open(self.m.KANDEV_PROXY_LOCK, "a", encoding="utf-8") as fh:
                 fcntl.flock(fh, fcntl.LOCK_EX)
+                fh.truncate(0)
+                fh.write(version and version + "\n")
+                fh.flush()
                 yield
         return held()
+
+
+class PortPools(TlsTest):
+    """Neither pool hands out a port the operator's own sandboxes publish,
+    whether they run or not (the registry decides, not msb's state), and
+    configure and health say when a pool overlaps such ports."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure(port_pool='"20000-20099"', proxy_port_pool='"30000-30099"')
+        self.make_folder_sandbox("web", entry_extra='ports = ["30000:80", "0.0.0.0:30002:81/udp", "20001:82"]')
+        self.make_folder_sandbox("api", entry_extra='ports = ["127.0.0.1:30004:83"]')
+
+    def test_allocation_skips_the_operators_ports(self):
+        # The ports each pool would hand out next (this machine may hold some
+        # of the pool already), published by a sandbox of the operator's that
+        # is not running: msb knows nothing of it, only the registry does.
+        settings = self.m.kandev_settings(self.m.load_config())
+        nxt = self.m.kandev_alloc_ports(settings)[:2] + self.m.kandev_alloc_proxy_ports(settings)[:2]
+        self.make_folder_sandbox("stopped", entry_extra="ports = [%s]" % ", ".join(
+            f'"{p}:{8000 + i}"' for i, p in enumerate(nxt)))
+        self.assertEqual(self.m.msb_table().get("stopped"), None)
+        mine = {30000, 30002, 30004, 20001, *nxt}
+        for env in ("e1", "e2"):
+            rec = self.provision(env, operation_id=f"op-{env}")
+            self.assertFalse(set(rec["ports"].values()) & mine, rec["ports"])
+            public = set(self.public(rec["name"]).values())
+            self.assertEqual(len(public), 4)
+            self.assertFalse(public & mine, public)
+
+    def test_health_counts_the_overlap_and_names_no_sandbox(self):
+        doc = self.ok("health")
+        self.assertEqual(doc["serve"]["pool_overlap"], 3)
+        for name in ("web", "api"):
+            self.assertNotIn(f'"{name}', json.dumps(doc))
+            self.assertNotIn(f'{name}"', json.dumps(doc))
+        self.configure(proxy_port_pool='"31000-31099"')
+        self.assertNotIn("pool_overlap", self.ok("health")["serve"])
+
+    def test_configure_names_them(self):
+        code, doc = self.msbctl_json("host", "kandev", "configure", "--json", plugin=False)
+        self.assertEqual(code, 0, doc)
+        port_pool, proxy_pool = doc["warnings"]
+        self.assertIn("[kandev] port_pool 20000-20099 holds 1 port(s)", port_pool)
+        self.assertIn("(20001: web)", port_pool)
+        self.assertIn("[kandev] proxy_port_pool 30000-30099 holds 3 port(s)", proxy_pool)
+        self.assertIn("(30000, 30002, 30004: api, web)", proxy_pool)
+        code, out, err = self.run_main("host", "kandev", "configure")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err.count("WARNING:"), 2, err)
+
+    def public(self, name):
+        return self.m.kandev_proxy_ports(self.m.read_toml(self.entry_path(name)))
 
 
 class Leases(TlsTest):
@@ -319,6 +393,8 @@ class Proxy(TlsTest):
                 self.backends.append(EchoBackend(host, f"{rec['name']}:{guest}"))
         self.client_ctx = ssl.create_default_context(cafile=self.pki["ca.pem"])
         self.halt = threading.Event()
+        # `host kandev proxy` (test_one_proxy_per_host) installs its SIGTERM handler.
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
         patches = [mock.patch.object(self.m, "KANDEV_PROXY_SCAN", 0.2),
                    mock.patch.object(self.m, "kandev_proxy_log", self.logs.append)]
         for patch in patches:
@@ -486,9 +562,180 @@ class Proxy(TlsTest):
             self.assertNotIn(AGENTCTL_TOKEN, message)
             self.assertNotIn("X-Msb-Lease", message)
 
+    def test_logs_each_listener_and_the_count(self):
+        names = {}
+        for rec in (self.e1, self.e2):
+            for guest, public in self.public(rec["name"]).items():
+                names[public] = (rec["name"], guest)
+                self.assertIn(f"{rec['name']} {guest} listening on port {public}", self.logs)
+        self.wait_for_log("serving 8 ports")
+        self.wait_for_ports(sorted(names))
+        e2 = self.public("k-e2")
+        self.purge("k-e2")
+        for port in e2.values():
+            self.wait_for(port, listening=False)
+        self.wait_for_log("serving 4 ports")
+        for guest, public in e2.items():
+            self.assertIn(f"k-e2 {guest} closed port {public}", self.logs)
+        self.wait_for_ports(sorted(self.public("k-e1").values()))
+        # Nothing live: still serving, and it says it holds nothing.
+        self.purge("k-e1")
+        self.wait_for_log("serving 0 ports: no Kandev sandbox is published through the proxy")
+        self.wait_for_ports([])
+        self.shutdown()
+        self.assertFalse(os.path.exists(self.m.KANDEV_PROXY_STATE))
+
+    def wait_for_log(self, line):
+        deadline = time.monotonic() + 5
+        while line not in self.logs and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIn(line, self.logs)
+
+    def wait_for_ports(self, ports):
+        """health's serve.ports: the state file comes after the summary line."""
+        deadline = time.monotonic() + 5
+        while self.ok("health")["serve"].get("ports") != ports and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual(self.ok("health")["serve"].get("ports"), ports)
+
     def test_one_proxy_per_host(self):
+        ports = sorted(p for rec in (self.e1, self.e2) for p in self.public(rec["name"]).values())
+        self.wait_for_ports(ports)
         code, _, err = self.run_main("host", "kandev", "proxy")
         self.assertNotEqual(code, 0)
         self.assertIn("already running", err)
         self.assertTrue(self.ok("health")["serve"]["running"])
+        # Refused the lock, it leaves the running proxy's file alone.
+        self.assertTrue(os.path.exists(self.m.KANDEV_PROXY_STATE))
+        self.assertEqual(self.ok("health")["serve"]["ports"], ports)
 
+
+class ProxyState(TlsTest):
+    """The state file health reads: dropped when a proxy takes the lock,
+    rewritten until a write succeeds, removed when the proxy stops, and
+    always of the release the lock names."""
+
+    def setUp(self):
+        super().setUp()
+        self.install()
+        self.logs = []
+        self.halt = threading.Event()
+        self.thread = None
+        patches = [mock.patch.object(self.m, "KANDEV_PROXY_SCAN", 0.2),
+                   mock.patch.object(self.m, "kandev_proxy_log", self.logs.append)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.shutdown)
+
+    def start(self):
+        self.thread = threading.Thread(target=self.m.kandev_proxy, args=(self.halt,), daemon=True)
+        self.thread.start()
+
+    def shutdown(self):
+        self.halt.set()
+        if self.thread is not None:
+            self.thread.join(5)
+
+    def wait_until(self, check):
+        deadline = time.monotonic() + 5
+        while not check() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(check())
+
+    def test_a_file_left_by_the_same_release_is_dropped_at_lock_time(self):
+        me = self.m.version_string()
+        self.m.write_json(self.m.KANDEV_PROXY_STATE, {"version": me, "ports": [30000, 30001]})
+        with mock.patch.object(self.m, "write_json", side_effect=OSError(28, "No space left")):
+            self.start()
+            self.wait_until(lambda: self.ok("health")["serve"]["running"])
+            self.wait_until(lambda: "serving 0 ports" in " ".join(self.logs))
+            # Its own write failed, and the old file says nothing either.
+            self.assertFalse(os.path.exists(self.m.KANDEV_PROXY_STATE))
+            self.assertNotIn("ports", self.ok("health")["serve"])
+
+    def test_a_failed_write_is_tried_again(self):
+        real, calls = self.m.write_json, []
+
+        def flaky(path, doc, *a, **kw):
+            if path == self.m.KANDEV_PROXY_STATE:
+                calls.append(doc)
+                if len(calls) == 1:
+                    raise OSError(28, "No space left")
+            return real(path, doc, *a, **kw)
+        with mock.patch.object(self.m, "write_json", flaky):
+            self.start()
+            self.wait_until(lambda: self.ok("health")["serve"].get("ports") == [])
+        self.assertGreaterEqual(len(calls), 2)
+
+    def test_the_release_is_the_one_it_started_as(self):
+        # A checkout moved under the running proxy: health still believes it.
+        # The proxy's first call says one release, every later call (its own
+        # or anyone else's) the next.
+        asked = []
+
+        def release():
+            if threading.current_thread() is self.thread and not asked:
+                asked.append(1)
+                return "1.0.0+aaaaaaa (git checkout)"
+            return "1.0.0+bbbbbbb (git checkout)"
+        with mock.patch.object(self.m, "version_string", release):
+            self.start()
+            self.wait_until(lambda: self.ok("health")["serve"].get("ports") == [])
+            rec = self.provision("e1", operation_id="op-1")
+            want = sorted(self.m.kandev_proxy_ports(self.m.read_toml(self.entry_path(rec["name"]))).values())
+            self.assertTrue(want)
+            self.wait_until(lambda: self.ok("health")["serve"].get("ports") == want)
+            self.assertEqual(self.ok("health")["serve"]["version"], "1.0.0+aaaaaaa (git checkout)")
+
+    def on_sigterm(self):
+        """Install the proxy's handler for `halt`; return it, to call directly
+        (no real signal is sent to the test process)."""
+        self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
+        self.m.kandev_proxy_on_sigterm(self.halt)
+        return signal.getsignal(signal.SIGTERM)
+
+    def test_sigterm_sets_stop_and_raises_nothing(self):
+        handler = self.on_sigterm()
+        handler(signal.SIGTERM, None)
+        self.assertTrue(self.halt.is_set())
+        handler(signal.SIGTERM, None)      # a second one, during cleanup: harmless
+        self.assertTrue(self.halt.is_set())
+
+    def test_sigterm_during_a_scan_stops_the_proxy_and_removes_the_file(self):
+        # The scan catches SystemExit (die() on a bad TOML file), so a handler
+        # that raised would be swallowed if the signal landed there.
+        rec = self.provision("e1", operation_id="op-1")
+        entry = self.entry_path(rec["name"])
+        want = sorted(self.m.kandev_proxy_ports(self.m.read_toml(entry)).values())
+        self.assertTrue(want)
+        handler, real, armed, fired = self.on_sigterm(), self.m.read_toml, threading.Event(), []
+
+        def read_toml(path, *a, **kw):
+            if armed.is_set() and not fired and path == entry \
+                    and threading.current_thread() is self.thread:
+                fired.append(1)
+                handler(signal.SIGTERM, None)       # what Python runs on SIGTERM
+            return real(path, *a, **kw)
+        with mock.patch.object(self.m, "read_toml", read_toml):
+            self.start()
+            self.wait_until(lambda: self.ok("health")["serve"].get("ports") == want)
+            armed.set()
+            self.thread.join(5)
+        self.assertTrue(fired)
+        self.assertFalse(self.thread.is_alive())
+        self.assertFalse(os.path.exists(self.m.KANDEV_PROXY_STATE))
+        # Stopped, not carried on: the entry was never dropped mid-scan.
+        self.assertFalse([line for line in self.logs if "closed port" in line or "config:" in line])
+
+
+class ProxySummary(KandevTest):
+
+    def test_the_count_is_always_said(self):
+        say = self.m.kandev_proxy_summary
+        self.assertEqual(say(0, 0, None), "serving 0 ports: no Kandev sandbox is published through the proxy")
+        self.assertEqual(say(1, 1, None), "serving 1 port")
+        self.assertEqual(say(2, 4, None), "serving 2 ports (2 could not be bound)")
+        self.assertEqual(say(0, 0, "no certificate"), "listening on nothing: no certificate")
+        # A config being edited keeps what is open, and says how much.
+        self.assertEqual(say(4, 4, "config: bad"), "keeping 4 ports open: config: bad")
