@@ -1554,13 +1554,22 @@ class Sandbox:
         # inside the sandbox, and the project layer is the repo's own .msb/ as
         # fetched at a recorded commit (policy_dir(), never mounted).
         # "kandev": a sandbox Kandev owns, written and removed by `msbctl
-        # kandev` (see that section). No project and no policy layer: the
-        # entry is the whole definition, and the project is an empty dir.
+        # kandev` (see that section). "managed": the same for another client,
+        # named by `client` (`msbctl managed`). No project and no policy layer:
+        # the entry is the whole definition, and the project is an empty dir.
         self.source = self.entry.get("source", "folder")
-        if self.source not in ("folder", "repo", "kandev"):
-            die(f"{name}.toml: source is {self.source!r}, expected \"folder\", \"repo\" or \"kandev\"")
+        if self.source not in ("folder", "repo", "kandev", "managed"):
+            die(f"{name}.toml: source is {self.source!r}, expected \"folder\", \"repo\", "
+                "\"kandev\" or \"managed\"")
         self.is_repo = self.source == "repo"
-        self.is_kandev = self.source == "kandev"
+        # Whose it is (entry_client()): None for the operator's own.
+        self.client = entry_client(self.entry)
+        if self.source == "managed" and self.client is None:
+            die(f"{name}.toml: source is \"managed\" but client is not a client name")
+        self.is_managed = self.client is not None
+        # Every is_kandev site means "a client owns it: none of the operator's
+        # plumbing", so it holds for every client, Kandev included.
+        self.is_kandev = self.is_managed
         self.repo = self.entry.get("repo", "")
         # The one parsed form of `repo` (see RepoRef): None for no repo, and
         # for a value no msbctl would have written.
@@ -1679,8 +1688,8 @@ class Sandbox:
     @property
     def location(self):
         """Where the code is, for display: a host folder, or the repo."""
-        if self.is_kandev:
-            return f"kandev:{self.entry.get('kandev_env', '?')}"
+        if self.is_managed:
+            return f"{self.client}:{entry_env(self.entry) or '?'}"
         if not self.is_repo:
             return tilde(self.project)
         ref = self.entry.get("ref") or self.repo_meta.get("branch") or "(default branch)"
@@ -4198,14 +4207,80 @@ POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
 
 
 def restricted():
-    """True under `msbctl host serve`: nothing that approves a policy may ask."""
-    return os.environ.get("MSB_RESTRICTED") in ("1", "kandev")
+    """True under `msbctl host serve`: nothing that approves a policy may ask.
+    Any value at all counts: one msbctl does not know is never less
+    restricted than one it does (key_client() refuses it outright)."""
+    return bool(os.environ.get("MSB_RESTRICTED"))
+
+
+# ------------------------------------------------------- client identity
+#
+# A managed client is an orchestrator that owns sandboxes on this host through
+# its own ssh key: Kandev (protocol 1, `msbctl kandev`) or any client the
+# operator names in [clients.<name>] (protocol 2, `msbctl managed`). Who the
+# caller is, and whose a registry entry is, are read here and nowhere else.
+#
+#   the key     MSB_RESTRICTED, set by `host serve` from the forced command
+#               alone: "kandev" for `--kandev`, "client:NAME" for `--client
+#               NAME`, "1" for the everyday key. Never from the caller's argv.
+#   an entry    source = "kandev" (kandev_env), or source = "managed" with
+#               client = "<name>" (client_env). folder and repo entries are
+#               the operator's.
+
+# A client's name: short, so `msbctl.owner=<name>` and the forced command stay
+# readable. folder, repo and managed would read as a registry source.
+CLIENT_NAME = re.compile(r"[a-z][a-z0-9-]{0,15}")
+RESERVED_CLIENT_NAMES = ("folder", "repo", "managed")
+
+
+def client_name_problem(name):
+    """Why `name` cannot name a client, or None."""
+    if not isinstance(name, str) or not CLIENT_NAME.fullmatch(name):
+        return f"{name!r} is not a client name (a-z first, then a-z 0-9 -, at most 16)"
+    if name in RESERVED_CLIENT_NAMES:
+        return f"{name} is reserved"
+    return None
+
+
+def key_client():
+    """The client whose key this session runs under, or None: "kandev" under
+    `host serve --kandev`, NAME under `host serve --client NAME`."""
+    value = os.environ.get("MSB_RESTRICTED", "")
+    if value in ("", "1"):
+        return None
+    if value == "kandev":
+        return "kandev"
+    if value.startswith("client:") and not client_name_problem(value[7:]):
+        return value[7:]
+    # Fail closed: a value `host serve` never sets is no key's, not the
+    # everyday one's (that would widen a mangled client key).
+    die("MSB_RESTRICTED holds a key msbctl does not know: refusing "
+        "(`msbctl host authorize` writes the forced command)")
 
 
 def kandev_key():
     """True under `host serve --kandev`: the Kandev plugin's key, whose generic
     verbs (ls, show, stop, purge) see Kandev's sandboxes and nothing else."""
-    return os.environ.get("MSB_RESTRICTED") == "kandev"
+    return key_client() == "kandev"
+
+
+def entry_client(entry):
+    """The client a registry entry belongs to, or None for the operator's."""
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("source") == "kandev":
+        return "kandev"
+    if entry.get("source") == "managed":
+        client = entry.get("client")
+        return client if not client_name_problem(client) and client != "kandev" else None
+    return None
+
+
+def entry_env(entry):
+    """The client's own id for the environment a managed entry is for."""
+    if entry.get("source") == "kandev":
+        return entry.get("kandev_env", "")
+    return entry.get("client_env", "")
 
 
 def project_policy(box):
@@ -4784,11 +4859,13 @@ def cmd_rebuild(args, config):
 def cmd_purge(args, config):
     """Returns {"name", "purged"} for `--json`. A name with nothing registered
     under it is not a failure: what was asked for is true, so a repeated or
-    late purge succeeds. Under the Kandev key, a sandbox that is not Kandev's
-    counts as nothing, and is never touched."""
+    late purge succeeds. Under a client's key (Kandev's or another's), a
+    sandbox that is not that client's counts as nothing, and is never touched:
+    another client's sandbox answers exactly as a name with nothing under it,
+    so a purge is no way to learn what exists."""
     name = args.name
     entry = read_toml(registry_path_for(name)) if os.path.isfile(registry_path_for(name)) else {}
-    if not entry or (kandev_key() and entry.get("source") != "kandev"):
+    if not entry or (key_client() and entry_client(entry) != key_client()):
         note(f"nothing found named {name}: nothing to purge")
         return {"name": name, "purged": False}
     box = Sandbox(name, config)
@@ -4885,7 +4962,7 @@ def purge_kandev(box, args):
     with kandev_lock():
         entry = read_toml(registry_path_for(box.name))
         try:
-            if entry.get("source") == "kandev":
+            if entry_client(entry) == box.client:
                 kandev_remove(box.name, entry, set(kandev_labelled()))
         except KandevError as exc:
             if getattr(args, "json", False):
@@ -9196,7 +9273,7 @@ def probe_installed(name, table):
 def refresh_versions(names, config, cache):
     say("Probing versions")
     # Kandev's sandboxes run Kandev's image and are not msbctl's to probe.
-    names = [n for n in names if read_toml(registry_path_for(n)).get("source") != "kandev"]
+    names = [n for n in names if entry_client(read_toml(registry_path_for(n))) is None]
     table = msb_table()
     token = None
     if config.get("version_check", {}).get("use_global_token", True):
@@ -12336,7 +12413,7 @@ def registry_port_claims():
                 yield name, entry, int(parse_port_spec(spec)[2])
             except (SystemExit, ValueError):
                 continue
-        if entry.get("source") == "kandev":
+        if entry_client(entry) is not None:
             for port in kandev_proxy_ports(entry).values():
                 yield name, entry, port
 
@@ -12356,7 +12433,7 @@ def kandev_pool_overlap(settings, key):
     low, high = settings[key]
     out = {}
     for name, entry, port in registry_port_claims():
-        if entry.get("source") != "kandev" and low <= port <= high:
+        if entry_client(entry) is None and low <= port <= high:
             out.setdefault(port, []).append(name)
     return {port: sorted(set(names)) for port, names in sorted(out.items())}
 
@@ -15718,6 +15795,7 @@ def parse_cli(argv, parser=None):
 
 def main():
     keyring_forget()
+    key_client()            # a MSB_RESTRICTED no `host serve` sets refuses every verb
     args = parse_cli(sys.argv[1:])
     # Before the preflight and the config: a Tab must answer on a laptop with
     # no msb, and quickly, and a broken config.toml only costs remote names.
