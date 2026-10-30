@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-30
+
 ### Added
 - `msbctl managed` (protocol 2) lets another orchestrator own sandboxes on a Kandev host beside Kandev's: `host authorize KEY --client NAME` writes a key whose forced command is `host serve --client NAME`, which runs that client's `managed` verbs and `ls`, `show`, `stop`, `purge` and `doctor --json` over its own sandboxes only. Its sandboxes have their own name prefix, msb label, limits, egress, guest ports, agentctl variable prefix and an optional callback, which its `allow_extra` must admit: by an address, CIDR or address:port entry covering the address it resolves to on the host, or by a hostname pattern only when that address is public or the name is in its `private_names`, as for the same name in `egress_allow` (a name nothing could admit is refused without being looked up); `*` admits any address given as one, private included, and for a name counts as a pattern. A client that is never called back sends none, so no egress rule names it and nothing is pinned in the guest's `/etc/hosts`, where a pinned name would get no secret substituted. Kandev's `msbctl kandev` (protocol 1) is unchanged, and the Kandev key may run `managed` too.
 - `msbctl kandev health` lists the `managed_namespace` feature on a host that speaks protocol 2.
