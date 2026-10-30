@@ -11285,7 +11285,8 @@ def client_table_warning(client):
     found = clients_settings(config).get(client)
     if found is None:
         warn(f"there is no [clients.{client}] in {tilde(CONFIG_FILE)} yet: this key answers `denied` "
-             "to every verb but `managed health` until there is one, enabled")
+             "to every verb but `managed health` until there is one, enabled (`msbctl host managed "
+             f"configure --client {client} --enabled` writes it)")
     elif isinstance(found, KandevError):
         warn(f"{found.message}: this key's verbs answer invalid_config until that is fixed")
     elif not found["enabled"]:
@@ -11324,8 +11325,76 @@ def doctor_checks(config=None):
         out.insert(0, _doctor("config", "fail", f"{tilde(CONFIG_FILE)} does not load",
                               "`msbctl config` shows the error; `msbctl setup` → edit the file"))
     else:
-        out += registry_checks(config, entries)
+        out += client_checks(config, entries) + registry_checks(config, entries)
     return out
+
+
+def client_checks(config, entries=None):
+    """Whether the managed clients' tables check out: [managed], [kandev] and
+    each [clients.NAME]. Under a client's key, its own and what all share.
+    At the host, with `entries` (doctor_registry()), also each client whose
+    name_prefix is already the start of a sandbox it does not own (one made
+    before the client's table was, by hand): its provision of that
+    environment answers conflict."""
+    scoped = key_client()
+    try:
+        managed_host_settings(config)
+    except KandevError as exc:
+        # The host's keys are every client's: this one does stop them all.
+        return [_doctor("clients", "warn", f"no client's verbs work: {exc.message}",
+                        "fix config.toml (`msbctl config`), or `msbctl host managed configure`")]
+    clients = clients_settings(config)
+    problems = []
+    if not isinstance(config.get("clients", {}), dict):
+        problems.append("[clients] is not a table, so it names no client but Kandev: each is a "
+                        "table of its own, [clients.NAME]")
+    if scoped:
+        clients = {scoped: clients.get(scoped) or {"enabled": False}}
+    broken = {n: e.message for n, e in clients.items() if isinstance(e, KandevError)}
+    enabled = sorted(n for n, s in clients.items() if isinstance(s, dict) and s["enabled"])
+    if broken:
+        # Until it is fixed, the proxy keeps the ports a broken table's
+        # sandboxes have open and opens none (after a restart, it has none),
+        # and leases already issued stay valid until they expire. Only the
+        # clients named are stopped: Kandev and the rest go on.
+        problems.append("; ".join(f"{n}: {m}" for n, m in sorted(broken.items()))
+                        + " (each client named answers invalid_config, and the others go on; until "
+                        "a table is fixed, the proxy keeps the ports its sandboxes have open and "
+                        "opens no new ones, none after it restarts, and leases already issued stay "
+                        "valid until they expire)")
+    if problems:
+        out = [_doctor("clients", "warn", "; ".join(problems),
+                       "fix the table named (`msbctl config` shows where), or `msbctl host managed "
+                       "configure --client NAME`")]
+    else:
+        out = [_doctor("clients", "ok", f"enabled: {', '.join(enabled)}" if enabled else "no client is enabled")]
+    if entries is not None and not scoped:
+        out += client_prefix_checks(config, entries)
+    return out
+
+
+def client_prefix_checks(config, entries):
+    """At the host: a warning per client whose name_prefix (its table
+    checking out or not) is already the start of a registered sandbox it does
+    not own, as `host managed configure` refuses to make one. The client's
+    provision of that environment answers conflict (naming nothing), and
+    whether one is there is all the client learns of it; the operator's own
+    sandbox there is best renamed."""
+    taken = []
+    for client in configured_clients(config):
+        prefix = client_prefix_wanted(config, client)
+        names = sorted(n for n, e in entries.items() if prefix and n.startswith(prefix)
+                       and isinstance(e, dict) and entry_client(e) != client)
+        if names:
+            shown = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
+            taken.append(f"{owner_name(client)}'s name_prefix {prefix!r} is the start of {shown}, "
+                         f"which {owner_name(client)} does not own")
+    if not taken:
+        return []
+    return [_doctor("client-prefixes", "warn", "; ".join(taken) + ": that client's provision of "
+                    "the environment answers conflict, and it learns that the name is taken",
+                    "rename the sandbox (`msbctl rename`), or give the client another name_prefix "
+                    "(`msbctl host managed configure --client NAME --name-prefix PREFIX`)")]
 
 
 # Under the Kandev plugin's key, doctor reports what decides whether Kandev's
@@ -11819,12 +11888,12 @@ def cmd_host(args, config):
         die(f"host {args.action} is for the host itself")
     elif args.kandev and args.action not in ("authorize", "serve"):
         die("--kandev goes with host authorize or host serve")
-    elif args.client and args.action not in ("authorize", "serve"):
-        die("--client goes with host authorize or host serve")
-    elif (any(getattr(args, attr) is not None for attr, _ in KANDEV_CONFIGURE_KEYS)
-          and (args.action, args.arg) != ("kandev", "configure")):
-        die("--enabled, --serve, --proxy-listen, --base-url, --allow-extra and --private-name "
-            "go with host kandev configure")
+    elif args.client and args.action not in ("authorize", "serve", "managed"):
+        die("--client goes with host authorize, host serve or host managed configure")
+    elif (any(getattr(args, attr) is not None for attr in MANAGED_CONFIGURE_FLAGS)
+          and (args.action, args.arg) not in (("kandev", "configure"), ("managed", "configure"))):
+        die("--enabled, --serve, --proxy-listen, --base-url, --allow-extra, --private-name and the "
+            "other configure flags go with host kandev configure or host managed configure")
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
@@ -11833,6 +11902,8 @@ def cmd_host(args, config):
         host_autostart(args)
     elif args.action == "kandev":
         host_kandev(args, config)
+    elif args.action == "managed":
+        host_managed(args, config)
 
 
 # ----------------------------------------------------------------- kandev
@@ -14713,6 +14784,119 @@ def kandev_configure(args):
     return {"changed": changed, "kandev": effective, "warnings": kandev_pool_warnings(settings)}
 
 
+# `host managed configure` flag → key. Host keys go to [managed] (or [kandev],
+# on a host that keeps them there); with --client, the client's keys go to its
+# table, [clients.NAME] (Kandev's: [kandev], or [clients.kandev]).
+MANAGED_CONFIGURE_HOST_KEYS = (("serve", "serve"), ("proxy_listen", "proxy_listen"),
+                               ("base_url", "base_url"), ("max_sandboxes", "max_sandboxes"),
+                               ("max_cpus", "max_cpus"), ("max_memory", "max_memory"))
+MANAGED_CONFIGURE_CLIENT_KEYS = (("enabled", "enabled"), ("max_sandboxes", "max_sandboxes"),
+                                 ("max_cpus", "max_cpus"), ("max_memory", "max_memory"),
+                                 ("allow_extra", "allow_extra"), ("private_names", "private_names"),
+                                 ("name_prefix", "name_prefix"), ("env_prefix", "env_prefix"),
+                                 ("guest_ports", "guest_ports"), ("require_callback", "require_callback"),
+                                 ("body_secret_hosts", "body_secret_hosts"))
+MANAGED_CONFIGURE_FLAGS = ("enabled", "serve", "proxy_listen", "base_url", "allow_extra", "private_names",
+                           "max_sandboxes", "max_cpus", "max_memory", "name_prefix", "env_prefix",
+                           "guest_ports", "require_callback", "body_secret_hosts")
+
+
+def managed_configure(args):
+    """`host managed configure [--client NAME]`: set the keys given, in
+    place in config.toml (comments and every other table kept), and only if
+    the host's keys still check out and, with --client, that client's table
+    does too (a name_prefix another client has included) and its
+    name_prefix is the start of no sandbox it does not own. Another client's
+    table that does not check out refuses nothing: it is reported under
+    `problems`, as each verb keeps it to that client. Without --client, the
+    host-wide keys; with it, that client's. A refused value leaves the file
+    as it was. Run from the host or an admin login, never from a client's
+    key: a client deciding its own egress is what allow_extra exists to
+    prevent."""
+    client = args.client
+    if client and client != "kandev" and client_name_problem(client):
+        raise KandevError("invalid_config", f"--client: {client_name_problem(client)}")
+    pairs = MANAGED_CONFIGURE_CLIENT_KEYS if client else MANAGED_CONFIGURE_HOST_KEYS
+    given = {attr for attr in MANAGED_CONFIGURE_FLAGS if getattr(args, attr, None) is not None}
+    stray = sorted(given - {attr for attr, _ in pairs})
+    if stray:
+        flag = "--" + stray[0].replace("_", "-")
+        raise KandevError("invalid_config", f"{flag} is a client's key: add --client NAME" if client is None
+                          else f"{flag} is the host's: leave --client out")
+    changes = []
+    for attr, key in pairs:
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        if key in ("allow_extra", "private_names", "body_secret_hosts"):
+            value = [e for e in value if e.strip()]
+        changes.append((key, value))
+    ensure_local_config()
+    target = os.path.realpath(CONFIG_FILE)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".config-", suffix=".toml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out, open(target, encoding="utf-8") as src:
+            out.write(src.read())
+        shutil.copymode(target, tmp)
+        op = read_toml(tmp)
+
+        def table_for(key):
+            if client == "kandev":
+                return "clients.kandev" if _table(op, "clients", "kandev") else "kandev"
+            if client:
+                return f"clients.{client}"
+            # A host key the operator keeps in [kandev] stays there: one copy.
+            return "kandev" if key in MANAGED_HOST_KEYS and key in _table(op, "kandev") else "managed"
+
+        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table=table_for(key))]
+        op = read_toml(tmp)
+        config = merge_config(read_toml(DEFAULTS_FILE), op)
+        host = managed_host_settings(config, operator=op)
+        clients = clients_settings(config, operator=op)
+        if client:
+            mine = clients.get(client) or client_settings(config, client, operator=op)
+            if isinstance(mine, KandevError):
+                raise mine
+            if client != "kandev":
+                taken = sorted(n for n in registered() if n.startswith(mine["name_prefix"])
+                               and entry_client(read_toml(registry_path_for(n))) != client)
+                if taken:
+                    raise KandevError("invalid_config", f"[clients.{client}] name_prefix "
+                                      f"{mine['name_prefix']!r}: already the start of "
+                                      f"{', '.join(taken[:5])}, which {client} does not own")
+                # Its sandboxes are found by the prefix: one left under the
+                # old one would be cut off from its own client's verbs.
+                stranded = "name_prefix" in changed and sorted(
+                    n for n in registered() if not n.startswith(mine["name_prefix"])
+                    and entry_client(read_toml(registry_path_for(n))) == client)
+                if stranded:
+                    raise KandevError("invalid_config", f"[clients.{client}] name_prefix "
+                                      f"{mine['name_prefix']!r}: {client} still has "
+                                      f"{', '.join(stranded[:5])}{', …' if len(stranded) > 5 else ''} "
+                                      "under its old prefix, which its verbs would no longer "
+                                      "find; purge them first (`msbctl purge NAME`)")
+        if changed:
+            os.replace(tmp, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+    def shown(settings):
+        out = {k: v for k, v in settings.items() if k not in ("allow_extra_entries", "table", "host_tables")}
+        for key in ("port_pool", "proxy_port_pool"):
+            if key in out:
+                out[key] = "%d-%d" % out[key]
+        return out
+
+    doc = {"changed": changed, "host": shown(host),
+           "warnings": kandev_pool_warnings(host),
+           "problems": {n: e.message for n, e in clients.items() if isinstance(e, KandevError)}}
+    if client:
+        doc["client"] = client
+        doc["settings"] = shown(mine)
+    return doc
+
+
 def kandev_pool_warnings(settings):
     """A line per Kandev pool that ports the operator's own sandboxes publish
     fall in, naming them (configure runs on the host, never under the plugin's
@@ -14728,6 +14912,26 @@ def kandev_pool_warnings(settings):
                        f"own sandboxes publish ({shown}: {', '.join(names)}). Kandev skips them; "
                        f"move them, or the pool, to keep the two apart")
     return out
+
+
+def host_managed(args, config):
+    """`host managed configure [--client NAME]`: the [managed] and
+    [clients.NAME] keys, as `host kandev configure` sets [kandev]'s."""
+    if args.arg != "configure":
+        die("host managed: configure")
+    if args.json:
+        json_document(lambda: managed_configure(args))
+    try:
+        done = managed_configure(args)
+    except KandevError as exc:
+        die(f"{exc.message}; {tilde(CONFIG_FILE)} is unchanged")
+    where = f"client {args.client}" if args.client else "the host"
+    note(f"{where} in {tilde(CONFIG_FILE)}: " +
+         (f"set {', '.join(done['changed'])}" if done["changed"] else "nothing to change"))
+    for line in done["warnings"]:
+        warn(line)
+    for name, problem in done["problems"].items():
+        warn(f"client {name}: {problem}")
 
 
 def host_kandev(args, config):
@@ -14750,6 +14954,10 @@ def host_kandev(args, config):
         kandev_rotate_lease_key()
         return
     if args.arg == "configure":
+        extra = sorted(a for a in MANAGED_CONFIGURE_FLAGS if getattr(args, a, None) is not None
+                       and a not in dict(KANDEV_CONFIGURE_KEYS))
+        if extra:
+            die(f"--{extra[0].replace('_', '-')} goes with host managed configure")
         if args.json:
             json_document(lambda: kandev_configure(args))
         try:
@@ -16588,13 +16796,15 @@ def build_parser():
                    help="remove the restriction: every host key")
     p.set_defaults(func=cmd_keys)
 
-    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
-    p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
+    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, "
+                       "kandev, managed")
+    p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev", "managed"])
     p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy|rotate-lease-key|configure",
                    help="authorize: one public key line, quoted; autostart: install; "
                    "kandev: install, reap (one pass), proxy (the TLS proxy, long-running), "
                    "rotate-lease-key (the old key is still accepted for 15 minutes) "
-                   "or configure (set [kandev] keys in config.toml)")
+                   "or configure (set [kandev] keys in config.toml); managed: configure (set "
+                   "[managed] keys, or with --client NAME [clients.NAME]'s)")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
     p.add_argument("--kandev", action="store_true",
@@ -16604,7 +16814,8 @@ def build_parser():
                    "verbs for that client only; `--client kandev` is --kandev")
     p.add_argument("--replace", action="store_true",
                    help="authorize: rewrite the key's existing line instead of refusing")
-    p.add_argument("--json", action="store_true", help="check, kandev configure: one JSON document")
+    p.add_argument("--json", action="store_true",
+                   help="check, kandev configure, managed configure: one JSON document")
     p.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
                    help="kandev configure: [kandev] enabled")
     p.add_argument("--serve", metavar="MODE", help="kandev configure: proxy, tailscale or none")
@@ -16616,6 +16827,21 @@ def build_parser():
     p.add_argument("--private-name", dest="private_names", action="append", metavar="HOST",
                    help="kandev configure: the whole private_names list, one host per flag; "
                    "'' alone empties it")
+    p.add_argument("--max-sandboxes", type=int, metavar="N",
+                   help="managed configure: the client's cap, or without --client the host's total")
+    p.add_argument("--max-cpus", type=int, metavar="N",
+                   help="managed configure: the client's cap, or without --client the host's total")
+    p.add_argument("--max-memory", metavar="SIZE",
+                   help="managed configure: like 96G; the client's cap, or the host's total")
+    p.add_argument("--name-prefix", metavar="PREFIX", help="managed configure --client: like c-")
+    p.add_argument("--env-prefix", metavar="PREFIX", help="managed configure --client: like CI_")
+    p.add_argument("--guest-port", dest="guest_ports", type=int, action="append", metavar="PORT",
+                   help="managed configure --client: the default guest ports, one per flag (1 to 4)")
+    p.add_argument("--require-callback", action=argparse.BooleanOptionalAction, default=None,
+                   help="managed configure --client: refuse a provision with no callback")
+    p.add_argument("--body-secret-host", dest="body_secret_hosts", action="append", metavar="HOST",
+                   help="managed configure --client: the whole body_secret_hosts list, one host per "
+                   "flag; '' alone empties it")
     p.set_defaults(func=cmd_host)
 
     p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",

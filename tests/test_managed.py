@@ -1479,5 +1479,203 @@ class ConfigProblemsUnderAKey(ManagedTest):
                                     caught.exception.message)
 
 
+class Configure(ManagedTest):
+    """`host managed configure`: the operator's way to set [managed] and
+    [clients.NAME], checked whole before the file changes."""
+
+    ci_table = ""
+
+    def configure_json(self, *flags):
+        return self.msbctl_json("host", "managed", "configure", *flags, "--json", plugin=False)
+
+    def text(self):
+        with open(self.m.CONFIG_FILE, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_a_client_table(self):
+        code, doc = self.configure_json("--client", "ci", "--enabled", "--env-prefix", "CI_",
+                                        "--guest-port", "8765", "--allow-extra", "*.example.org",
+                                        "--body-secret-host", "llm.example.org", "--max-sandboxes", "2")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["changed"], ["enabled", "max_sandboxes", "allow_extra", "env_prefix",
+                                          "guest_ports", "body_secret_hosts"])
+        self.assertEqual((doc["client"], doc["settings"]["name_prefix"], doc["settings"]["guest_ports"]),
+                         ("ci", "c-", [8765]))
+        self.assertIn("[clients.ci]", self.text())
+        self.assertTrue(self.ci_ok("managed", "health")["enabled"])
+        code, doc = self.configure_json("--client", "ci", "--enabled")
+        self.assertEqual((code, doc["changed"]), (0, []))
+
+    def test_host_keys_go_where_they_are(self):
+        # [kandev] holds base_url (KandevTest.configure): it stays the one copy.
+        code, doc = self.configure_json("--base-url", "https://sbx.example.org", "--max-cpus", "8")
+        self.assertEqual(code, 0, doc)
+        config = self.m.read_toml(self.m.CONFIG_FILE)
+        self.assertEqual(config["kandev"]["base_url"], "https://sbx.example.org")
+        self.assertEqual(config["managed"], {"max_cpus": 8})
+        self.assertEqual(doc["host"]["host_max_cpus"], 8)
+
+    def test_refusals_leave_the_file(self):
+        before = self.text()
+        for flags, word in ((["--client", "ci", "--env-prefix", "ci_"], "env_prefix"),
+                            (["--client", "ci", "--name-prefix", "k-"], "name_prefix"),
+                            (["--client", "kandev", "--env-prefix", "X_"], "fixed for Kandev"),
+                            (["--client", "ci", "--serve", "none"], "--serve"),
+                            (["--enabled"], "--client"),
+                            (["--client", "Bad", "--enabled"], "client name"),
+                            (["--client", "ci", "--body-secret-host", "llm.example.org"], "body_secret_hosts")):
+            with self.subTest(flags=flags):
+                code, doc = self.configure_json(*flags)
+                self.assertEqual(code, 3, doc)
+                self.assertIn(word, doc["error"]["message"])
+                self.assertEqual(self.text(), before)
+
+    def test_a_prefix_an_operator_sandbox_already_has(self):
+        self.make_folder_sandbox("c-web")
+        code, doc = self.configure_json("--client", "ci", "--enabled")
+        self.assertEqual(code, 3, doc)
+        self.assertIn("c-web", doc["error"]["message"])
+        code, doc = self.configure_json("--client", "ci", "--enabled", "--name-prefix", "ci-")
+        self.assertEqual(code, 0, doc)
+        self.assertIn("ci", self.m.name_problem("ci-mine"))
+
+    def test_a_new_prefix_while_the_old_one_has_sandboxes(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(CI)
+        self.ci_provision("e1")
+        before = self.text()
+        code, doc = self.configure_json("--client", "ci", "--name-prefix", "ci-")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+        self.assertIn("ci still has c-e1 under its old prefix", doc["error"]["message"])
+        self.assertIn("purge", doc["error"]["message"])
+        self.assertEqual(self.text(), before)
+        # Its other keys are still set; once purged, the prefix moves.
+        code, doc = self.configure_json("--client", "ci", "--max-sandboxes", "2")
+        self.assertEqual((code, doc["changed"]), (0, ["max_sandboxes"]), doc)
+        code, _, err = self.run_main("purge", "c-e1", "-y")
+        self.assertEqual(code, 0, err)
+        code, doc = self.configure_json("--client", "ci", "--name-prefix", "ci-")
+        self.assertEqual((code, doc["settings"]["name_prefix"]), (0, "ci-"), doc)
+        self.assertEqual(self.ci_provision("e1")["name"], "ci-e1")
+
+    def test_only_at_the_host(self):
+        for key in ("kandev", "client:ci", "1"):
+            with self.subTest(key=key):
+                os.environ["MSB_RESTRICTED"] = key
+                code, _, err = self.run_main("host", "managed", "configure", "--client", "ci", "--enabled")
+                os.environ.pop("MSB_RESTRICTED")
+                self.assertNotEqual(code, 0)
+                self.assertIn("for the host itself", err)
+        self.assertNotIn("[clients.ci]", self.text())
+        code, _, err = self.run_main("host", "kandev", "configure", "--env-prefix", "X_")
+        self.assertNotEqual(code, 0)
+        self.assertIn("host managed configure", err)
+
+    def test_without_json(self):
+        code, out, err = self.run_main("host", "managed", "configure", "--client", "ci", "--enabled")
+        self.assertEqual(code, 0, err)
+        self.assertIn("client ci", out + err)
+
+    def test_doctor_names_a_broken_table(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[clients.ci]\nmax_cpus = -1\n[clients.lab]\nenabled = true\n")
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertEqual(checks["clients"]["status"], "warn")
+        self.assertIn("ci: [clients.ci] max_cpus", checks["clients"]["message"])
+        os.environ["MSB_RESTRICTED"] = "client:lab"
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertEqual((checks["clients"]["status"], checks["clients"]["message"]), ("ok", "enabled: lab"))
+
+    def test_doctor_says_a_broken_table_keeps_its_open_ports(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write('[clients.lab]\nenabled = "false"\n')
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertIn("the proxy keeps the ports its sandboxes have open and opens no new ones",
+                      checks["clients"]["message"])
+        self.assertNotIn("enabled = false", checks["clients"]["message"])
+
+    def test_doctor_under_a_key_names_no_other_client(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write('[clients.ci]\nenabled = true\n[clients.secretco]\nname_prefix = "c-"\n')
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertIn("secretco", checks["clients"]["message"])           # the operator's
+        os.environ["MSB_RESTRICTED"] = "client:ci"
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertEqual(checks["clients"]["status"], "warn")
+        self.assertNotIn("secretco", checks["clients"]["message"])
+        self.assertNotIn("'c-'", checks["clients"]["message"])
+
+    def test_kandevs_prefix_and_host_keys_are_refused(self):
+        before = self.text()
+        code, doc = self.configure_json("--client", "ci", "--name-prefix", "k-")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+        self.assertIn("k- is always Kandev's", doc["error"]["message"])
+        self.assertEqual(self.text(), before)
+        code, doc = self.configure_json("--client", "kube", "--enabled")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["settings"]["name_prefix"], "ku-")
+        self.assertNotIn("host_tables", doc["host"])
+
+
+    def test_a_clash_refuses_only_the_clients_in_it(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[clients.ci]\nenabled = true\n[clients.cd]\nenabled = true\n")
+        before = self.text()
+        code, doc = self.configure_json("--client", "ci", "--max-cpus", "4")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+        self.assertIn("is also [clients.cd]'s", doc["error"]["message"])
+        self.assertEqual(self.text(), before)
+        # A client outside it, and the host's keys, are set; the clash is listed.
+        code, doc = self.configure_json("--client", "lab", "--enabled")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(sorted(doc["problems"]), ["cd", "ci"])
+        code, doc = self.configure_json("--max-sandboxes", "20")
+        self.assertEqual(code, 0, doc)
+        # Giving one of them its own prefix ends it.
+        code, doc = self.configure_json("--client", "cd", "--name-prefix", "cd-")
+        self.assertEqual((code, doc["problems"]), (0, {}), doc)
+
+    def test_doctor_on_a_clash(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[clients.ci]\nenabled = true\n[clients.cd]\nenabled = true\n")
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertEqual(checks["clients"]["status"], "warn")
+        message = checks["clients"]["message"]
+        self.assertIn("cd: [clients.cd] name_prefix 'c-' is also [clients.ci]'s", message)
+        self.assertIn("ci: [clients.ci] name_prefix 'c-' is also [clients.cd]'s", message)
+        self.assertIn("the others go on", message)
+        self.assertNotIn("no client's verbs work", message)
+
+    def test_doctor_on_clients_that_is_not_a_table(self):
+        text = self.text()
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write("clients = 1\n" + text)       # before any table, so a top-level key
+        config = self.m.load_config()
+        self.assertEqual(config["clients"], 1)
+        checks = {c["id"]: c for c in self.m.doctor_checks(config)}
+        self.assertEqual(checks["clients"]["status"], "warn")
+        self.assertIn("[clients] is not a table", checks["clients"]["message"])
+        self.assertEqual(self.kandev("health")[0], 0)
+        self.assertEqual(self.provision("k1")["name"], "k-k1")
+
+    def test_doctor_names_a_prefix_an_operator_sandbox_has(self):
+        self.make_folder_sandbox("c-web")
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[clients.ci]\nenabled = true\n")      # by hand: configure would refuse it
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertEqual(checks["client-prefixes"]["status"], "warn")
+        self.assertIn("ci's name_prefix 'c-' is the start of c-web, which ci does not own",
+                      checks["client-prefixes"]["message"])
+        # Not under the client's key: the operator's to act on.
+        os.environ["MSB_RESTRICTED"] = "client:ci"
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertNotIn("client-prefixes", checks)
+        os.environ.pop("MSB_RESTRICTED")
+        # The client's own sandboxes are no finding.
+        os.remove(self.m.registry_path_for("c-web"))
+        checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
+        self.assertNotIn("client-prefixes", checks)
+
+
 if __name__ == "__main__":
     main()

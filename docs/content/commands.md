@@ -580,6 +580,13 @@ msbctl host kandev install | reap | proxy | rotate-lease-key
 msbctl host kandev configure [--[no-]enabled] [--serve MODE] [--proxy-listen IP]
                              [--base-url URL] [--allow-extra ENTRY …]
                              [--private-name HOST …] [--json]
+msbctl host managed configure [--client NAME] [--[no-]enabled] [--serve MODE]
+                              [--proxy-listen IP] [--base-url URL]
+                              [--max-sandboxes N] [--max-cpus N] [--max-memory SIZE]
+                              [--allow-extra ENTRY …] [--private-name HOST …]
+                              [--name-prefix PREFIX] [--env-prefix PREFIX]
+                              [--guest-port PORT …] [--[no-]require-callback]
+                              [--body-secret-host HOST …] [--json]
 ```
 
 For running this machine as a [remote host](remote-hosts.md). Under
@@ -596,6 +603,7 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `kandev rotate-lease-key` | replace the key its tokens are signed with, honouring the old one for 15 minutes |
 | `kandev install` | write and enable a systemd user timer for the reaper and a service for the proxy, and restart the proxy |
 | `kandev configure` | set the [`[kandev]` keys](kandev.md#setting-a-host-up) it is given in `config.toml`, keeping everything else, and only if the result is valid |
+| `managed configure` | the same for the host-wide `[managed]` keys, or with `--client NAME` for that client's `[clients.NAME]`. A key the host keeps in `[kandev]` is set there. Refused, with the file unchanged, when the host's keys would no longer check out, or with `--client` when that client's own table would not (its `name_prefix` shared with another client's included), or its `name_prefix` is already the start of a sandbox it does not own, or a new `name_prefix` would leave the client's own sandboxes under the old one (purge them first). Another client's table that does not check out refuses nothing: it is listed as a problem |
 
 | Option | Meaning |
 | --- | --- |
@@ -603,7 +611,12 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `--kandev` | `authorize`, `serve`: the [Kandev plugin's key](kandev.md#the-plugin-key). Its line runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`, `show`, `stop`, `purge` and `self-update` with `--json`, seeing only Kandev's sandboxes. The everyday key runs no `kandev` verb |
 | `--client NAME` | `authorize`, `serve`: a client's key, for the client `[clients.NAME]` configures. Its line runs `host serve --client NAME`, which admits `msbctl managed` verbs for that client and `ls`, `show`, `stop`, `purge` and `doctor` with `--json`, seeing only its sandboxes; never `self-update`, `kandev tls` or `kandev restart-proxy`, which are the host's. The client is the forced command's: a `--client` naming another in the command is refused. `--client kandev` is `--kandev`, and writes the same line. `authorize` warns when `[clients.NAME]` is missing, does not check out or is not enabled (the key would answer `denied` or `invalid_config`), and writes the line all the same |
 | `--replace` | `authorize`: rewrite the key's existing line instead of refusing |
-| `--json` | `check`, `kandev configure`: one JSON document |
+| `--json` | `check`, `kandev configure`, `managed configure`: one JSON document |
+| `--max-sandboxes N`, `--max-cpus N`, `--max-memory SIZE` | `managed configure`: the client's caps, or without `--client` the host's totals over every client |
+| `--name-prefix PREFIX`, `--env-prefix PREFIX` | `managed configure --client`: the client's sandbox-name prefix (like `c-`) and agentctl's variable prefix (like `CI_`) |
+| `--guest-port PORT` | `managed configure --client`: the guest ports a provision publishes when it names none, one per flag (1 to 4) |
+| `--require-callback`, `--no-require-callback` | `managed configure --client`: whether a provision must name a callback |
+| `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |
 | `--proxy-listen IP` | `kandev configure`: the address the proxy binds |
