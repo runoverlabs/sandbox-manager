@@ -8747,17 +8747,17 @@ def cmd_ls(args, config):
     remotes = configured_remotes(config)
     if remotes:
         ls_with_remotes(args, config, names)
-        return
+        return None
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
-        return
+        return None
     rows = [(r["name"], r["state"], r["location"], ",".join(r["updates"]) or "-",
              "yes" if r["autostart"] else "no") for r in ls_rows(args, config, names)]
 
     if args.porcelain:
         for row in rows:
             print("\t".join(row))
-        return
+        return None
 
     if args.picker:
         # `name<TAB>pre-padded display text`.
@@ -8773,7 +8773,7 @@ def cmd_ls(args, config):
         for row in rows:
             shown = "  ".join(str(row[i]).ljust(widths[i]) for i in order)
             print(f"{row[0]}\t{shown.rstrip()}")
-        return
+        return None
 
     widths = [max(len(str(r[i])) for r in [("NAME", "STATE", "PROJECT",
                                             "UPDATES", "AUTOSTART")] + rows)
@@ -9009,7 +9009,7 @@ def cmd_show(args, config):
         say("Egress")
         for rule in box.net_rules():
             note(f"  {rule}")
-        return
+        return None
     if box.is_repo:
         meta = box.repo_meta
         note(f"source     {box.location}, cloned inside the sandbox ({box.workspace_volume})")
@@ -12220,11 +12220,11 @@ def managed_host_settings(config, operator=None):
     if base:
         try:
             parts = urllib.parse.urlsplit(base)
-            hostname = parts.hostname
+            usable = (parts.scheme == "https" and parts.hostname and not (
+                parts.username or parts.password or parts.path or parts.query or parts.fragment))
         except ValueError:              # "https://[x": not a URL at all
-            parts = hostname = None
-        if (parts is None or parts.scheme != "https" or not hostname or parts.username or parts.password
-                or parts.path or parts.query or parts.fragment):
+            usable = False
+        if not usable:
             _settings_bad(table, "base_url", "https://host[:port] with no path, query or credentials — Kandev "
                           "refuses any other lease URL")
     out["base_url"] = base

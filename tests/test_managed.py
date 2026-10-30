@@ -10,7 +10,6 @@ import tomllib
 from unittest import main, mock
 
 from tests.harness import MsbctlTest
-import tests.test_kandev as tk
 from tests.test_kandev import IMAGE, KandevTest, request
 
 PLANTED_CI = "planted-ci-secret"
@@ -275,7 +274,7 @@ class Settings(MsbctlTest):
         self.assertEqual(found["lab"]["name_prefix"], "l-")
         self.invalid('[clients]\nBad = "x"\n', "Bad", "not a client name")
         # It still holds its prefix: no other client takes f- meanwhile.
-        found = self.invalid("[clients]\nfoo = 1\n[clients.fx]\nname_prefix = \"f-\"\n", "fx", "'f-'")
+        self.invalid("[clients]\nfoo = 1\n[clients.fx]\nname_prefix = \"f-\"\n", "fx", "'f-'")
         # Kandev's own entry is Kandev's own problem, as a bad key in [kandev] is.
         self.write("[clients]\nkandev = 1\n[clients.lab]\n")
         found = self.m.clients_settings(self.m.load_config())
@@ -707,7 +706,7 @@ class Provisioning(ManagedTest):
         msb's DNS rebind protection never sees it, and the same name in
         egress_allow would get no private answer without private_names."""
         for addr in ("10.0.0.5", "127.0.0.1", "169.254.169.254", "100.64.0.5", "192.88.99.1"):
-            with self.subTest(addr=addr), mock.patch.object(tk, "API_ADDR", addr):
+            with self.subTest(addr=addr), mock.patch("tests.test_kandev.API_ADDR", addr):
                 err = self.ci_error("invalid_config", "managed", "provision", "e1",
                                     stdin=ci_request(callback={"host": "lan.example.org", "port": 22}))
                 self.assertEqual(err["message"], "callback lan.example.org resolves to a private or reserved "
@@ -721,7 +720,7 @@ class Provisioning(ManagedTest):
         self.assertFalse(os.path.exists(self.entry_path("c-e1")))
         # A public answer is what the pattern was written for (93.184.216.34
         # is IANA's, example.com's historical address: any public one is real).
-        with mock.patch.object(tk, "API_ADDR", "93.184.216.34"):
+        with mock.patch("tests.test_kandev.API_ADDR", "93.184.216.34"):
             rec = self.ci_provision(callback={"host": "lan.example.org", "port": 22})
         self.assertIn("allow@93.184.216.34:tcp:22", self.m.read_toml(self.entry_path(rec["name"]))["extra_rules"])
 
@@ -736,7 +735,7 @@ class Provisioning(ManagedTest):
                 ("10.0.0.5", None),
                 ("127.0.0.1", None),
                 ("169.254.169.254", None))):
-            with self.subTest(addr=addr, table=table), mock.patch.object(tk, "API_ADDR", addr):
+            with self.subTest(addr=addr, table=table), mock.patch("tests.test_kandev.API_ADDR", addr):
                 base = CI.replace("max_sandboxes = 3", "max_sandboxes = 8")
                 self.ci_table = base + table if table else base.replace(
                     'allow_extra = ["pypi.org", "*.example.org"]',
@@ -753,7 +752,7 @@ class Provisioning(ManagedTest):
                 self.assertTrue(any(f"allow@{addr}:tcp:22" in a for a in argv), argv)
         # An address:port entry covers that port only; the pattern alone then
         # needs the address public.
-        with mock.patch.object(tk, "API_ADDR", "127.0.0.1"):
+        with mock.patch("tests.test_kandev.API_ADDR", "127.0.0.1"):
             self.assertIn("private_names", self.ci_error("invalid_config", "managed", "provision", "e9", stdin=ci_request(
                 operation_id="op-e9", callback={"host": "lan.example.org", "port": 23}))["message"])
 
@@ -766,7 +765,7 @@ class Provisioning(ManagedTest):
             "max_sandboxes = 3", "max_sandboxes = 8")
         self.ci_table = star
         self.configure()
-        with mock.patch.object(tk, "API_ADDR", "10.0.0.5"):
+        with mock.patch("tests.test_kandev.API_ADDR", "10.0.0.5"):
             err = self.ci_error("invalid_config", "managed", "provision", "e1",
                                 stdin=ci_request(callback={"host": "lan.example.org", "port": 22}))
             self.assertEqual(err["message"], "callback lan.example.org resolves to a private or reserved "
@@ -817,10 +816,9 @@ class Provisioning(ManagedTest):
                 wider = dict(settings, allow_extra_entries=settings["allow_extra_entries"]
                              + [self.m.kandev_allow_entry(extra)])
                 with mock.patch.object(self.m.socket, "getaddrinfo", return_value=fake) as lookup:
-                    try:
+                    # Refused or not, what counts here is that the name was looked up.
+                    with contextlib.suppress(self.m.KandevError):
                         self.m.request_callback(req, dialect, wider)
-                    except self.m.KandevError:
-                        pass
                 lookup.assert_called_once()
 
     def test_guest_ports(self):
