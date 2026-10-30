@@ -13,5 +13,5 @@ msb 0.7.6 and re-checked on 0.7.7.
 - `msb-picker` — fzf picker used by the desktop entry (`msb-manager.desktop`).
 - `bootstrap.sh` — runs once **inside the guest** at create time. `msbctl` pipes it in over stdin (not mounted, so manager code stays out of the VM). Intentionally not `set -e`: every step records its outcome and failures are summarized together so an allowlist can be built in one pass. Parameterized by `MSB_*` env vars.
 - `defaults.toml` — what msb-manager ships: egress rule groups, version pins, baseline defaults. Read from the checkout, never copied.
-- `templates/` — `config.toml.in` (the short skeleton of *local* overrides install.sh writes once), `sandbox.toml.in`, `dev.yaml.in`, `registry.toml.in`, `registry-repo.toml.in` (a sandbox with no folder), `registry-kandev.toml.in` (one Kandev owns).
+- `templates/` — `config.toml.in` (the short skeleton of *local* overrides install.sh writes once), `sandbox.toml.in`, `dev.yaml.in`, `registry.toml.in`, `registry-repo.toml.in` (a sandbox with no folder), `registry-kandev.toml.in` (one Kandev owns), `registry-managed.toml.in` (one another managed client owns).
 - `.msb/` — this repo's own sandbox policy (`sandbox.toml`, `dev.yaml`).

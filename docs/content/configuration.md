@@ -146,6 +146,15 @@ node's major line ships (node 24 comes with npm 11); `""` keeps that one. npm
 | --- | --- | --- | --- |
 | `store` | `"file"`, `"keyring"` or `"auto"` | `"file"` | where new secret values go. See [the keyring](credentials.md#keeping-the-values-in-the-keyring); `msbctl secret migrate` moves the existing ones and sets this |
 
+### `[managed]` and `[clients.<name>]`
+
+The host-wide keys every [managed client](managed.md) shares (the proxy, its
+address and `base_url`, the port pools, and optional totals over every
+client's sandboxes), and one table per client other than Kandev, whose own
+table is `[kandev]`. Both are described on the
+[Managed clients](managed.md#the-clientsname-table) page, and `msbctl host
+managed configure` sets them.
+
 ### `[secret_presets.<name>]`
 
 What `msbctl secret add` offers. Shipped: `npm`, `dockerhub`, `ghcr`, `pypi`,

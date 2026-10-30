@@ -659,8 +659,8 @@ msbctl managed lease ENV PORT
 msbctl managed … --client NAME
 ```
 
-Protocol 2: the [`kandev` verbs](#msbctl-kandev), for any client a
-`[clients.NAME]` table in `config.toml` configures, run over ssh through
+Protocol 2: the [`kandev` verbs](#msbctl-kandev), for any
+[client](managed.md) a `[clients.NAME]` table in `config.toml` configures, run over ssh through
 `host serve --client NAME`. The client is the key's; `--client` is needed only
 by the operator trying a client's verbs at the host, and under a key it may
 only repeat the key's own. The Kandev key may run these too, as Kandev.

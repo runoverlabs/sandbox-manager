@@ -364,6 +364,14 @@ store = "file"
 # yours are outside the budget, and no kandev verb can see or touch them.
 # Nothing in a Kandev request can raise these limits or remove a base rule.
 # See the "Kandev hosts" page of the docs.
+#
+# Kandev is one client of this host: this is the kandev client's table. Its
+# client keys (enabled, the limits, rule_groups, allow_extra, private_names)
+# may live in [clients.kandev] instead (one of the two, never both), and are
+# where every other client's start (see [clients.<name>] below). serve,
+# proxy_listen, base_url, port_pool and proxy_port_pool are the HOST's, shared
+# by every client: they stay here or move to [managed], never into a
+# [clients.*] table, and one key in both [managed] and [kandev] is refused.
 # ---------------------------------------------------------------------------
 [kandev]
 enabled       = false
@@ -431,6 +439,64 @@ allow_extra   = []
 # connect. Such a name must also be reachable through the request's
 # egress_allow, which allow_extra governs as always. Empty allows none.
 private_names = []
+
+# ---------------------------------------------------------------------------
+# Managed clients
+#
+# Another orchestrator owning sandboxes beside Kandev's (`msbctl managed …`,
+# protocol 2, over ssh through `msbctl host serve --client NAME`). Nothing to
+# do on a host that runs Kandev alone. See the "Managed clients" page of the
+# docs; `msbctl host managed configure` sets these keys from a script.
+#
+# [managed] is what exists once per host, whichever clients use it: serve,
+# proxy_listen, base_url, port_pool, proxy_port_pool (as in [kandev] above,
+# which still works for them), and optional totals over EVERY client's
+# sandboxes, Kandev's included. Unset, there is no host-wide total; a
+# provision must fit its own client's limits and these.
+#
+#   [managed]
+#   max_sandboxes = 16
+#   max_cpus      = 48
+#   max_memory    = "128G"
+#
+# [clients.<name>] is one client's table, a-z first, at most 16 characters
+# (folder, repo and managed are taken). Every key starts from the [kandev]
+# value above, so a new client is off until enabled, with Kandev's limits and
+# groups. Its limits count its own sandboxes only.
+#
+#   [clients.ci]
+#   enabled       = true
+#   max_sandboxes = 4
+#   allow_extra   = ["pypi.org", "llm.example.org"]
+#   # Its sandboxes' names: a-z, up to 6 of a-z 0-9, then "-". Default: its
+#   # first letter and "-" (kube: ku-, since k- is always Kandev's). No two
+#   # clients may share one, and new sandboxes of yours may not start with it.
+#   name_prefix   = "c-"
+#   # agentctl's variables and its nonce (<prefix>BOOTSTRAP_NONCE); a
+#   # request's own env and secrets may not use it. Never MSB_, MSBCTL_, LD_,
+#   # SSH_, XDG_ or LC_. Default "AGENTCTL_".
+#   env_prefix    = "CI_"
+#   # The guest ports a provision publishes when it names none (1 to 4).
+#   # Default Kandev's four.
+#   guest_ports   = [8765]
+#   # Refuse a provision that names no callback (its own API, pinned by
+#   # address as Kandev's is). Default false. A callback, required or not,
+#   # is egress to that one address and port: allow_extra must admit the
+#   # address (for a name, the one it resolves to here) with an address or
+#   # CIDR entry, or an address:port entry at that port; or else match the
+#   # name with a pattern, and then the address must be public unless the
+#   # name is in private_names. "*" admits any address given as one, private
+#   # included; for a name it counts as a pattern. Otherwise the provision
+#   # is refused.
+#   require_callback = false
+#   # Hosts a secret's PLACEHOLDER may travel to in a request BODY: msb blocks
+#   # any other request carrying one, and an LLM client sends the whole
+#   # conversation, so once an agent prints its environment every later model
+#   # request is blocked. Its model endpoints, say. Each must be reachable
+#   # through allow_extra, rule_groups or private_names. Those hosts see the
+#   # placeholder's text, never the value, which only ever goes into headers
+#   # for the secret's own hosts. Default none. (Kandev's: Anthropic's hosts.)
+#   body_secret_hosts = ["llm.example.org"]
 
 # ---------------------------------------------------------------------------
 # Egress rule groups

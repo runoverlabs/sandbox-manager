@@ -41,7 +41,7 @@ every session — if a symptom below rings a bell, the fix is one file away.
 | `msb-wizard` | features, coding agents, `FEATURES`, `detect_features()`, a prompt or picker |
 | `msb-edit` | `msbctl edit` sections, `rename` / `move`, secret storage, the `--json` interfaces |
 | `msb-remotes` | remote hosts: `host serve` refusals, `host:name`, `ls` fan-out, `remote setup` |
-| `msb-kandev` | any Kandev verb, its provisioning, its API pinning, `kandev reap` |
+| `msb-kandev` | any Kandev verb, its provisioning, its API pinning, `kandev reap`, or a managed client (`msbctl managed`, `[clients.NAME]`, `host serve --client`) |
 | `msb-setup` | machine-level settings, first run, named Claude tokens |
 | `msb-pi-llm` | pi install or config, `[llm.<name>]`, how an endpoint's key reaches it |
 | `msb-git-agent` | how a sandbox pushes, which key, what the SSH agent filter forwards |
@@ -61,7 +61,7 @@ Its rules already apply to new code in the single file. The most important is
 | `msb-picker` | fzf picker used by the desktop entry (`msb-manager.desktop`) |
 | `bootstrap.sh` | runs once **inside the guest** at create, piped over stdin so manager code stays out of the VM; deliberately not `set -e`; parameterized by `MSB_*` env vars |
 | `defaults.toml` | what msb-manager ships: egress rule groups, version pins, baseline defaults. Read from the checkout, never copied |
-| `templates/` | the `.in` skeletons install.sh seeds once: `config`, `sandbox`, `dev.yaml`, `registry`, `registry-repo` (no folder), `registry-kandev` |
+| `templates/` | the `.in` skeletons install.sh seeds once: `config`, `sandbox`, `dev.yaml`, `registry`, `registry-repo` (no folder), `registry-kandev`, `registry-managed` |
 | `.msb/` | this repo's own sandbox policy (`sandbox.toml`, `dev.yaml`) |
 | `profile/` | the SHIPPED central CLAUDE.md → `msb-profile` |
 | `install.sh`, `get.sh`, `scripts/package.sh`, `VERSION` | install, the curl-piped entry point, `dist/` build, release version → `msb-packaging` |
