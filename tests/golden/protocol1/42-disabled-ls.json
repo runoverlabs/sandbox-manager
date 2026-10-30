@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "ls",
+  "--json"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"denied\",\n    \"message\": \"Kandev is not enabled on this host ([kandev] enabled)\"\n  }\n}\n"
+}

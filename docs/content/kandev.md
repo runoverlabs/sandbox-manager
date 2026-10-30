@@ -136,6 +136,17 @@ pool, and `health` counts the ones in `proxy_port_pool` as
 Nothing in a request can raise these limits or remove a base rule. Profiles add
 egress only within `allow_extra`.
 
+Kandev is one client of this host. [Another orchestrator](managed.md) can own
+sandboxes beside Kandev's, with a table of its own, `[clients.NAME]`, and its
+own key. Kandev's own keys, `enabled`, `max_sandboxes`, `max_cpus`,
+`max_memory`, `rule_groups`, `allow_extra` and `private_names`, may live in
+`[clients.kandev]` instead of `[kandev]` (one or the other, not both). The
+host-wide keys, `serve`, `proxy_listen`, `base_url`, `port_pool` and
+`proxy_port_pool`, never go in `[clients.kandev]` (it refuses them): they stay
+in `[kandev]` or move to `[managed]`, where the optional totals over every
+client go too; a key in both `[managed]` and `[kandev]` is refused. A host
+that runs Kandev alone needs none of this.
+
 ## How Kandev reaches a sandbox
 
 Each sandbox publishes four guest ports on 127.0.0.1: agentctl's control port
@@ -297,7 +308,8 @@ one port per lease means a connection can only ever reach one VM port.
 - **Rotating the key:** `msbctl host kandev rotate-lease-key` makes a new one
   and keeps the old one as `lease.key.prev`, still accepted for 15 minutes,
   so no lease already handed out breaks. Rotate at most every 15 minutes.
-- **What it follows:** the Kandev entries. It looks every 2 seconds, so a new
+- **What it follows:** the Kandev entries, and those of every other enabled
+  [client](managed.md). It looks every 2 seconds, so a new
   sandbox's ports open within that. A destroyed sandbox's ports close, and
   their open connections are cut. It also re-reads the entry on every
   connection, so a destroyed sandbox refuses at once.
@@ -319,6 +331,11 @@ writes. It isn't a daemon: each run makes one pass and exits.
 - A VM carrying the Kandev label with no entry, older than an hour, is removed.
 
 It never touches a sandbox that lacks either the `kandev` source or the label.
+It makes the same pass over every other [client](managed.md)'s sandboxes,
+each by that client's own label: a VM labelled for one client is never
+removed as another's. Only a problem in the host's keys stops it: while a
+client's table (`[kandev]`'s own keys included) does not check out, its
+sandboxes and everyone else's still expire, and only its orphans wait.
 
 ## The plugin key
 

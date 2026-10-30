@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "kandev",
+  "health"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"[kandev] serve: \\\"proxy\\\", \\\"tailscale\\\" or \\\"none\\\" (`msbctl config` shows where it is set)\"\n  }\n}\n"
+}

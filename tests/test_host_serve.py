@@ -300,5 +300,142 @@ class AutostartTest(MsbctlTest):
         self.assertIn("swap", {c["check"] for c in data["checks"]})
 
 
+# A client's key: `host serve --client ci`. Its own `managed` verbs, the
+# generic verbs in their JSON shape, and nothing else; the client is the
+# forced command's, whatever argv says.
+CLIENT_ALLOWED = [
+    "msbctl --version", "msbctl managed health", "msbctl managed provision e1",
+    "msbctl managed agentctl e1", "msbctl managed start e1", "msbctl managed lease e1 8765",
+    "msbctl managed expiry e1 --at 2026-10-17T15:00:00Z", "msbctl managed health --client ci",
+    "msbctl ls --json", "msbctl show c-e1 --json", "msbctl stop c-e1 --json",
+    "msbctl purge c-e1 -y --json", "msbctl doctor --json",
+]
+CLIENT_REFUSED = [
+    "msbctl kandev health", "msbctl kandev provision e1", "msbctl managed health --client kandev",
+    "msbctl managed provision e1 --client other", "msbctl self-update --json",
+    "msbctl kandev restart-proxy", "msbctl kandev tls install", "msbctl managed tls install",
+    "msbctl managed restart-proxy", "msbctl ls", "msbctl show web", "msbctl purge web --json",
+    "msbctl host kandev configure --json", "msbctl host managed configure --json", "msbctl setup", "",
+]
+
+
+class ClientKeyTest(MsbctlTest):
+
+    def serve(self, command, *flags):
+        os.environ["SSH_ORIGINAL_COMMAND"] = command
+        seen = {}
+
+        def fake_execv(path, argv):
+            seen["argv"] = argv
+            seen["restricted"] = os.environ.get("MSB_RESTRICTED")
+            raise Exec
+
+        with mock.patch.object(self.m.os, "execv", fake_execv):
+            try:
+                code, _, err = self.run_main("host", "serve", *flags)
+            except Exec:
+                return 0, seen, ""
+        return code, seen, err
+
+    def test_a_client_key_runs_its_own_verbs_only(self):
+        for command in CLIENT_ALLOWED:
+            with self.subTest(command=command):
+                code, seen, err = self.serve(command, "--client", "ci")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(seen["restricted"], "client:ci")
+        for command in CLIENT_REFUSED:
+            with self.subTest(command=command):
+                code, seen, err = self.serve(command, "--client", "ci")
+                self.assertEqual(code, 126, err)
+                self.assertNotIn("argv", seen)
+
+    def test_the_kandev_key_runs_managed_too_but_as_kandev(self):
+        for command in ("msbctl managed health", "msbctl managed provision e1",
+                        "msbctl managed health --client kandev", "msbctl kandev health"):
+            for flags in (["--kandev"], ["--client", "kandev"]):
+                with self.subTest(command=command, flags=flags):
+                    code, seen, err = self.serve(command, *flags)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(seen["restricted"], "kandev")
+        code, _, err = self.serve("msbctl managed health --client ci", "--kandev")
+        self.assertEqual(code, 126, err)
+        self.assertIn("names another client", err)
+
+    def test_the_everyday_key_runs_no_managed_verb(self):
+        for command in ("msbctl managed health", "msbctl managed provision e1 --client ci"):
+            with self.subTest(command=command):
+                code, _, err = self.serve(command)
+                self.assertEqual(code, 126, err)
+                self.assertIn("host authorize --client", err)
+
+    def test_a_bad_forced_command_refuses_everything(self):
+        for flags in (["--client", "Bad"], ["--client", "repo"], ["--kandev", "--client", "ci"]):
+            with self.subTest(flags=flags):
+                code, seen, _ = self.serve("msbctl managed health", *flags)
+                self.assertEqual(code, 126)
+                self.assertNotIn("argv", seen)
+
+
+class ClientAuthorizeTest(MsbctlTest):
+
+    def authorized(self):
+        with open(os.path.join(self.home, ".ssh", "authorized_keys"), encoding="utf-8") as fh:
+            return fh.read().splitlines()
+
+    def authorize(self, *flags):
+        with mock.patch.object(self.m.shutil, "which", lambda name: "/home/x/.local/bin/msbctl"):
+            return self.run_main("host", "authorize", KEY, *flags)
+
+    def test_the_client_line(self):
+        code, out, err = self.authorize("--client", "ci")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.authorized(), [
+            'restrict,command="/home/x/.local/bin/msbctl host serve --client ci" ' + KEY])
+
+    def test_client_kandev_is_the_kandev_line(self):
+        code, _, err = self.authorize("--kandev")
+        self.assertEqual(code, 0, err)
+        before = self.authorized()
+        code, _, err = self.authorize("--client", "kandev", "--replace")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.authorized(), before)
+        self.assertEqual(before, ['restrict,command="/home/x/.local/bin/msbctl host serve --kandev" ' + KEY])
+
+    def test_refusals(self):
+        for flags in (["--client", "ci", "--admin"], ["--client", "Bad"], ["--client", "managed"],
+                      ["--client", "ci", "--kandev"]):
+            with self.subTest(flags=flags):
+                code, _, _ = self.authorize(*flags)
+                self.assertNotEqual(code, 0)
+                self.assertFalse(os.path.exists(os.path.join(self.home, ".ssh", "authorized_keys")))
+        code, _, err = self.run_main("host", "check", "--client", "ci")
+        self.assertNotEqual(code, 0)
+        self.assertIn("--client goes with", err)
+
+    def test_a_table_that_would_not_serve_the_key_is_said(self):
+        def write(text):
+            os.makedirs(self.m.CONFIG_DIR, exist_ok=True)
+            with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        for text, said in (("", "no [clients.ci]"), ("[clients.ci]\n", "[clients.ci] enabled is false"),
+                           ("[clients.ci]\nenabled = true\nmax_cpus = -1\n", "[clients.ci] max_cpus"),
+                           ("[clients.ci]\nenabled = true\n", None)):
+            with self.subTest(text=text):
+                write(text)
+                code, _, err = self.authorize("--client", "ci", "--replace")
+                self.assertEqual(code, 0, err)
+                # Written all the same: the table may come next.
+                self.assertEqual(self.authorized(), [
+                    'restrict,command="/home/x/.local/bin/msbctl host serve --client ci" ' + KEY])
+                if said:
+                    self.assertIn(said, err)
+                else:
+                    self.assertNotIn("[clients.ci]", err)
+        write("")
+        code, _, err = self.authorize("--kandev", "--replace")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("clients", err)
+
+
 if __name__ == "__main__":
     main()

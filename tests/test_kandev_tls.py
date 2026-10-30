@@ -524,6 +524,43 @@ class Proxy(TlsTest):
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
 
+    def test_another_clients_sandbox_is_served_while_it_is_enabled(self):
+        table = ('\n[clients.ci]\nenabled = {}\nguest_ports = [8765]\nallow_extra = ["pypi.org"]\n'
+                 'rule_groups = []\n')
+        with open(self.m.CONFIG_FILE, encoding="utf-8") as fh:
+            config = fh.read()
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(config + table.format("true"))
+        os.environ["MSB_RESTRICTED"] = "client:ci"
+        try:
+            code, doc = self._msbctl_json(("managed", "provision", "e1"), (json.dumps({
+                "operation_id": "op-c", "input_digest": "d", "image": "ghcr.io/acme/api-sbx@sha256:" + "a" * 64,
+                "cpus": 1, "memory_mib": 512, "workspace_gib": 1, "expires_at": "2099-01-01T00:00:00Z"})
+                + "\n").encode())
+            self.assertEqual(code, 0, doc)
+            self.backends.append(EchoBackend(doc["record"]["ports"]["8765"], "c-e1:8765"))
+            [public] = self.public("c-e1").values()
+            self.wait_for(public, listening=True)
+            code, doc = self._msbctl_json(("managed", "lease", "e1", "8765"), b"")
+            self.assertEqual(code, 0, doc)
+            token = doc["lease"]["headers"]["X-Msb-Lease"]
+        finally:
+            os.environ.pop("MSB_RESTRICTED", None)
+        tls, line = self.request(public, token)
+        tls.close()
+        self.assertEqual(line, "c-e1:8765\n")
+        # Kandev's token is for Kandev's sandbox, never through ci's port.
+        _, kandev_token = self.lease("e1", 8765)
+        self.assert_refused(public, kandev_token)
+        # Disabled: its ports close; Kandev's stay.
+        with open(self.m.CONFIG_FILE, "w", encoding="utf-8") as fh:
+            fh.write(config + table.format("false"))
+        self.wait_for(public, listening=False)
+        port, token = self.lease("e1", 8765)
+        tls, line = self.request(port, token)
+        tls.close()
+        self.assertEqual(line, "k-e1:8765\n")
+
     def test_a_destroyed_sandboxs_port_refuses(self):
         ports = self.public("k-e2")
         port, token = self.lease("e2", 8765)
@@ -543,6 +580,24 @@ class Proxy(TlsTest):
         tls, line = self.request(port, token)
         tls.close()
         self.assertEqual(line, "k-e1:8765\n")
+
+    def test_an_unforeseen_error_keeps_what_is_open(self):
+        # Whatever a scan raises, the proxy goes on: it keeps the ports whose
+        # sandboxes are still there, says so once, and never closes them all.
+        port, token = self.lease("e1", 8765)
+        held = len(self.public("k-e1")) + len(self.public("k-e2"))
+        line = (f"keeping {held} ports open: unexpected TypeError reading the config or registry: "
+                "cannot use 'list' as a dict key")
+        with mock.patch.object(self.m, "kandev_proxy_wanted",
+                               side_effect=TypeError("cannot use 'list' as a dict key")):
+            self.wait_for_log(line)
+            time.sleep(0.6)                 # a few more scans: still said once
+            self.assertTrue(self.thread.is_alive())
+            tls, got = self.request(port, token)
+            tls.close()
+            self.assertEqual(got, "k-e1:8765\n")
+        self.assertEqual(self.logs.count(line), 1)
+        self.wait_for_log(f"serving {held} ports")
 
     def test_logs_hold_no_token(self):
         port, token = self.lease("e1", 8765)
@@ -734,6 +789,9 @@ class ProxySummary(KandevTest):
     def test_the_count_is_always_said(self):
         say = self.m.kandev_proxy_summary
         self.assertEqual(say(0, 0, None), "serving 0 ports: no Kandev sandbox is published through the proxy")
+        # A host with clients other than Kandev says what it means.
+        self.assertEqual(say(0, 0, None, shared=True),
+                         "serving 0 ports: no managed sandbox is published through the proxy")
         self.assertEqual(say(1, 1, None), "serving 1 port")
         self.assertEqual(say(2, 4, None), "serving 2 ports (2 could not be bound)")
         self.assertEqual(say(0, 0, "no certificate"), "listening on nothing: no certificate")

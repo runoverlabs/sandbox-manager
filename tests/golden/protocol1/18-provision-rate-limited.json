@@ -1,0 +1,15 @@
+{
+ "argv": [
+  "kandev",
+  "provision",
+  "e4"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [
+  [
+   "ls"
+  ]
+ ],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"rate_limited\",\n    \"message\": \"this host is at its [kandev] limits\",\n    \"retry_after_seconds\": 30\n  }\n}\n"
+}

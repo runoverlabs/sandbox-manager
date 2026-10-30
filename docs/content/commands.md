@@ -85,13 +85,17 @@ One line per sandbox: name, state, project, pending updates, autostart.
 `--json` prints `{"msbctl": version, "sandboxes": [...]}`, each with `name`,
 `state`, `source`, `location`, `repo`, `ref`, `autostart` and `updates`. It
 lists this machine's sandboxes only, which is what a laptop asks a remote for.
-A [Kandev](kandev.md) sandbox's row also has `kandev`, its record.
+A [Kandev](kandev.md) sandbox's row also has `kandev`, its record. Another
+client's sandbox (`msbctl managed`) has `source` `managed`, `client`, its name,
+and `record`, its record, which names the client too.
 
 With `--json`, `ls`, `show`, `stop` and `purge` print exactly one JSON
 document on stdout, everything else going to stderr, and exit 0. On failure
 they exit 3 with `{"error": {"code": …, "message": …}}`. The code is
 `not_found` for a name with no sandbox under it, else `unavailable` (or, under
-the Kandev key, `denied` and `conflict`).
+a client's key, `denied` and `conflict`). Under a client's key they see that
+client's sandboxes alone: any other name is `not_found`, and `purge` reports
+it `absent`, as it would a name with nothing under it.
 
 ### `msbctl status`
 
@@ -568,14 +572,21 @@ written once, so write it again after an upgrade.
 ### `msbctl host`
 
 ```text
-msbctl host serve [--kandev]
-msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev] [--replace]
+msbctl host serve [--kandev | --client NAME]
+msbctl host authorize "PUBLIC KEY LINE" [--admin | --kandev | --client NAME] [--replace]
 msbctl host check [--json]
 msbctl host autostart install
 msbctl host kandev install | reap | proxy | rotate-lease-key
 msbctl host kandev configure [--[no-]enabled] [--serve MODE] [--proxy-listen IP]
                              [--base-url URL] [--allow-extra ENTRY …]
                              [--private-name HOST …] [--json]
+msbctl host managed configure [--client NAME] [--[no-]enabled] [--serve MODE]
+                              [--proxy-listen IP] [--base-url URL]
+                              [--max-sandboxes N] [--max-cpus N] [--max-memory SIZE]
+                              [--allow-extra ENTRY …] [--private-name HOST …]
+                              [--name-prefix PREFIX] [--env-prefix PREFIX]
+                              [--guest-port PORT …] [--[no-]require-callback]
+                              [--body-secret-host HOST …] [--json]
 ```
 
 For running this machine as a [remote host](remote-hosts.md). Under
@@ -592,13 +603,20 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `kandev rotate-lease-key` | replace the key its tokens are signed with, honouring the old one for 15 minutes |
 | `kandev install` | write and enable a systemd user timer for the reaper and a service for the proxy, and restart the proxy |
 | `kandev configure` | set the [`[kandev]` keys](kandev.md#setting-a-host-up) it is given in `config.toml`, keeping everything else, and only if the result is valid |
+| `managed configure` | the same for the host-wide `[managed]` keys, or with `--client NAME` for that client's `[clients.NAME]`. A key the host keeps in `[kandev]` is set there. Refused, with the file unchanged, when the host's keys would no longer check out, or with `--client` when that client's own table would not (its `name_prefix` shared with another client's included), or its `name_prefix` is already the start of a sandbox it does not own, or a new `name_prefix` would leave the client's own sandboxes under the old one (purge them first). Another client's table that does not check out refuses nothing: it is listed as a problem |
 
 | Option | Meaning |
 | --- | --- |
 | `--admin` | `authorize`: no forced command. Use a FIDO2 `sk-` key |
 | `--kandev` | `authorize`, `serve`: the [Kandev plugin's key](kandev.md#the-plugin-key). Its line runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`, `show`, `stop`, `purge` and `self-update` with `--json`, seeing only Kandev's sandboxes. The everyday key runs no `kandev` verb |
+| `--client NAME` | `authorize`, `serve`: a client's key, for the client `[clients.NAME]` configures. Its line runs `host serve --client NAME`, which admits `msbctl managed` verbs for that client and `ls`, `show`, `stop`, `purge` and `doctor` with `--json`, seeing only its sandboxes; never `self-update`, `kandev tls` or `kandev restart-proxy`, which are the host's. The client is the forced command's: a `--client` naming another in the command is refused. `--client kandev` is `--kandev`, and writes the same line. `authorize` warns when `[clients.NAME]` is missing, does not check out or is not enabled (the key would answer `denied` or `invalid_config`), and writes the line all the same |
 | `--replace` | `authorize`: rewrite the key's existing line instead of refusing |
-| `--json` | `check`, `kandev configure`: one JSON document |
+| `--json` | `check`, `kandev configure`, `managed configure`: one JSON document |
+| `--max-sandboxes N`, `--max-cpus N`, `--max-memory SIZE` | `managed configure`: the client's caps, or without `--client` the host's totals over every client |
+| `--name-prefix PREFIX`, `--env-prefix PREFIX` | `managed configure --client`: the client's sandbox-name prefix (like `c-`) and agentctl's variable prefix (like `CI_`) |
+| `--guest-port PORT` | `managed configure --client`: the guest ports a provision publishes when it names none, one per flag (1 to 4) |
+| `--require-callback`, `--no-require-callback` | `managed configure --client`: whether a provision must name a callback |
+| `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |
 | `--proxy-listen IP` | `kandev configure`: the address the proxy binds |
@@ -630,6 +648,47 @@ and `purge` and `--json`, and the reaper and the TLS proxy are
 | Option | Meaning |
 | --- | --- |
 | `--at TIME` | `expiry`: the new `expires_at`, RFC 3339 |
+
+### `msbctl managed`
+
+```text
+msbctl managed health
+msbctl managed provision|agentctl|start ENV
+msbctl managed expiry ENV --at TIME
+msbctl managed lease ENV PORT
+msbctl managed … --client NAME
+```
+
+Protocol 2: the [`kandev` verbs](#msbctl-kandev), for any
+[client](managed.md) a `[clients.NAME]` table in `config.toml` configures, run over ssh through
+`host serve --client NAME`. The client is the key's; `--client` is needed only
+by the operator trying a client's verbs at the host, and under a key it may
+only repeat the key's own. The Kandev key may run these too, as Kandev.
+
+What differs from protocol 1: `health` answers `protocol` 2, `protocols`, the
+`client` and its `client_settings`; a record names its `client`, and `ls` and
+`show` put it under `record`. A provision's callback (`callback`, or its
+protocol-1 name `kandev_api`) is optional unless the client sets
+`require_callback`: with none, no egress rule names it and nothing is pinned
+in the guest's `/etc/hosts`, which would stop secret substitution for that
+name ([names on your LAN](kandev.md#names-on-your-lan)). A client's callback
+must be admitted by its `allow_extra`: by an address, CIDR or address:port entry
+covering its address (for a name, the one it resolves to on the host), or by a
+hostname pattern only if that address is public or the name is in the client's
+`private_names`; otherwise `invalid_config`. `*` admits any address given as
+one, private and reserved included; for a name it counts as a pattern. A name
+nothing could admit (no pattern or `*` matches it, and no IPv4 address, CIDR or
+address:port entry at its port) is refused without being looked up.
+Kandev's stays required and unchecked. `guest_ports` may name 1 to 4 guest ports to publish
+(Kandev's stay its four, so under the Kandev key any others are refused).
+agentctl's environment and nonce use the client's `env_prefix`, and its binary
+goes to `/opt/NAME/agentctl`. `tls install`, `restart-proxy` and `self-update`
+are not here: they act for the whole host.
+
+| Option | Meaning |
+| --- | --- |
+| `--at TIME` | `expiry`: the new `expires_at`, RFC 3339 |
+| `--client NAME` | which client; at the host only, or the key's own |
 
 ### `msbctl remote`
 

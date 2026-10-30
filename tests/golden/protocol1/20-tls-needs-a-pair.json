@@ -1,0 +1,11 @@
+{
+ "argv": [
+  "kandev",
+  "tls",
+  "install"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"cert_pem and key_pem are required\"\n  }\n}\n"
+}

@@ -1,0 +1,10 @@
+{
+ "argv": [
+  "kandev",
+  "provision"
+ ],
+ "exit": 3,
+ "key": "kandev",
+ "msb": [],
+ "stdout": "{\n  \"error\": {\n    \"code\": \"invalid_config\",\n    \"message\": \"kandev provision needs an environment id\"\n  }\n}\n"
+}

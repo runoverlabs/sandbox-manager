@@ -1,0 +1,3 @@
+{
+ "file": "# Written by `msbctl host kandev install`.\n[Unit]\nDescription=msb-manager: reap expired Kandev sandboxes every minute\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec=60s\n\n[Install]\nWantedBy=timers.target\n"
+}

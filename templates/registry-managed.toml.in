@@ -1,0 +1,68 @@
+# {{NAME}} — a sandbox client {{CLIENT}} owns, written by `msbctl managed provision` on {{DATE}}.
+#
+# WRITTEN AND OWNED BY msbctl's managed verbs, for the client named below
+# ([clients.<name>] in config.toml). Do not edit it: the client decides
+# everything here through its own requests, and `msbctl purge` from its key (or
+# the reaper, at expiry) removes it. Your own verbs may list, show and shell
+# into it while it runs, and refuse everything else. Another client's key sees
+# none of it.
+#
+# This file is the inventory: it is written BEFORE `msb create`, so a crash
+# halfway is something `msbctl host kandev reap` can find and clean up. It holds
+# the NAMES and hosts of secret bindings, never a value: the client re-sends the
+# values on every create and start, and they exist on this machine only in the
+# environment of the one `msb` process that uses them.
+
+source       = "managed"
+client       = {{CLIENT}}
+name         = "{{NAME}}"
+client_env   = {{ENV}}
+operation_id = {{OPERATION}}
+input_digest = {{DIGEST}}
+# creating | running | stopped | absent (the VM is gone; the entry waits for
+# destroy or expiry).
+state        = "creating"
+image        = {{IMAGE}}
+cpus         = {{CPUS}}
+memory       = "{{MEMORY}}"
+root_disk    = "{{DISK}}"
+# An ext4 disk at /workspace. Owned by the VM (`--mount-owned`): msb deletes it
+# with the sandbox, and nothing else has it.
+workspace_disk = "{{WORKSPACE}}"
+created_at     = "{{CREATED}}"
+# Drawn at provision; with created_at, what a lease token is bound to (one
+# provision of this name, through stops and starts).
+incarnation    = "{{INCARNATION}}"
+expires_at     = "{{EXPIRES}}"
+max_expires_at = "{{EXPIRES}}"
+# Bumped on every start; a client may drop idle connections when it changes.
+generation   = 0
+autostart    = false
+ssh_keys     = []
+
+# 127.0.0.1:<host port>:<guest port>, from port_pool ([managed], or [kandev] on
+# a host set up before [managed]). One per guest port the request published.
+{{PORTS}}
+
+# serve when it was made: what destroy undoes, and how a lease reads.
+serve        = {{SERVE}}
+# serve = "proxy": <public TLS port>:<guest port>, from proxy_port_pool, on
+# proxy_listen. `msbctl host kandev proxy` listens on these while this file
+# exists and the client is enabled (or, while its table does not check out,
+# keeps those it already had open: docs/content/managed.md), and checks each
+# connection's lease token for this sandbox.
+{{PROXY_PORTS}}
+
+# The client's rule_groups at provision time, then the request's own egress and
+# its callback host, if it gave one: pinned to the address it resolved to here
+# and written into the guest's /etc/hosts, so DNS rebind protection stays on.
+# Empty when the request named no callback: no rule, no /etc/hosts line.
+callback      = {{CALLBACK}}
+callback_ip   = {{CALLBACK_IP}}
+{{RULE_GROUPS}}
+{{EXTRA_RULES}}
+{{BINDINGS}}
+# Hosts the request let resolve to a private address. When not empty, the VM was
+# created with DNS rebind protection off, and these names' rules first, ahead
+# of a deny of every non-public destination.
+{{PRIVATE}}

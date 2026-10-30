@@ -1,0 +1,3 @@
+{
+ "file": "# Written by `msbctl host kandev install`. The TLS proxy for Kandev's\n# sandboxes ([kandev] serve = \"proxy\"): one listener per published port on\n# proxy_listen, each connection checked for a lease token. It reads the kandev\n# entries and the certificate itself, so it never needs a restart for them.\n[Unit]\nDescription=msb-manager: TLS proxy for Kandev's sandboxes\n\n[Service]\nType=simple\nEnvironment=PATH=<TMP>/home/.local/bin:/usr/local/bin:/usr/bin:/bin\nExecStart=/opt/msb/bin/msbctl host kandev proxy\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n"
+}

@@ -1554,13 +1554,22 @@ class Sandbox:
         # inside the sandbox, and the project layer is the repo's own .msb/ as
         # fetched at a recorded commit (policy_dir(), never mounted).
         # "kandev": a sandbox Kandev owns, written and removed by `msbctl
-        # kandev` (see that section). No project and no policy layer: the
-        # entry is the whole definition, and the project is an empty dir.
+        # kandev` (see that section). "managed": the same for another client,
+        # named by `client` (`msbctl managed`). No project and no policy layer:
+        # the entry is the whole definition, and the project is an empty dir.
         self.source = self.entry.get("source", "folder")
-        if self.source not in ("folder", "repo", "kandev"):
-            die(f"{name}.toml: source is {self.source!r}, expected \"folder\", \"repo\" or \"kandev\"")
+        if self.source not in ("folder", "repo", "kandev", "managed"):
+            die(f"{name}.toml: source is {self.source!r}, expected \"folder\", \"repo\", "
+                "\"kandev\" or \"managed\"")
         self.is_repo = self.source == "repo"
-        self.is_kandev = self.source == "kandev"
+        # Whose it is (entry_client()): None for the operator's own.
+        self.client = entry_client(self.entry)
+        if self.source == "managed" and self.client is None:
+            die(f"{name}.toml: source is \"managed\" but client is not a client name")
+        self.is_managed = self.client is not None
+        # Every is_kandev site means "a client owns it: none of the operator's
+        # plumbing", so it holds for every client, Kandev included.
+        self.is_kandev = self.is_managed
         self.repo = self.entry.get("repo", "")
         # The one parsed form of `repo` (see RepoRef): None for no repo, and
         # for a value no msbctl would have written.
@@ -1679,8 +1688,8 @@ class Sandbox:
     @property
     def location(self):
         """Where the code is, for display: a host folder, or the repo."""
-        if self.is_kandev:
-            return f"kandev:{self.entry.get('kandev_env', '?')}"
+        if self.is_managed:
+            return f"{self.client}:{entry_env(self.entry) or '?'}"
         if not self.is_repo:
             return tilde(self.project)
         ref = self.entry.get("ref") or self.repo_meta.get("branch") or "(default branch)"
@@ -4075,7 +4084,9 @@ def ensure_running(box, table=None, packages=False):
         # Kandev starts its own, with secrets only its requests carry; and none
         # of the per-boot plumbing below is for its sandboxes (see kandev).
         if state != "running":
-            die(f"{box.name} is a Kandev sandbox and is {state}: only Kandev starts it")
+            who = owner_name(box.client)
+            what = "a Kandev sandbox" if who == "Kandev" else f"client {who}'s sandbox"
+            die(f"{box.name} is {what} and is {state}: only {who} starts it")
         return
     if state == "absent":
         die(f"no sandbox named {box.name} — run: msbctl rebuild {box.name}")
@@ -4198,14 +4209,85 @@ POLICY_APPROVED_DIR = os.path.join(STATE_DIR, "policy-approved")
 
 
 def restricted():
-    """True under `msbctl host serve`: nothing that approves a policy may ask."""
-    return os.environ.get("MSB_RESTRICTED") in ("1", "kandev")
+    """True under `msbctl host serve`: nothing that approves a policy may ask.
+    Any value at all counts: one msbctl does not know is never less
+    restricted than one it does (key_client() refuses it outright)."""
+    return bool(os.environ.get("MSB_RESTRICTED"))
+
+
+# ------------------------------------------------------- client identity
+#
+# A managed client is an orchestrator that owns sandboxes on this host through
+# its own ssh key: Kandev (protocol 1, `msbctl kandev`) or any client the
+# operator names in [clients.<name>] (protocol 2, `msbctl managed`). Who the
+# caller is, and whose a registry entry is, are read here and nowhere else.
+#
+#   the key     MSB_RESTRICTED, set by `host serve` from the forced command
+#               alone: "kandev" for `--kandev`, "client:NAME" for `--client
+#               NAME`, "1" for the everyday key. Never from the caller's argv.
+#   an entry    source = "kandev" (kandev_env), or source = "managed" with
+#               client = "<name>" (client_env). folder and repo entries are
+#               the operator's.
+
+# A client's name: short, so `msbctl.owner=<name>` and the forced command stay
+# readable. folder, repo and managed would read as a registry source.
+CLIENT_NAME = re.compile(r"[a-z][a-z0-9-]{0,15}")
+RESERVED_CLIENT_NAMES = ("folder", "repo", "managed")
+
+
+def client_name_problem(name):
+    """Why `name` cannot name a client, or None."""
+    if not isinstance(name, str) or not CLIENT_NAME.fullmatch(name):
+        return f"{name!r} is not a client name (a-z first, then a-z 0-9 -, at most 16)"
+    if name in RESERVED_CLIENT_NAMES:
+        return f"{name} is reserved"
+    return None
+
+
+def key_client():
+    """The client whose key this session runs under, or None: "kandev" under
+    `host serve --kandev`, NAME under `host serve --client NAME`."""
+    value = os.environ.get("MSB_RESTRICTED", "")
+    if value in ("", "1"):
+        return None
+    if value == "kandev":
+        return "kandev"
+    if value.startswith("client:") and not client_name_problem(value[7:]):
+        return value[7:]
+    # Fail closed: a value `host serve` never sets is no key's, not the
+    # everyday one's (that would widen a mangled client key).
+    die("MSB_RESTRICTED holds a key msbctl does not know: refusing "
+        "(`msbctl host authorize` writes the forced command)")
 
 
 def kandev_key():
     """True under `host serve --kandev`: the Kandev plugin's key, whose generic
     verbs (ls, show, stop, purge) see Kandev's sandboxes and nothing else."""
-    return os.environ.get("MSB_RESTRICTED") == "kandev"
+    return key_client() == "kandev"
+
+
+def entry_client(entry):
+    """The client a registry entry belongs to, or None for the operator's."""
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("source") == "kandev":
+        return "kandev"
+    if entry.get("source") == "managed":
+        client = entry.get("client")
+        return client if not client_name_problem(client) and client != "kandev" else None
+    return None
+
+
+def owner_name(client):
+    """A client as people read it: Kandev, or the name in [clients.<name>]."""
+    return "Kandev" if client == "kandev" else client
+
+
+def entry_env(entry):
+    """The client's own id for the environment a managed entry is for."""
+    if entry.get("source") == "kandev":
+        return entry.get("kandev_env", "")
+    return entry.get("client_env", "")
 
 
 def project_policy(box):
@@ -4592,7 +4674,7 @@ def refuse_before_create(box):
     rebuild or rename that tore the VM down first and then refused would leave
     nothing where a running sandbox was."""
     if box.is_kandev:
-        die(f"{box.name} is a Kandev sandbox: only `msbctl kandev provision` creates one")
+        die(f"{box.name} is {owner_name(box.client)}'s sandbox: only its own provision creates one")
     ensure_repo_policy(box)
     refuse_conf_problems(box)
     refuse_reserved_bindings(box)
@@ -4784,11 +4866,13 @@ def cmd_rebuild(args, config):
 def cmd_purge(args, config):
     """Returns {"name", "purged"} for `--json`. A name with nothing registered
     under it is not a failure: what was asked for is true, so a repeated or
-    late purge succeeds. Under the Kandev key, a sandbox that is not Kandev's
-    counts as nothing, and is never touched."""
+    late purge succeeds. Under a client's key (Kandev's or another's), a
+    sandbox that is not that client's counts as nothing, and is never touched:
+    another client's sandbox answers exactly as a name with nothing under it,
+    so a purge is no way to learn what exists."""
     name = args.name
     entry = read_toml(registry_path_for(name)) if os.path.isfile(registry_path_for(name)) else {}
-    if not entry or (kandev_key() and entry.get("source") != "kandev"):
+    if not entry or (key_client() and entry_client(entry) != key_client()):
         note(f"nothing found named {name}: nothing to purge")
         return {"name": name, "purged": False}
     box = Sandbox(name, config)
@@ -4885,8 +4969,8 @@ def purge_kandev(box, args):
     with kandev_lock():
         entry = read_toml(registry_path_for(box.name))
         try:
-            if entry.get("source") == "kandev":
-                kandev_remove(box.name, entry, set(kandev_labelled()))
+            if entry_client(entry) == box.client:
+                kandev_remove(box.name, entry, set(managed_labelled(box.client)))
         except KandevError as exc:
             if getattr(args, "json", False):
                 raise                   # its code (conflict, unavailable) reaches the JSON
@@ -4912,8 +4996,9 @@ def name_problem(name, renaming=None):
         return "name must be lowercase letters, digits and dashes"
     if name == renaming:
         return f"it is already called {name}"
-    if name.startswith("k-"):
-        return "names starting with k- are kept for Kandev's sandboxes"
+    for prefix, client in client_prefixes():
+        if name.startswith(prefix):
+            return f"names starting with {prefix} are kept for {owner_name(client)}'s sandboxes"
     if os.path.exists(registry_path_for(name)):
         return f"{name} is already registered ({tilde(registry_path_for(name))})"
     # A renamed sandbox still owns volumes under its old name; a second sandbox
@@ -4924,6 +5009,23 @@ def name_problem(name, renaming=None):
     if state_of(name) != "absent":
         return f"msb already has a sandbox called {name} that msbctl does not manage"
     return None
+
+
+def client_prefixes():
+    """[(name_prefix, client)]: k- for Kandev always, and the one each
+    [clients.<name>] asks for, its table checking out or not (a broken one is
+    the operator's to fix, and says so at its own verbs, but its prefix stays
+    its own meanwhile: client_prefix_wanted())."""
+    found = [("k-", "kandev")]
+    try:
+        config = load_config()
+    except SystemExit:
+        return found
+    for client in configured_clients(config):
+        prefix = client_prefix_wanted(config, client)
+        if client != "kandev" and prefix and prefix != "k-":
+            found.append((prefix, client))
+    return found
 
 
 def _follow_rename_in_comments(path, old, new):
@@ -8645,17 +8747,17 @@ def cmd_ls(args, config):
     remotes = configured_remotes(config)
     if remotes:
         ls_with_remotes(args, config, names)
-        return
+        return None
     if not names:
         note("nothing registered yet — `msbctl add` in a project directory")
-        return
+        return None
     rows = [(r["name"], r["state"], r["location"], ",".join(r["updates"]) or "-",
              "yes" if r["autostart"] else "no") for r in ls_rows(args, config, names)]
 
     if args.porcelain:
         for row in rows:
             print("\t".join(row))
-        return
+        return None
 
     if args.picker:
         # `name<TAB>pre-padded display text`.
@@ -8671,7 +8773,7 @@ def cmd_ls(args, config):
         for row in rows:
             shown = "  ".join(str(row[i]).ljust(widths[i]) for i in order)
             print(f"{row[0]}\t{shown.rstrip()}")
-        return
+        return None
 
     widths = [max(len(str(r[i])) for r in [("NAME", "STATE", "PROJECT",
                                             "UPDATES", "AUTOSTART")] + rows)
@@ -8742,16 +8844,21 @@ def ls_rows(args, config, names):
                      "location": box.location, "repo": box.repo,
                      "ref": box.entry.get("ref", "") if box.is_repo else "",
                      "autostart": box.autostart, "updates": pending})
-        if box.is_kandev:
+        if box.client == "kandev":
+            # Byte for byte what protocol 1 has always listed.
             rows[-1]["kandev"] = kandev_record(name, box.entry, table)["record"]
+        elif box.is_managed:
+            rows[-1]["client"] = box.client
+            rows[-1]["record"] = kandev_record(name, box.entry, table, client=True)["record"]
     return rows
 
 
 def ls_data(args, config):
     """`ls --json`: {"msbctl": version, "sandboxes": [...]}. Never a secret.
-    Under the Kandev key, Kandev's sandboxes only: the operator's names and
-    folders are none of its business."""
-    names = [n for n, _ in kandev_entries()] if kandev_key() else registered()
+    Under a client's key, that client's sandboxes only: the operator's names
+    and folders, and other clients' sandboxes, are none of its business."""
+    client = key_client()
+    names = [n for n, _ in managed_entries(client)] if client else registered()
     return {"msbctl": version_string(), "sandboxes": ls_rows(args, config, names)}
 
 
@@ -8818,10 +8925,14 @@ def show_data(box, table=None):
     """`show --json`: what one sandbox resolves to. Says whether each secret is
     STORED, never what it is: no value is ever put in here. For a Kandev
     sandbox, its record, with agentctl checked live."""
-    if box.is_kandev:
+    if box.client == "kandev":
         record = kandev_record(box.name, box.entry, table, live=True)["record"]
         return {"name": box.name, "source": "kandev", "state": record["state"],
                 "location": box.location, "kandev": record}
+    if box.is_managed:
+        record = kandev_record(box.name, box.entry, table, live=True, client=True)["record"]
+        return {"name": box.name, "source": "managed", "client": box.client, "state": record["state"],
+                "location": box.location, "record": record}
     own = stored_env(os.path.join(SECRETS_DIR, f"{box.name}.env"))
     shared = stored_env(GLOBAL_ENV)
     secrets = []
@@ -8881,7 +8992,8 @@ def cmd_show(args, config):
     say(f"{box.name}  [{state_of(box.name, table)}]")
     if box.is_kandev:
         rec = kandev_record(box.name, box.entry, table)["record"]
-        note(f"source     Kandev, environment {rec['env']} (Kandev owns it)")
+        who = owner_name(box.client)
+        note(f"source     {who}, environment {rec['env']} ({who} owns it)")
         note(f"image      {rec['image']}")
         note(f"resources  {box.entry.get('cpus')} cpu, {box.entry.get('memory')}, "
              f"{box.entry.get('root_disk')} disk")
@@ -8893,11 +9005,11 @@ def cmd_show(args, config):
             f"{g} <- {port_link(LOOPBACK_BIND, h, 'tcp', f'127.0.0.1:{h}')}"
             for g, h in rec["ports"].items()))
         note(f"secrets    {', '.join(binding_var(b) for b in box.entry.get('secret_binds', [])) or 'none'}"
-             "  (values only ever in Kandev's requests)")
+             f"  (values only ever in {who}'s requests)")
         say("Egress")
         for rule in box.net_rules():
             note(f"  {rule}")
-        return
+        return None
     if box.is_repo:
         meta = box.repo_meta
         note(f"source     {box.location}, cloned inside the sandbox ({box.workspace_volume})")
@@ -9196,7 +9308,7 @@ def probe_installed(name, table):
 def refresh_versions(names, config, cache):
     say("Probing versions")
     # Kandev's sandboxes run Kandev's image and are not msbctl's to probe.
-    names = [n for n in names if read_toml(registry_path_for(n)).get("source") != "kandev"]
+    names = [n for n in names if entry_client(read_toml(registry_path_for(n))) is None]
     table = msb_table()
     token = None
     if config.get("version_check", {}).get("use_global_token", True):
@@ -10897,27 +11009,42 @@ def _msb_flags_problem(flags):
     return None
 
 
-def restricted_problem(argv, kandev=False):
+def restricted_problem(argv, client=None, kandev=False):
     """None if `msbctl <argv>` may run under `host serve`, else the reason.
     Each refusal says what it would let a compromised laptop do.
 
-    The two keys are disjoint. The Kandev plugin's key (`--kandev`) runs
-    `kandev` verbs only. Those DO set egress and secret bindings, which the
-    everyday key may never do: a Kandev profile is the policy for its own
-    sandboxes, and they can reach nothing else (see kandev). The everyday key
-    runs no `kandev` verb, since one could create a sandbox with any egress."""
+    The keys are disjoint. A client's key (`--client NAME`; `--kandev` is
+    Kandev's) runs `managed` verbs, for that client alone, and Kandev's also
+    `kandev`. Those DO set egress and secret bindings, which the everyday key
+    may never do: a client's request is the policy for its own sandboxes, and
+    they can reach nothing else (see kandev). The everyday key runs neither,
+    since one could create a sandbox with any egress. Which client a key is
+    comes from the forced command alone: a `--client` in argv that names
+    another is refused, never followed."""
     if argv in (["--version"], ["-V"]):
         return None
-    if kandev:
-        if not argv or argv[0] not in ("kandev", "ls", "show", "stop", "purge", "self-update", "doctor"):
-            return ("this key runs `msbctl kandev` verbs, and ls, show, stop, purge, self-update "
+    client = "kandev" if kandev else client
+    if client:
+        first = ("kandev", "managed", "ls", "show", "stop", "purge", "doctor") + \
+            (("self-update",) if client == "kandev" else ())
+        if not argv or argv[0] not in first:
+            if client == "kandev":
+                return ("this key runs `msbctl kandev` and `msbctl managed` verbs, and ls, show, stop, "
+                        "purge, self-update and doctor with --json")
+            return (f"this key runs `msbctl managed` verbs for {client}, and ls, show, stop, purge "
                     "and doctor with --json")
+        if argv[0] == "kandev" and client != "kandev":
+            return "kandev verbs are for the Kandev plugin's key (`host authorize --kandev`)"
         try:
             with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
                 args = build_parser().parse_args(argv)
         except SystemExit:
             return "the command line does not parse"
         if args.func is cmd_kandev:
+            return None
+        if args.func is cmd_managed:
+            if args.client and args.client != client:
+                return f"this key is {owner_name(client)}'s: --client {args.client} names another client"
             return None
         # The generic verbs, in the one shape the plugin uses: JSON, explicit
         # names, nothing that re-probes or prompts. Under this key they see
@@ -10939,6 +11066,8 @@ def restricted_problem(argv, kandev=False):
         return None
     if argv and argv[0] == "kandev":
         return "kandev verbs are for the Kandev plugin's key (`host authorize --kandev`)"
+    if argv and argv[0] == "managed":
+        return "managed verbs are for a client's key (`host authorize --client NAME`)"
     try:
         split, flags = split_cli(argv)
     except (ValueError, IndexError):
@@ -11016,13 +11145,20 @@ def restricted_problem(argv, kandev=False):
     return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
 
 
-def host_serve(kandev=False):
+def host_serve(kandev=False, client=None):
     """The forced command: validate SSH_ORIGINAL_COMMAND and run it, restricted.
-    `kandev`: the Kandev plugin's key, which runs `kandev` verbs and nothing
-    else — and the everyday key runs no `kandev` verb (restricted_problem())."""
+    `kandev` (or `client` "kandev"): the Kandev plugin's key; `client`: that
+    client's key. Each runs its own verbs and nothing else — and the everyday
+    key runs none of them (restricted_problem())."""
     def refuse(reason):
         print(f"msbctl host serve: refused: {reason}", file=sys.stderr)
         sys.exit(HOST_EXIT_REFUSED)
+
+    if kandev and client not in (None, "kandev"):
+        refuse("--kandev and --client name two different keys")
+    client = "kandev" if kandev else client
+    if client and client != "kandev" and client_name_problem(client):
+        refuse(f"--client: {client_name_problem(client)} (fix this key's line in authorized_keys)")
 
     raw = os.environ.get("SSH_ORIGINAL_COMMAND")
     if raw is None:
@@ -11039,10 +11175,10 @@ def host_serve(kandev=False):
     if not argv or not REMOTE_PROGRAM.fullmatch(argv[0]):
         refuse("only msbctl commands")
     argv = argv[1:]
-    problem = restricted_problem(argv, kandev=kandev)
+    problem = restricted_problem(argv, client=client)
     if problem:
         refuse(problem)
-    os.environ["MSB_RESTRICTED"] = "kandev" if kandev else "1"
+    os.environ["MSB_RESTRICTED"] = "kandev" if client == "kandev" else f"client:{client}" if client else "1"
     # sshd runs a forced command with its own minimal PATH, so an msb in
     # ~/.local/bin (where get.sh puts it) would not be found by any verb.
     here = os.path.dirname(os.path.realpath(__file__))
@@ -11076,8 +11212,13 @@ def host_authorize(args):
     if present and not args.replace:
         die(f"that key is already in {tilde(path)}:\n  {present[0]}\n"
             "--replace rewrites that line; or edit the file by hand")
-    if args.admin and args.kandev:
-        die("--admin and --kandev are two different keys")
+    client = "kandev" if args.kandev else args.client
+    if args.kandev and args.client not in (None, "kandev"):
+        die("--kandev and --client are two different keys")
+    if args.admin and client:
+        die(f"--admin and {'--kandev' if args.kandev else '--client'} are two different keys")
+    if client and client != "kandev" and client_name_problem(client):
+        die(f"--client: {client_name_problem(client)}")
     if args.admin:
         if not ktype.startswith("sk-"):
             warn("a plain key as the admin key: if the laptop's ssh-agent holds it, the")
@@ -11093,9 +11234,16 @@ def host_authorize(args):
         if not me:
             me = os.path.realpath(__file__)
             warn(f"msbctl is not on PATH; the line names {me}, which an upgrade may move")
-        # The Kandev plugin never needs a terminal, so its line has no pty.
-        line = (f'restrict,command="{me} host serve --kandev" {ktype} {blob} {comment}' if args.kandev
-                else f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}').rstrip()
+        # A client never needs a terminal, so its line has no pty. Kandev's
+        # line is the one it has always been (`--client kandev` too), so a
+        # --replace finds and dedupes it.
+        if client == "kandev":
+            line = f'restrict,command="{me} host serve --kandev" {ktype} {blob} {comment}'
+        elif client:
+            line = f'restrict,command="{me} host serve --client {client}" {ktype} {blob} {comment}'
+        else:
+            line = f'restrict,pty,command="{me} host serve" {ktype} {blob} {comment}'
+        line = line.rstrip()
     if present:
         # Every line naming the key goes, so none of them still grants what the
         # new one does not; written whole and renamed, so a failure halfway
@@ -11113,10 +11261,37 @@ def host_authorize(args):
     os.chmod(path, 0o600)
     note(f"{'replaced in' if present else 'added to'} {tilde(path)}:")
     note(f"  {line}")
-    if args.kandev:
+    if client == "kandev":
         note("this key can run `msbctl kandev` verbs, and nothing else")
+    elif client:
+        note(f"this key can run `msbctl managed` verbs as client {client}, and ls, show, stop, purge "
+             "and doctor with --json for its own sandboxes; nothing else")
+        client_table_warning(client)
     elif not args.admin:
         note("this key can run msbctl verbs from host serve's allowlist, and nothing else")
+
+
+def client_table_warning(client):
+    """After `host authorize --client NAME`: say so when [clients.NAME] is
+    missing, does not check out or is not enabled, since the key then answers
+    `denied` (or invalid_config) to every verb. The line is written either
+    way: the table may well come next."""
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            config = load_config()
+    except SystemExit:
+        warn(f"{tilde(CONFIG_FILE)} does not load, so whether [clients.{client}] is there is unknown")
+        return
+    found = clients_settings(config).get(client)
+    if found is None:
+        warn(f"there is no [clients.{client}] in {tilde(CONFIG_FILE)} yet: this key answers `denied` "
+             "to every verb but `managed health` until there is one, enabled (`msbctl host managed "
+             f"configure --client {client} --enabled` writes it)")
+    elif isinstance(found, KandevError):
+        warn(f"{found.message}: this key's verbs answer invalid_config until that is fixed")
+    elif not found["enabled"]:
+        warn(f"[clients.{client}] enabled is false: this key answers `denied` to every verb but "
+             "`managed health` until it is true")
 
 
 # ---------------------------------------------------------------- doctor
@@ -11150,8 +11325,76 @@ def doctor_checks(config=None):
         out.insert(0, _doctor("config", "fail", f"{tilde(CONFIG_FILE)} does not load",
                               "`msbctl config` shows the error; `msbctl setup` → edit the file"))
     else:
-        out += registry_checks(config, entries)
+        out += client_checks(config, entries) + registry_checks(config, entries)
     return out
+
+
+def client_checks(config, entries=None):
+    """Whether the managed clients' tables check out: [managed], [kandev] and
+    each [clients.NAME]. Under a client's key, its own and what all share.
+    At the host, with `entries` (doctor_registry()), also each client whose
+    name_prefix is already the start of a sandbox it does not own (one made
+    before the client's table was, by hand): its provision of that
+    environment answers conflict."""
+    scoped = key_client()
+    try:
+        managed_host_settings(config)
+    except KandevError as exc:
+        # The host's keys are every client's: this one does stop them all.
+        return [_doctor("clients", "warn", f"no client's verbs work: {exc.message}",
+                        "fix config.toml (`msbctl config`), or `msbctl host managed configure`")]
+    clients = clients_settings(config)
+    problems = []
+    if not isinstance(config.get("clients", {}), dict):
+        problems.append("[clients] is not a table, so it names no client but Kandev: each is a "
+                        "table of its own, [clients.NAME]")
+    if scoped:
+        clients = {scoped: clients.get(scoped) or {"enabled": False}}
+    broken = {n: e.message for n, e in clients.items() if isinstance(e, KandevError)}
+    enabled = sorted(n for n, s in clients.items() if isinstance(s, dict) and s["enabled"])
+    if broken:
+        # Until it is fixed, the proxy keeps the ports a broken table's
+        # sandboxes have open and opens none (after a restart, it has none),
+        # and leases already issued stay valid until they expire. Only the
+        # clients named are stopped: Kandev and the rest go on.
+        problems.append("; ".join(f"{n}: {m}" for n, m in sorted(broken.items()))
+                        + " (each client named answers invalid_config, and the others go on; until "
+                        "a table is fixed, the proxy keeps the ports its sandboxes have open and "
+                        "opens no new ones, none after it restarts, and leases already issued stay "
+                        "valid until they expire)")
+    if problems:
+        out = [_doctor("clients", "warn", "; ".join(problems),
+                       "fix the table named (`msbctl config` shows where), or `msbctl host managed "
+                       "configure --client NAME`")]
+    else:
+        out = [_doctor("clients", "ok", f"enabled: {', '.join(enabled)}" if enabled else "no client is enabled")]
+    if entries is not None and not scoped:
+        out += client_prefix_checks(config, entries)
+    return out
+
+
+def client_prefix_checks(config, entries):
+    """At the host: a warning per client whose name_prefix (its table
+    checking out or not) is already the start of a registered sandbox it does
+    not own, as `host managed configure` refuses to make one. The client's
+    provision of that environment answers conflict (naming nothing), and
+    whether one is there is all the client learns of it; the operator's own
+    sandbox there is best renamed."""
+    taken = []
+    for client in configured_clients(config):
+        prefix = client_prefix_wanted(config, client)
+        names = sorted(n for n, e in entries.items() if prefix and n.startswith(prefix)
+                       and isinstance(e, dict) and entry_client(e) != client)
+        if names:
+            shown = ", ".join(names[:5]) + (", …" if len(names) > 5 else "")
+            taken.append(f"{owner_name(client)}'s name_prefix {prefix!r} is the start of {shown}, "
+                         f"which {owner_name(client)} does not own")
+    if not taken:
+        return []
+    return [_doctor("client-prefixes", "warn", "; ".join(taken) + ": that client's provision of "
+                    "the environment answers conflict, and it learns that the name is taken",
+                    "rename the sandbox (`msbctl rename`), or give the client another name_prefix "
+                    "(`msbctl host managed configure --client NAME --name-prefix PREFIX`)")]
 
 
 # Under the Kandev plugin's key, doctor reports what decides whether Kandev's
@@ -11263,8 +11506,8 @@ def tool_checks(entries):
     out.append(_doctor("fzf", "ok", "fzf is on PATH") if shutil.which("fzf") else
                _doctor("fzf", "warn", "fzf is not on PATH: menus are numbered prompts",
                        "install fzf for the picker (optional)"))
-    if kandev_key():
-        return out      # Kandev delivers its own credentials, through agentctl
+    if key_client():
+        return out      # a client delivers its own credentials, through agentctl
     # The token sandboxes push and use the API with; gh's own login on the host
     # is never used. Names only: stored_env() reads no keyring value.
     holders = [n for n in entries
@@ -11311,14 +11554,14 @@ def storage_checks(config, autostart):
             except OSError:
                 pass    # gone since listdir (a `secret rm`), or a dangling link: nothing to read
         dmode = os.stat(SECRETS_DIR).st_mode & 0o777
-        shown = f"{len(loose)} file(s)" if kandev_key() else ", ".join(loose)
+        shown = f"{len(loose)} file(s)" if key_client() else ", ".join(loose)
         out.append(_doctor("secrets", "ok" if dmode == 0o700 and not loose else "warn",
                            f"{tilde(SECRETS_DIR)} {dmode:04o}" +
                            (f"; not 0600: {shown}" if loose else ", every file 0600"),
                            f"chmod 700 {tilde(SECRETS_DIR)}; chmod 600 {tilde(SECRETS_DIR)}/*"))
     else:
         out.append(_doctor("secrets", "ok", "no secrets stored yet"))
-    if config is not None and not kandev_key():
+    if config is not None and not key_client():
         out.append(secret_store_check(config, autostart))
     return out
 
@@ -11424,7 +11667,7 @@ def hygiene_checks(autostart):
           "`msbctl host authorize` each laptop's key; keep a shell for an sk- key")
     check("restricted", True, "yes: this key runs under host serve"
           if restricted() else "no: this session is unrestricted")
-    if kandev_key():
+    if key_client():
         return out      # autostart is the operator's sandboxes'
     linger = lingering(user)
     unit = os.path.exists(os.path.join(SYSTEMD_USER_DIR, "default.target.wants", AUTOSTART_UNIT))
@@ -11466,13 +11709,15 @@ def registry_checks(config, entries):
     """Each registry entry loads, its folder is there, the agent its keys need
     is reachable, and msb has no sandbox no entry names. Each is about one
     sandbox, so a warning: the host itself can still run the rest.
-    `entries`: doctor_registry(). Under the Kandev key, Kandev's entries
-    alone: those with source = "kandev", and a k- one that does not parse
-    (`add` keeps k- names for Kandev); orphans are VMs with Kandev's label."""
+    `entries`: doctor_registry(). Under a client's key, that client's
+    entries alone (entry_client()), and one that does not parse under its
+    name_prefix (`add` keeps the prefixes for the clients); orphans are VMs
+    with its owner label."""
     out = []
-    scoped = kandev_key()
+    scoped = key_client()
+    prefixes = tuple(p for p, c in client_prefixes() if c == scoped)
     names = [n for n, e in entries.items()
-             if not scoped or (e.get("source") == "kandev" if isinstance(e, dict) else n.startswith("k-"))]
+             if not scoped or (entry_client(e) == scoped if isinstance(e, dict) else n.startswith(prefixes))]
     broken, gone, need_agent = [], [], []
     for name in names:
         if isinstance(entries[name], str):
@@ -11491,7 +11736,7 @@ def registry_checks(config, entries):
         if not box.is_kandev and box.ssh_keys != []:
             need_agent.append(name)
     out.append(_doctor("registry", "warn" if broken else "ok",
-                       f"{len(names)} {'Kandev ' if scoped else ''}sandbox(es) registered" +
+                       f"{len(names)} {owner_name(scoped) + ' ' if scoped else ''}sandbox(es) registered" +
                        (f"; not loading: {'; '.join(broken)}" if broken else ""),
                        f"fix or remove the entry under {tilde(REGISTRY_DIR)}"))
     if gone:
@@ -11505,14 +11750,14 @@ def registry_checks(config, entries):
                            "start an agent and ssh-add a key, or `msbctl keys <name>` → none"))
     if shutil.which("msb") and scoped:
         try:
-            orphans = sorted(set(kandev_labelled()) - set(entries))
+            orphans = sorted(set(managed_labelled(scoped)) - set(entries))
         except KandevError as exc:
-            out.append(_doctor("orphans", "warn", f"cannot list Kandev's VMs: {exc}",
+            out.append(_doctor("orphans", "warn", f"cannot list {owner_name(scoped)}'s VMs: {exc}",
                                "run `msb ls` on the host"))
         else:
             out.append(_doctor("orphans", "warn" if orphans else "ok",
-                               f"Kandev VMs no entry names: {', '.join(orphans)}" if orphans else
-                               "every Kandev VM has a registry entry",
+                               f"{owner_name(scoped)} VMs no entry names: {', '.join(orphans)}" if orphans else
+                               f"every {owner_name(scoped)} VM has a registry entry",
                                "`msbctl host kandev reap` removes them once they are old enough"))
     elif shutil.which("msb"):
         orphans = sorted(set(msb_table()) - set(names))
@@ -11638,15 +11883,17 @@ WantedBy=default.target
 def cmd_host(args, config):
     """host serve|authorize|check|autostart|kandev — running this machine as a remote."""
     if args.action == "serve":
-        host_serve(kandev=args.kandev)
+        host_serve(kandev=args.kandev, client=args.client)
     elif restricted() and args.action != "check":
         die(f"host {args.action} is for the host itself")
     elif args.kandev and args.action not in ("authorize", "serve"):
         die("--kandev goes with host authorize or host serve")
-    elif (any(getattr(args, attr) is not None for attr, _ in KANDEV_CONFIGURE_KEYS)
-          and (args.action, args.arg) != ("kandev", "configure")):
-        die("--enabled, --serve, --proxy-listen, --base-url, --allow-extra and --private-name "
-            "go with host kandev configure")
+    elif args.client and args.action not in ("authorize", "serve", "managed"):
+        die("--client goes with host authorize, host serve or host managed configure")
+    elif (any(getattr(args, attr) is not None for attr in MANAGED_CONFIGURE_FLAGS)
+          and (args.action, args.arg) not in (("kandev", "configure"), ("managed", "configure"))):
+        die("--enabled, --serve, --proxy-listen, --base-url, --allow-extra, --private-name and the "
+            "other configure flags go with host kandev configure or host managed configure")
     elif args.action == "authorize":
         host_authorize(args)
     elif args.action == "check":
@@ -11655,6 +11902,8 @@ def cmd_host(args, config):
         host_autostart(args)
     elif args.action == "kandev":
         host_kandev(args, config)
+    elif args.action == "managed":
+        host_managed(args, config)
 
 
 # ----------------------------------------------------------------- kandev
@@ -11728,7 +11977,9 @@ KANDEV_WORKSPACE_MAX_GIB = 500
 # `serve_ports`: in proxy mode, `serve.ports` lists the public ports the running
 # proxy has open (absent for a proxy too old to say), and `serve.pool_overlap`
 # counts ports in proxy_port_pool that the operator's own sandboxes publish.
-KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports")
+# `managed_namespace`: this host also speaks protocol 2 (`msbctl managed`),
+# where a client can migrate without a flag day.
+KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_namespace")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -11823,58 +12074,231 @@ def parse_iso(text, what="a timestamp"):
     return when.astimezone(dt.timezone.utc)
 
 
-def kandev_settings(config):
-    """[kandev], checked. Every problem is invalid_config, naming the key."""
-    raw = config.get("kandev", {})
+# ------------------------------------------------------------- settings
+#
+# Two scopes. Host-wide keys exist once whatever the clients: there is one
+# proxy, one listen address, one certificate, one lease key and one pair of
+# port pools. They live in [managed]; [kandev] still holds them for a host set
+# up before clients existed, and one key in both is refused. Per-client keys
+# live in [clients.<name>], and Kandev's in [kandev] (or [clients.kandev], but
+# not both). Every client starts from the shipped [kandev] values: today's
+# caps and groups, and enabled = false.
+#
+# Conflicts are read from the OPERATOR's config.toml alone: defaults.toml
+# ships a full [kandev], so the merged config always has one.
 
-    def bad(key, why):
-        raise KandevError("invalid_config", f"[kandev] {key}: {why} (`msbctl config` shows where it is set)")
+MANAGED_HOST_KEYS = ("serve", "proxy_listen", "base_url", "port_pool", "proxy_port_pool")
+# Optional caps summed over every client's sandboxes; only [managed] has them
+# ([kandev] max_sandboxes is Kandev's own cap). Unset: no host-wide cap.
+MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
+CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
+               "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
+               "body_secret_hosts")
+# What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
+KANDEV_FIXED = {"name_prefix": "k-", "env_prefix": "AGENTCTL_", "guest_ports": list(KANDEV_GUEST_PORTS),
+                "require_callback": True, "body_secret_hosts": list(AGENT_TRANSCRIPT_HOSTS)}
+# The keys kandev_settings() has always returned (`host kandev configure --json`).
+KANDEV_SETTINGS_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory_mib", "port_pool",
+                        "proxy_port_pool", "proxy_listen", "base_url", "serve", "rule_groups",
+                        "allow_extra", "allow_extra_entries", "private_names")
+CLIENT_PREFIX = re.compile(r"[a-z][a-z0-9]{0,6}-")
+CLIENT_ENV_PREFIX = re.compile(r"[A-Z][A-Z0-9]*_")
+CLIENT_ENV_PREFIX_REFUSED = ("MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
+CLIENT_MAX_PORTS = 4
 
-    out = {"enabled": raw.get("enabled", False)}
-    if not isinstance(out["enabled"], bool):
-        bad("enabled", "true or false")
-    for key in ("max_sandboxes", "max_cpus"):
-        value = raw.get(key, 0)
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            bad(key, "a whole number, 0 or more")
-        out[key] = value
-    memory = str(raw.get("max_memory", "0M"))
+
+def _settings_bad(table, key, why):
+    raise KandevError("invalid_config", f"[{table}] {key}: {why} (`msbctl config` shows where it is set)")
+
+
+def _operator_layer(operator):
+    """The operator's own config.toml, as given or read now."""
+    return read_toml(CONFIG_FILE) if operator is None else operator
+
+
+def _shipped_layer():
+    return read_toml(DEFAULTS_FILE)
+
+
+def _table(layer, *path):
+    for key in path:
+        layer = layer.get(key) if isinstance(layer, dict) else None
+    return layer if isinstance(layer, dict) else {}
+
+
+def _int_setting(table, key, value):
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        _settings_bad(table, key, "a whole number, 0 or more")
+    return value
+
+
+def _memory_setting(table, value):
+    memory = str(value)
     if not re.fullmatch(r"\d+[MGT]", memory.upper()):
-        bad("max_memory", f"{memory!r} is not a size like 96G")
-    out["max_memory_mib"] = size_bytes(memory) // MIB
+        _settings_bad(table, "max_memory", f"{memory!r} is not a size like 96G")
+    return size_bytes(memory) // MIB
+
+
+# The tracebacks _only_invalid_config() has printed in this process: the
+# proxy reads the config every scan, and says each one once.
+_CONFIG_TRACES = set()
+
+
+def _only_invalid_config(where):
+    """Decorator: a value of a type no check foresaw (a list where a string
+    belongs, an inline table, ...) is invalid_config naming `where(*args,
+    **kwargs)` and the exception's type, never an internal error that would
+    stop every client and the proxy. It may as well be a bug in the check:
+    at the host (the operator's terminal, the reaper's and the proxy's
+    journal) the traceback goes to stderr, once per process. Never under a
+    key, where stderr crosses ssh to a client, and never into the JSON."""
+    def wrap(fn):
+        @functools.wraps(fn)
+        def checked(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except KandevError:
+                raise
+            except Exception as exc:
+                trace = traceback.format_exc()
+                if not restricted() and trace not in _CONFIG_TRACES:
+                    _CONFIG_TRACES.add(trace)
+                    print(trace, end="", file=sys.stderr)
+                raise KandevError("invalid_config", f"{where(*args, **kwargs)} does not check out "
+                                  f"({type(exc).__name__}; `msbctl config` shows where it is "
+                                  "set)") from None
+        return checked
+    return wrap
+
+
+@_only_invalid_config(lambda *_, **__: "the host keys ([managed], or [kandev] before it)")
+def managed_host_settings(config, operator=None):
+    """The host-wide keys, checked: from the operator's [managed], else the
+    operator's [kandev] (a host from before [managed]), else what ships. One
+    key in both of the operator's tables is invalid_config, naming both."""
+    op = _operator_layer(operator)
+    op_managed, op_kandev = _table(op, "managed"), _table(op, "kandev")
+    merged_managed, merged_kandev = _table(config, "managed"), _table(config, "kandev")
+    for key in MANAGED_HOST_KEYS:
+        if key in op_managed and key in op_kandev:
+            raise KandevError("invalid_config", f"{key} is set in both [managed] and [kandev]: keep "
+                              "it in [managed] (`msbctl config` shows where it is set)")
+
+    out = {"host_tables": {}}       # where each host key is set: messages name that table
+
+    def get(key, default):
+        if key in op_managed or key in merged_managed:
+            out["host_tables"][key] = "managed"
+            return "managed", merged_managed.get(key, op_managed.get(key))
+        if key in op_kandev:
+            out["host_tables"][key] = "kandev"
+            return "kandev", merged_kandev.get(key, default)
+        return "kandev", merged_kandev.get(key, default)
 
     def pool(key, default):
-        found = re.fullmatch(r"(\d+)-(\d+)", str(raw.get(key, default)))
+        table, value = get(key, default)
+        found = re.fullmatch(r"(\d+)-(\d+)", str(value))
         if not found or not 1024 <= int(found.group(1)) <= int(found.group(2)) <= 65535 \
-                or int(found.group(2)) - int(found.group(1)) + 1 < len(KANDEV_GUEST_PORTS):
-            bad(key, f"a range like {default}, within 1024-65535, of at least 4 ports")
+                or int(found.group(2)) - int(found.group(1)) + 1 < CLIENT_MAX_PORTS:
+            _settings_bad(table, key, f"a range like {default}, within 1024-65535, of at least 4 ports")
         return int(found.group(1)), int(found.group(2))
 
     out["port_pool"] = pool("port_pool", "20000-29999")
     out["proxy_port_pool"] = pool("proxy_port_pool", "30000-39999")
     if out["port_pool"][0] <= out["proxy_port_pool"][1] and out["proxy_port_pool"][0] <= out["port_pool"][1]:
-        bad("proxy_port_pool", "must not overlap port_pool")
-    listen = str(raw.get("proxy_listen", "")).strip()
+        _settings_bad(get("proxy_port_pool", "")[0], "proxy_port_pool", "must not overlap port_pool")
+    table, listen = get("proxy_listen", "")
+    listen = str(listen).strip()
     if listen:
         try:
             listen = str(ipaddress.ip_address(listen))
         except ValueError:
-            bad("proxy_listen", f"{listen!r} is not an IP address (the tailnet or LAN one to bind)")
+            _settings_bad(table, "proxy_listen", f"{listen!r} is not an IP address (the tailnet or LAN one to bind)")
     out["proxy_listen"] = listen
-    base = str(raw.get("base_url", "")).rstrip("/")
+    table, base = get("base_url", "")
+    base = str(base).rstrip("/")
     if base:
-        parts = urllib.parse.urlsplit(base)
-        if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
-                or parts.path or parts.query or parts.fragment):
-            bad("base_url", "https://host[:port] with no path, query or credentials — Kandev "
-                "refuses any other lease URL")
+        try:
+            parts = urllib.parse.urlsplit(base)
+            usable = (parts.scheme == "https" and parts.hostname and not (
+                parts.username or parts.password or parts.path or parts.query or parts.fragment))
+        except ValueError:              # "https://[x": not a URL at all
+            usable = False
+        if not usable:
+            _settings_bad(table, "base_url", "https://host[:port] with no path, query or credentials — Kandev "
+                          "refuses any other lease URL")
     out["base_url"] = base
-    out["serve"] = raw.get("serve", "proxy")
+    table, out["serve"] = get("serve", "proxy")
     if out["serve"] not in KANDEV_SERVE_MODES:
-        bad("serve", '"proxy", "tailscale" or "none"')
+        _settings_bad(table, "serve", '"proxy", "tailscale" or "none"')
+    # Host totals: [managed] only, each optional (None: no cap).
+    for key in ("max_sandboxes", "max_cpus"):
+        out[f"host_{key}"] = (_int_setting("managed", key, merged_managed[key])
+                              if key in merged_managed else None)
+    out["host_max_memory_mib"] = (_memory_setting("managed", merged_managed["max_memory"])
+                                  if "max_memory" in merged_managed else None)
+    return out
+
+
+def _client_table(config, op, name):
+    """(the table name to report, the operator's raw table) for a client."""
+    if name == "kandev":
+        legacy, new = _table(op, "kandev"), _table(op, "clients", "kandev")
+        if any(k in legacy for k in CLIENT_KEYS) and new:
+            raise KandevError("invalid_config", "Kandev is configured in both [kandev] and "
+                              "[clients.kandev]: keep one (`msbctl config` shows where it is set)")
+        if not new:
+            # [kandev] as merged: the shipped values under the operator's.
+            return "kandev", {k: v for k, v in _table(config, "kandev").items() if k in CLIENT_KEYS}
+        return "clients.kandev", _with_shipped(_table(config, "clients", "kandev"))
+    return f"clients.{name}", _with_shipped(_table(config, "clients", name))
+
+
+def _with_shipped(raw):
+    """A client table over the shipped [kandev] client defaults."""
+    shipped = _table(_shipped_layer(), "kandev")
+    return {**{k: v for k, v in shipped.items() if k in CLIENT_KEYS}, **raw}
+
+
+@_only_invalid_config(lambda config, name, operator=None: "[kandev]" if name == "kandev" else f"[clients.{name}]")
+def client_settings(config, name, operator=None):
+    """One client's keys, checked: Kandev's from [kandev] (or [clients.kandev]),
+    another's from [clients.<name>], each over the shipped [kandev] defaults.
+    Kandev's name_prefix, env_prefix, guest_ports, require_callback and
+    body_secret_hosts are fixed (protocol 1 is frozen); another value for any
+    of them is refused."""
+    problem = client_name_problem(name) if name != "kandev" else None
+    if problem:
+        raise KandevError("invalid_config", f"[clients.{name}]: {problem}")
+    listed = config.get("clients")
+    if isinstance(listed, dict) and name in listed and not isinstance(listed[name], dict):
+        raise KandevError("invalid_config", f"[clients] {name}: a client is a table, [clients.{name}]")
+    op = _operator_layer(operator)
+    table, raw = _client_table(config, op, name)
+
+    def bad(key, why):
+        _settings_bad(table, key, why)
+
+    if table.startswith("clients."):
+        # One proxy, one address, one pair of pools for every client: a host
+        # key here would be silently someone else's, so it is refused.
+        stray = sorted(k for k in raw if k in MANAGED_HOST_KEYS)
+        if stray:
+            bad(stray[0], "a host key, shared by every client: put it in [managed] (or in [kandev] "
+                "on a host set up before [managed])")
+        unknown = sorted(k for k in raw if k not in CLIENT_KEYS)
+        if unknown:
+            bad(unknown[0], f"not a client key; one of {', '.join(CLIENT_KEYS)}")
+    out = {"client": name, "table": table, "enabled": raw.get("enabled", False)}
+    if not isinstance(out["enabled"], bool):
+        bad("enabled", "true or false")
+    for key in ("max_sandboxes", "max_cpus"):
+        out[key] = _int_setting(table, key, raw.get(key, 0))
+    out["max_memory_mib"] = _memory_setting(table, raw.get("max_memory", "0M"))
     groups = raw.get("rule_groups", [])
     known = config.get("rules", {})
-    if not isinstance(groups, list) or any(g not in known for g in groups):
+    known = known if isinstance(known, dict) else {}
+    if not isinstance(groups, list) or any(not isinstance(g, str) or g not in known for g in groups):
         bad("rule_groups", f"a list of rule groups; known: {', '.join(sorted(known))}")
     out["rule_groups"] = [g for g in groups if g != "base"]
     extra = raw.get("allow_extra", [])
@@ -11882,8 +12306,8 @@ def kandev_settings(config):
                for p in (extra if isinstance(extra, list) else [None])]
     if None in entries:
         bad("allow_extra", 'a list of "*", hostname patterns ("pypi.org", "*.example.com"), '
-            'addresses ("192.168.2.6"), address:port ("192.168.2.6:8788", "[fd00::1]:22") '
-            'and CIDRs ("192.168.2.0/24")')
+            'addresses ("192.0.2.6"), address:port ("192.0.2.6:8788", "[fd00::1]:22") '
+            'and CIDRs ("192.0.2.0/24")')
     for entry, text in zip(entries, extra, strict=True):
         if entry[0] == "net" and entry[1].prefixlen < KANDEV_CIDR_MIN[entry[1].version]:
             bad("allow_extra", f"{text} is wider than /{KANDEV_CIDR_MIN[entry[1].version]}")
@@ -11895,7 +12319,166 @@ def kandev_settings(config):
             or n.strip().startswith("*.") for n in names):
         bad("private_names", 'a list of exact hostnames ("git.example.com"), no patterns or addresses')
     out["private_names"] = [n.strip().lower() for n in names]
+
+    if name == "kandev":
+        for key, fixed in KANDEV_FIXED.items():
+            if key in raw and raw[key] != fixed:
+                bad(key, f"fixed for Kandev at {toml_literal(fixed)} (protocol 1 does not change)")
+        out.update({k: (list(v) if isinstance(v, list) else v) for k, v in KANDEV_FIXED.items()})
+        return out
+
+    prefix = raw["name_prefix"] if "name_prefix" in raw else default_client_prefix(name)
+    if prefix is None:
+        bad("name_prefix", "set one: the default, k-, is Kandev's")
+    if not isinstance(prefix, str) or not CLIENT_PREFIX.fullmatch(prefix):
+        bad("name_prefix", 'a-z, then up to 6 of a-z 0-9, then "-" (like "c-")')
+    if prefix == KANDEV_FIXED["name_prefix"]:
+        # Kandev's on every host, its table set or not: never a clash Kandev is at fault for.
+        bad("name_prefix", 'k- is always Kandev\'s: pick another (like "kb-")')
+    out["name_prefix"] = prefix
+    env_prefix = raw.get("env_prefix", "AGENTCTL_")
+    if not isinstance(env_prefix, str) or not CLIENT_ENV_PREFIX.fullmatch(env_prefix) \
+            or env_prefix.startswith(CLIENT_ENV_PREFIX_REFUSED) or len(env_prefix) > 32:
+        bad("env_prefix", 'A-Z first, then A-Z 0-9, ending in "_" (like "CI_"); never MSB_, '
+            "MSBCTL_, LD_, SSH_, XDG_ or LC_")
+    out["env_prefix"] = env_prefix
+    ports = raw.get("guest_ports", list(KANDEV_GUEST_PORTS))
+    problem = guest_ports_problem(ports)
+    if problem:
+        bad("guest_ports", problem)
+    out["guest_ports"] = list(ports)
+    out["require_callback"] = raw.get("require_callback", False)
+    if not isinstance(out["require_callback"], bool):
+        bad("require_callback", "true or false")
+    hosts = raw.get("body_secret_hosts", [])
+    if not isinstance(hosts, list) or any(
+            not isinstance(h, str) or not HOSTNAME.fullmatch(h) or h.startswith("*.") for h in hosts):
+        bad("body_secret_hosts", "a list of exact, lowercase hostnames")
+    # Reachable on some port: an address:port in allow_extra reaches that address.
+    any_port = [(kind, value, None) for kind, value, _ in entries]
+    for host in hosts:
+        if host not in out["private_names"] and not kandev_target_allowed(host, any_port) \
+                and not rule_groups_allow(host, ["base", *groups], known):
+            bad("body_secret_hosts", f"{host} is in none of allow_extra, rule_groups or private_names: "
+                "a placeholder may only travel to a host this client can reach")
+    out["body_secret_hosts"] = list(hosts)
     return out
+
+
+def default_client_prefix(name):
+    """A client's name_prefix when its table names none: its first letter and
+    "-", but never Kandev's k-: a name starting with k takes its next letter
+    or digit too (kube: ku-). None when there is none (k must set one)."""
+    if name[0] != "k":
+        return f"{name[0]}-"
+    rest = name[1:].replace("-", "")
+    return f"k{rest[0]}-" if rest else None
+
+
+def client_prefix_wanted(config, name):
+    """The name_prefix [clients.<name>] asks for, read even when the rest of
+    its table does not check out (so no other client may take it meanwhile),
+    or None when it names none that could be one."""
+    if name == "kandev":
+        return KANDEV_FIXED["name_prefix"]
+    if client_name_problem(name):
+        return None
+    raw = _table(config, "clients", name)
+    prefix = raw["name_prefix"] if "name_prefix" in raw else default_client_prefix(name)
+    return prefix if isinstance(prefix, str) and CLIENT_PREFIX.fullmatch(prefix) else None
+
+
+def rule_groups_allow(host, groups, rules):
+    """Whether one of these [rules] groups allows `host`, on any port: an
+    allow@ rule naming it, or a *.suffix it is under."""
+    for group in groups:
+        lines = rules.get(group, [])
+        for line in lines if isinstance(lines, list) else []:
+            for rule in str(line).split(","):
+                action, _, target = rule.strip().partition("@")
+                fields = _split_rule_target(target) if action == "allow" else None
+                pattern = fields[0].lower() if fields else ""
+                if "." in pattern and (host == pattern or (
+                        pattern.startswith("*.") and host.endswith(pattern[1:]))):
+                    return True
+    return False
+
+
+def guest_ports_problem(ports):
+    """Why `ports` is not a list of guest ports to publish, or None."""
+    if not isinstance(ports, list) or not 1 <= len(ports) <= CLIENT_MAX_PORTS or any(
+            not isinstance(p, int) or isinstance(p, bool) or not 1024 <= p <= 65535 for p in ports):
+        return f"1 to {CLIENT_MAX_PORTS} guest ports, each 1024-65535"
+    if len(set(ports)) != len(ports):
+        return "a port is listed twice"
+    return None
+
+
+def configured_clients(config):
+    """Every client name this host knows: kandev, and each [clients.<name>]."""
+    names = ["kandev"]
+    for name in _table(config, "clients"):
+        if name != "kandev":
+            names.append(name)
+    return names
+
+
+def clients_settings(config, operator=None):
+    """{name: settings, or the KandevError that client's table has}, for
+    Kandev and every [clients.<name>]. Every problem is the problem of the
+    client(s) it concerns, and stops no one else: a table whose name is not a
+    client name, an entry under [clients] that is not a table, and one name
+    prefix shared by two clients make each client involved invalid_config.
+    Kandev's k- is no one else's (client_settings() refuses it there, as that
+    client's own problem), so a clash between other clients never stops
+    Kandev. A [clients] that is not a table at all names no client: Kandev
+    alone."""
+    def clash(message):
+        # A client's key sees nothing of the others, their names and prefixes included.
+        if key_client():
+            message = ("this client's name_prefix clashes with another client's: the operator's "
+                       "`msbctl doctor` names it")
+        return KandevError("invalid_config", message)
+
+    out = {}
+    for name in configured_clients(config):
+        try:
+            out[name] = client_settings(config, name, operator)
+        except KandevError as exc:
+            out[name] = exc
+        except Exception:               # a value no check foresaw: still this client's alone
+            out[name] = KandevError("invalid_config", f"[{'kandev' if name == 'kandev' else 'clients.' + name}] "
+                                    "does not check out (`msbctl config` shows where it is set)")
+    # Every prefix a table asks for, its table checking out or not: a broken
+    # one keeps its prefix, so no other client takes it while it is fixed.
+    asked = [(n, s["name_prefix"] if isinstance(s, dict) else client_prefix_wanted(config, n))
+             for n, s in out.items() if n != "kandev"]
+    asked = [(n, p) for n, p in asked if p and p != KANDEV_FIXED["name_prefix"]]
+    for name, prefix in asked:
+        for other, theirs in asked:
+            # Equal or not at all: each prefix ends at its one "-". A table
+            # with a problem of its own keeps that one, the more specific.
+            if name != other and theirs == prefix and isinstance(out[name], dict):
+                out[name] = clash(f"[clients.{name}] name_prefix {prefix!r} is also "
+                                  f"[clients.{other}]'s: one client's names would be another's")
+                break
+    return out
+
+
+def kandev_settings(config, operator=None):
+    """Kandev's view, checked: the host-wide keys and Kandev's own, as one
+    dict of exactly the keys it has always had. Every problem is
+    invalid_config, naming the key."""
+    merged = {**managed_host_settings(config, operator), **client_settings(config, "kandev", operator)}
+    return {k: merged[k] for k in KANDEV_SETTINGS_KEYS}
+
+
+def host_table(settings, key):
+    """The table a message names for host key `key`: [kandev] in Kandev's
+    (protocol 1's words, pinned), else the one it is set in, or [managed]."""
+    if settings.get("client", "kandev") == "kandev":
+        return "kandev"
+    return settings.get("host_tables", {}).get(key, "managed")
 
 
 # The widest CIDR [kandev] allow_extra may name, per IP version, as the
@@ -11958,14 +12541,76 @@ def kandev_target_allowed(target, entries):
     return False
 
 
-def kandev_name(env):
-    """The msb sandbox name for a Kandev environment id. `k-<env>` when that
-    is already a valid, short sandbox name (no lowercasing, so two ids that
-    differ only in case cannot meet), else `k-` and 24 hex digits of its hash."""
-    name = f"k-{env}"
+@dataclasses.dataclass(frozen=True)
+class Dialect:
+    """How one client speaks: the only place protocol 1 and 2 differ.
+
+    protocol 1 is `msbctl kandev`, frozen: what the Kandev plugin was built
+    against, byte for byte (tests/golden/protocol1). protocol 2 is `msbctl
+    managed`, for any client, Kandev included: the same verbs, with the
+    client's own prefixes and ports, an optional callback, and `client` in
+    every record."""
+    protocol: int
+    client: str
+    row_key: str                # what ls/show --json put the record under
+    callback_keys: tuple        # request keys naming the client's own API
+    callback_required: bool
+    env_prefix: str             # agentctl's env keys, and its nonce variable
+    default_ports: tuple        # guest ports published when a request names none
+    guest_ports_settable: bool  # whether a request may name them
+    agentctl_path: str
+    record_has_client: bool
+    name_prefix: str
+    body_secret_hosts: tuple    # where a secret's placeholder may travel in a body
+
+    @property
+    def owner(self):
+        """Its name for people: Kandev, or the client's table name."""
+        return "Kandev" if self.client == "kandev" else self.client
+
+
+KANDEV_DIALECT = Dialect(
+    protocol=1, client="kandev", row_key="kandev", callback_keys=("kandev_api",),
+    callback_required=True, env_prefix="AGENTCTL_", default_ports=KANDEV_GUEST_PORTS,
+    guest_ports_settable=False, agentctl_path=GUEST_AGENTCTL, record_has_client=False,
+    name_prefix="k-", body_secret_hosts=AGENT_TRANSCRIPT_HOSTS)
+
+
+def managed_dialect(settings):
+    """Protocol 2 for one client, from its checked settings (client_settings())."""
+    client = settings["client"]
+    return Dialect(
+        protocol=2, client=client, row_key="kandev" if client == "kandev" else "record",
+        callback_keys=("callback", "kandev_api"), callback_required=settings["require_callback"],
+        env_prefix=settings["env_prefix"], default_ports=tuple(settings["guest_ports"]),
+        # Kandev's entries keep protocol 1's four ports: its agentctl is the first.
+        guest_ports_settable=client != "kandev", agentctl_path=f"/opt/{client}/agentctl",
+        record_has_client=True,
+        name_prefix=settings["name_prefix"], body_secret_hosts=tuple(settings["body_secret_hosts"]))
+
+
+def owner_labels(client, env):
+    """The msb labels a client's VM carries: its owner, and its environment.
+    Kandev's are what they have always been (kandev.env=)."""
+    if client == "kandev":
+        return [KANDEV_OWNER_LABEL, f"kandev.env={env}"]
+    return [f"msbctl.owner={client}", f"msbctl.env={env}"]
+
+
+def managed_name(prefix, env):
+    """The msb sandbox name for a client's environment id. `<prefix><env>`
+    when that is already a valid, short sandbox name (no lowercasing, so two
+    ids that differ only in case cannot meet), else the prefix and 24 hex
+    digits of its hash."""
+    name = f"{prefix}{env}"
     if SANDBOX_NAME.fullmatch(name) and len(name) <= KANDEV_NAME_MAX:
         return name
-    return "k-" + hashlib.sha256(env.encode()).hexdigest()[:24]
+    return prefix + hashlib.sha256(env.encode()).hexdigest()[:24]
+
+
+def kandev_name(env):
+    """The msb sandbox name for a Kandev environment id (managed_name())."""
+    return managed_name("k-", env)
 
 
 def kandev_check_env(env):
@@ -11974,35 +12619,51 @@ def kandev_check_env(env):
     return env
 
 
-def kandev_entries():
-    """[(name, entry)] for every Kandev entry, and nothing else."""
+def managed_entries(client=None):
+    """[(name, entry)] for every managed entry of `client`, or of every
+    client when None; never one of the operator's."""
     found = []
     for name in registered():
         try:
             entry = read_toml(registry_path_for(name))
         except SystemExit:
             continue
-        if entry.get("source") == "kandev":
+        owner = entry_client(entry)
+        if owner is not None and (client is None or owner == client):
             found.append((name, entry))
     return found
 
 
-def kandev_lookup(env):
-    """(name, entry) of the Kandev entry for `env`, or None. A file under that
-    name that is not Kandev's — an operator sandbox called k-something — is
-    reported as absent here, never touched."""
-    name = kandev_name(kandev_check_env(env))
+def kandev_entries():
+    """[(name, entry)] for every Kandev entry, and nothing else."""
+    return managed_entries("kandev")
+
+
+def managed_lookup(dialect, env):
+    """(name, entry) of the client's entry for `env`, or None. A file under
+    that name that is not this client's — an operator sandbox called
+    k-something, or another client's — is reported as absent here, never
+    touched."""
+    name = managed_name(dialect.name_prefix, kandev_check_env(env))
     entry = read_toml(registry_path_for(name)) if os.path.exists(registry_path_for(name)) else {}
-    if entry.get("source") == "kandev" and entry.get("kandev_env") == env:
+    if entry_client(entry) == dialect.client and entry_env(entry) == env:
         return name, entry
     return None
 
 
-def kandev_need(env):
-    found = kandev_lookup(env)
+def kandev_lookup(env):
+    return managed_lookup(KANDEV_DIALECT, env)
+
+
+def managed_need(dialect, env):
+    found = managed_lookup(dialect, env)
     if not found:
-        raise KandevError("not_found", "no kandev entry for that environment")
+        raise KandevError("not_found", f"no {dialect.client} entry for that environment")
     return found
+
+
+def kandev_need(env):
+    return managed_need(KANDEV_DIALECT, env)
 
 
 @contextlib.contextmanager
@@ -12071,19 +12732,30 @@ def kandev_state(name, entry, table):
     return "running" if vm == "running" else "stopped"
 
 
-def kandev_record(name, entry, table=None, live=False):
-    """The document provision, start and expiry return, and `kandev` in what
-    `ls --json` and `show --json` (agentctl checked live) say of one.
-    Names, ports and timestamps only: no value of any kind of secret."""
+def agentctl_port(entry):
+    """The guest port agentctl answers on: Kandev's fixed control port, or
+    the first port a client's sandbox publishes."""
+    ports = kandev_ports(entry)
+    if entry_client(entry) == "kandev":
+        return KANDEV_GUEST_PORTS[0]
+    return next(iter(ports), None)
+
+
+def kandev_record(name, entry, table=None, live=False, client=False):
+    """The document provision, start and expiry return, and the record in
+    what `ls --json` and `show --json` (agentctl checked live) say of one.
+    `client`: add the client's name (protocol 2). Names, ports and
+    timestamps only: no value of any kind of secret."""
     table = msb_table() if table is None else table
     state = kandev_state(name, entry, table)
     ports = kandev_ports(entry)
     running = bool(entry.get("agentctl_running", False))
     if live:
-        running = state == "running" and KANDEV_GUEST_PORTS[0] in ports \
-            and kandev_probe(ports[KANDEV_GUEST_PORTS[0]])
+        port = agentctl_port(entry)
+        running = state == "running" and port in ports and kandev_probe(ports[port])
     return {"record": {
-        "env": entry.get("kandev_env", ""), "name": name,
+        **({"client": entry_client(entry)} if client else {}),
+        "env": entry_env(entry), "name": name,
         "operation_id": entry.get("operation_id", ""), "input_digest": entry.get("input_digest", ""),
         "state": state, "platform": host_platform(), "image": entry.get("image", ""),
         "created_at": entry.get("created_at", ""), "expires_at": entry.get("expires_at", ""),
@@ -12094,16 +12766,21 @@ def kandev_record(name, entry, table=None, live=False):
     }}
 
 
-def kandev_usage(table):
-    """(sandboxes, cpus, memory MiB) used by Kandev entries that are not absent."""
+def managed_usage(table, client=None):
+    """(sandboxes, cpus, memory MiB) used by a client's entries that are not
+    absent, or by every client's (None: what the [managed] totals cap)."""
     count = cpus = mem = 0
-    for name, entry in kandev_entries():
+    for name, entry in managed_entries(client):
         if kandev_state(name, entry, table) == "absent":
             continue
         count += 1
         cpus += int(entry.get("cpus", 0))
         mem += size_bytes(entry.get("memory", "0M")) // MIB
     return count, cpus, mem
+
+
+def kandev_usage(table):
+    return managed_usage(table, "kandev")
 
 
 def kandev_read_header(allow_empty=False):
@@ -12122,16 +12799,18 @@ def kandev_read_header(allow_empty=False):
     return header
 
 
-def kandev_name_problem(name):
+def kandev_name_problem(name, env_prefix="AGENTCTL_"):
+    """Why a request's secret or env var may not take `name`, or None. A
+    client's own env_prefix is agentctl's, so it is reserved too."""
     if not isinstance(name, str) or not ENV_NAME.fullmatch(name):
         return f"{name!r} is not a variable name (A-Z, 0-9, _)"
     if is_reserved_var(name) or name in KANDEV_RESERVED_NAMES \
-            or name.startswith(KANDEV_RESERVED_PREFIXES):
+            or name.startswith(KANDEV_RESERVED_PREFIXES + (env_prefix,)):
         return f"{name} is reserved"
     return None
 
 
-def kandev_bound_values(raw, field="secrets"):
+def kandev_bound_values(raw, field="secrets", env_prefix="AGENTCTL_"):
     """({name: value}, [(name, [hosts])]) from a request, checked. Two
     structures on purpose: what is written to the entry is built from the
     second alone, which never held a value."""
@@ -12144,7 +12823,7 @@ def kandev_bound_values(raw, field="secrets"):
         if not isinstance(item, dict):
             raise KandevError("invalid_config", f"each of {field} is an object")
         name, value, hosts = item.get("name"), item.get("value"), item.get("hosts")
-        problem = kandev_name_problem(name)
+        problem = kandev_name_problem(name, env_prefix)
         if problem:
             raise KandevError("invalid_config", f"secret {problem}")
         if name in seen:
@@ -12224,6 +12903,7 @@ def kandev_pull(image, registry):
 
 def kandev_egress(raw, settings):
     """Net rules for a request's `egress_allow`, each allowed by allow_extra."""
+    table = settings.get("table", "kandev")
     if raw is None:
         return []
     if not isinstance(raw, list) or any(not isinstance(t, str) for t in raw):
@@ -12234,7 +12914,7 @@ def kandev_egress(raw, settings):
             raise KandevError("invalid_config", f"{target!r}: give a host or host:port, not a rule")
         rule = _kandev_try(parse_allow_target, target)
         if not kandev_target_allowed(target, settings["allow_extra_entries"]):
-            raise KandevError("invalid_config", f"{target} is not allowed by [kandev] allow_extra")
+            raise KandevError("invalid_config", f"{target} is not allowed by [{table}] allow_extra")
         rules.append(rule)
     return rules
 
@@ -12250,10 +12930,11 @@ def kandev_private_names(raw, settings, egress_allow):
         raise KandevError("invalid_config", "private_names must be a list of hostnames")
     allowed = {_split_rule_target(t.strip())[0].lower() for t in egress_allow or []
                if isinstance(t, str)}
+    table = settings.get("table", "kandev")
     names = []
     for name in (n.strip().lower() for n in raw):
         if name not in settings["private_names"]:
-            raise KandevError("invalid_config", f"{name} is not allowed by [kandev] private_names")
+            raise KandevError("invalid_config", f"{name} is not allowed by [{table}] private_names")
         if name not in allowed:
             raise KandevError("invalid_config", f"private_names: {name} is not in egress_allow")
         if name not in names:
@@ -12282,22 +12963,29 @@ def kandev_private_order(rules, base_count, names):
     return base + first + addresses + [KANDEV_PRIVATE_DENY] + rest
 
 
-def kandev_api(raw):
-    """(host, address, port, rule) for the Kandev API. The host is resolved
+def kandev_api(raw, key="kandev_api", before_resolving=None):
+    """(host, address, port, rule) for the Kandev API, or a client's callback
+    (`key` names it in errors). The host is resolved
     HERE and the rule names that one address, so the guest needs no DNS answer
     for it: a MagicDNS name resolves to 100.x, which msb's DNS rebind protection
     would otherwise drop, and turning that protection off for the whole VM is
-    the alternative this avoids. The name goes in the guest's /etc/hosts."""
+    the alternative this avoids. For a client's callback, request_callback()
+    then checks that address against the client's allow_extra, where a 100.x
+    answer to a pattern needs the name in private_names. The name goes in the
+    guest's /etc/hosts. `before_resolving(host, port)`, if given, may refuse a name first, so
+    the host never looks it up."""
     if not isinstance(raw, dict) or not isinstance(raw.get("host"), str):
-        raise KandevError("invalid_config", "kandev_api needs a host")
+        raise KandevError("invalid_config", f"{key} needs a host")
     host, port = raw["host"].strip().lower(), raw.get("port", 443)
     if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
-        raise KandevError("invalid_config", "kandev_api.port is 1-65535")
+        raise KandevError("invalid_config", f"{key}.port is 1-65535")
     try:
         addr = str(ipaddress.ip_address(host))
     except ValueError:
         if not HOSTNAME.fullmatch(host) or host.startswith("*."):
-            raise KandevError("invalid_config", f"kandev_api.host {host!r} is not a hostname") from None
+            raise KandevError("invalid_config", f"{key}.host {host!r} is not a hostname") from None
+        if before_resolving is not None:
+            before_resolving(host, port)
         try:
             infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
         except OSError:
@@ -12308,17 +12996,22 @@ def kandev_api(raw):
 
 
 def kandev_pin_api(name, entry):
-    """Put the Kandev API's name in the guest's /etc/hosts, at the address its
-    egress rule names. On every boot: msb writes a fresh /etc/hosts each time
-    a sandbox starts, so a line added once is gone after a restart."""
-    host, addr = entry.get("kandev_api", ""), entry.get("kandev_api_ip", "")
+    """Put the Kandev API's name (a client's callback) in the guest's
+    /etc/hosts, at the address its egress rule names. On every boot: msb
+    writes a fresh /etc/hosts each time a sandbox starts, so a line added once
+    is gone after a restart. Nothing for a sandbox with no callback."""
+    if entry_client(entry) == "kandev":
+        host, addr = entry.get("kandev_api", ""), entry.get("kandev_api_ip", "")
+    else:
+        host, addr = entry.get("callback", ""), entry.get("callback_ip", "")
     if not host or host == addr:
         return
     proc = run(["msb", "exec", name, "--no-tty", "--", "sh", "-c",
                 'grep -qs " $2$" /etc/hosts || printf "%s %s\\n" "$1" "$2" >> /etc/hosts',
                 "_", addr, host], check=False, quiet=True)
     if proc.returncode != 0:
-        raise KandevError("unavailable", "could not write the Kandev API host into the guest")
+        raise KandevError("unavailable", "could not write the Kandev API host into the guest"
+                          if entry_client(entry) == "kandev" else "could not write the callback host into the guest")
 
 
 def registry_port_claims():
@@ -12336,7 +13029,7 @@ def registry_port_claims():
                 yield name, entry, int(parse_port_spec(spec)[2])
             except (SystemExit, ValueError):
                 continue
-        if entry.get("source") == "kandev":
+        if entry_client(entry) is not None:
             for port in kandev_proxy_ports(entry).values():
                 yield name, entry, port
 
@@ -12356,15 +13049,19 @@ def kandev_pool_overlap(settings, key):
     low, high = settings[key]
     out = {}
     for name, entry, port in registry_port_claims():
-        if entry.get("source") != "kandev" and low <= port <= high:
+        if entry_client(entry) is None and low <= port <= high:
             out.setdefault(port, []).append(name)
     return {port: sorted(set(names)) for port, names in sorted(out.items())}
 
 
 def kandev_alloc_ports(settings):
-    """Four free host ports from the pool: not named by any registry entry (any
-    source, so the operator's own published ports are avoided too) and free to
-    bind right now. Under kandev_lock()."""
+    return alloc_ports(settings, len(KANDEV_GUEST_PORTS))
+
+
+def alloc_ports(settings, count):
+    """`count` free host ports from the pool: not named by any registry entry
+    (any source, so the operator's own published ports are avoided too) and
+    free to bind right now. Under kandev_lock()."""
     used = registry_host_ports()
     got = []
     low, high = settings["port_pool"]
@@ -12377,15 +13074,18 @@ def kandev_alloc_ports(settings):
             except OSError:
                 continue
         got.append(port)
-        if len(got) == len(KANDEV_GUEST_PORTS):
+        if len(got) == count:
             return got
-    raise KandevError("rate_limited", "no free host ports left in [kandev] port_pool", 30)
+    raise KandevError("rate_limited", f"no free host ports left in [{host_table(settings, 'port_pool')}] "
+                      "port_pool", 30)
 
 
 def kandev_proxy_ports(entry):
-    """{guest port: public TLS port} from the entry's `proxy_ports` specs."""
+    """{guest port: public TLS port} from the entry's `proxy_ports` specs.
+    Anything but a list of them (a hand edit) is no one's port."""
     out = {}
-    for spec in entry.get("proxy_ports", []):
+    specs = entry.get("proxy_ports", []) if isinstance(entry, dict) else []
+    for spec in specs if isinstance(specs, list) else []:
         found = re.fullmatch(r"(\d{1,5}):(\d{1,5})", str(spec))
         if found:                       # anything else is no one's port
             out[int(found.group(2))] = int(found.group(1))
@@ -12393,8 +13093,12 @@ def kandev_proxy_ports(entry):
 
 
 def kandev_alloc_proxy_ports(settings):
-    """Four public TLS ports from proxy_port_pool: named by no Kandev entry and
-    not in use on proxy_listen. Under kandev_lock(). An address that is not up
+    return alloc_proxy_ports(settings, len(KANDEV_GUEST_PORTS))
+
+
+def alloc_proxy_ports(settings, count):
+    """`count` public TLS ports from proxy_port_pool: named by no registry
+    entry and not in use on proxy_listen. Under kandev_lock(). An address that is not up
     yet (tailscale still starting) proves nothing either way, so only "in use"
     rules a port out; the proxy binds it once the address exists."""
     used = registry_host_ports()
@@ -12413,9 +13117,10 @@ def kandev_alloc_proxy_ports(settings):
                     if exc.errno == errno.EADDRINUSE:
                         continue
         got.append(port)
-        if len(got) == len(KANDEV_GUEST_PORTS):
+        if len(got) == count:
             return got
-    raise KandevError("rate_limited", "no free ports left in [kandev] proxy_port_pool", 30)
+    raise KandevError("rate_limited", "no free ports left in "
+                      f"[{host_table(settings, 'proxy_port_pool')}] proxy_port_pool", 30)
 
 
 def kandev_entry_serve(entry):
@@ -12519,16 +13224,18 @@ def kandev_restart_proxy(installed, wait=10.0):
             "if its unit runs an old path"}
 
 
-def kandev_serve_ok(settings, tls):
-    """health's `serve`. `tls` is (document, problem) from kandev_tls_status()."""
+def kandev_serve_ok(settings, tls, client="kandev"):
+    """health's `serve`. `tls` is (document, problem) from kandev_tls_status().
+    `client`: whose health it is; the proxy ports it reports are never
+    another client's."""
     mode = settings["serve"]
     if mode == "none":
         return {"ok": True, "mode": "none"}
     if mode == "proxy":
         running = kandev_proxy_running()
         reasons = [why for bad, why in (
-            (not settings["proxy_listen"], "[kandev] proxy_listen is not set"),
-            (not settings["base_url"], "[kandev] base_url is not set"),
+            (not settings["proxy_listen"], f"[{host_table(settings, 'proxy_listen')}] proxy_listen is not set"),
+            (not settings["base_url"], f"[{host_table(settings, 'base_url')}] base_url is not set"),
             (not tls[0]["installed"], "no certificate yet: the plugin installs one with `kandev tls install`"),
             (tls[0]["installed"] and tls[1], tls[1]),
             (not running, "the proxy is not running (`msbctl host kandev install` sets it up)"),
@@ -12541,6 +13248,11 @@ def kandev_serve_ok(settings, tls):
         # port, and nothing at all while no Kandev sandbox exists, so an empty
         # list with `running` is a healthy, idle proxy.
         ports = kandev_proxy_open_ports(version) if running else None
+        if ports is not None:
+            # Never another client's: what they publish is none of this one's business.
+            theirs = {p for _, e in managed_entries() if entry_client(e) != client
+                      for p in kandev_proxy_ports(e).values()}
+            ports = [p for p in ports if p not in theirs]
         # Counted, never named: the plugin's key sees none of the operator's sandboxes.
         overlap = len(kandev_pool_overlap(settings, "proxy_port_pool"))
         return {"ok": not reasons, "mode": "proxy", "listen": settings["proxy_listen"],
@@ -12800,7 +13512,12 @@ def kandev_token_ok(keys, token, name, guest, incarnation, now=None):
 
 def kandev_labelled(fmt_json=False):
     """Names (or rows) of every VM carrying the Kandev owner label."""
-    argv = ["msb", "ls", "--label", KANDEV_OWNER_LABEL] + (["--format", "json"] if fmt_json else ["-q"])
+    return managed_labelled("kandev", fmt_json)
+
+
+def managed_labelled(client, fmt_json=False):
+    """Names (or rows) of every VM carrying `client`'s owner label."""
+    argv = ["msb", "ls", "--label", owner_labels(client, "")[0]] + (["--format", "json"] if fmt_json else ["-q"])
     proc = run(argv, check=False, capture=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb ls --label failed")
@@ -12883,9 +13600,9 @@ def kandev_restart_proxy_verb(args, config, settings):
     return {"proxy": proxy}
 
 
-def kandev_health(args, config, settings):
+def kandev_health(args, config, settings, client="kandev"):
     table = msb_table()
-    count, cpus, mem = kandev_usage(table)
+    count, cpus, mem = managed_usage(table, client)
     tls = kandev_tls_status(settings)
     return {
         "protocol": KANDEV_PROTOCOL, "features": list(KANDEV_FEATURES),
@@ -12896,7 +13613,7 @@ def kandev_health(args, config, settings):
         "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
                      "max_cpus": settings["max_cpus"], "cpus": cpus,
                      "max_memory_mib": settings["max_memory_mib"], "memory_mib": mem},
-        "serve": kandev_serve_ok(settings, tls),
+        "serve": kandev_serve_ok(settings, tls, client),
         "tls": tls[0],
         # The operator's own policy, not a secret: the plugin's Test checks its
         # default egress against it, since one refused entry refuses a whole
@@ -12916,23 +13633,120 @@ def _int_field(req, key, low, high, default=None):
 
 
 def kandev_provision(args, config, settings):
+    return managed_provision(args, config, settings, KANDEV_DIALECT)
+
+
+def callback_address_public(addr):
+    """Whether a name may answer with `addr` through msb's DNS rebind filter
+    (what KANDEV_PRIVATE_DENY stands in for when it is off): a global unicast
+    address outside every reserved range that filter drops. Not loopback,
+    link-local, RFC 1918, CGNAT (100.64.0.0/10), ULA or multicast."""
+    ip = ipaddress.ip_address(addr)
+    reserved = (ipaddress.ip_network(t.partition("@")[2]) for t in KANDEV_PRIVATE_DENY.split(",")
+                if t.partition("@")[2][:1].isdigit())
+    return ip.is_global and not ip.is_multicast and not any(ip in net for net in reserved)
+
+
+def request_callback(req, dialect, settings):
+    """(host, address, port, rule) for the request's callback, or None.
+    Protocol 1 needs `kandev_api`; protocol 2 takes `callback` (`kandev_api`
+    is its alias), optional unless the client sets require_callback. A
+    client that is never called back sends none: then no rule names it and
+    nothing is pinned in the guest's /etc/hosts, which would keep msb from
+    substituting a secret for that name (see `kandev_pin_api`).
+
+    A callback is egress: its rule lets the guest reach that address and port.
+    Kandev's is its trusted API, as it has always been. Any other client's
+    must be admitted by its own allow_extra. An address is admitted by an
+    address or CIDR entry (any port), an address:port entry (that port), or
+    `*`, which admits any address, private and reserved ones included. A
+    name is admitted when an address, CIDR or address:port entry covers the
+    address it resolves to here, which is the operator's explicit choice.
+    Otherwise it needs a hostname pattern that matches it, at any port, and
+    for a name `*` counts as a pattern. Then it gets no more than the same
+    name in `egress_allow` would: the address must be public
+    (callback_address_public), unless the name is in the client's
+    private_names. The rule pins the address, so msb's rebind protection
+    never sees it and cannot refuse it at connect time. A name that no entry
+    could admit (no pattern or `*` matches it, and no IPv4 address, CIDR or
+    address:port entry at its port could hold its answer: a name resolves to
+    IPv4 only) is refused before it is looked up, so a client key cannot
+    make the host resolve arbitrary names."""
+    given = [key for key in dialect.callback_keys if req.get(key) is not None]
+    if len(given) > 1:
+        raise KandevError("invalid_config", f"give one of {' and '.join(given)}, not both")
+    if not given:
+        if dialect.callback_required:
+            raise KandevError("invalid_config", f"{dialect.callback_keys[0]} needs a host")
+        return None
+    if dialect.client == "kandev":
+        return kandev_api(req[given[0]], given[0])
+    entries, table = settings["allow_extra_entries"], settings.get("table", "kandev")
+    nets = [e for e in entries if e[0] == "net"]
+
+    def refuse(host, port):
+        raise KandevError("invalid_config", f"{given[0]} {host}:{port} is not allowed by "
+                          f"[{table}] allow_extra")
+
+    def before_resolving(host, port):
+        # The answer is one IPv4 address (AF_INET): only an IPv4 entry at any
+        # port, or at this one, could admit it.
+        could_hold = any(net.version == 4 and net_port in (None, port) for _, net, net_port in nets)
+        if not could_hold and not kandev_target_allowed(f"{host}:tcp:{port}", entries):
+            refuse(host, port)
+
+    callback = kandev_api(req[given[0]], given[0], before_resolving)
+    host, addr, port, rule = callback
+    address = rule.partition("@")[2]                # <address>:tcp:<port>, bracketed if IPv6
+    try:
+        ipaddress.ip_address(host)
+        is_name = False
+    except ValueError:
+        is_name = True
+    if not is_name:
+        if not kandev_target_allowed(address, entries):
+            refuse(host, port)
+    elif not kandev_target_allowed(address, nets):
+        if not kandev_target_allowed(f"{host}:tcp:{port}", entries):
+            refuse(host, port)
+        if not callback_address_public(addr) and host not in settings["private_names"]:
+            raise KandevError("invalid_config", f"{given[0]} {host} resolves to a private or reserved "
+                              f"address on this host: allow_extra admits only a public one by name. "
+                              f"List {host} in [{table}] private_names, or its address in allow_extra")
+    return callback
+
+
+def body_passthrough(spec, dialect):
+    """A secret binding with the client's body_secret_hosts as passthrough:
+    hosts its PLACEHOLDER may travel to in a request body (never the value).
+    None means none: msb then blocks any request that carries one."""
+    if not dialect.body_secret_hosts:
+        return spec
+    return with_transcript_passthrough(spec, dialect.body_secret_hosts)
+
+
+def managed_provision(args, config, settings, dialect):
     env = kandev_check_env(args.env)
     req = kandev_read_header()
     op, digest = req.get("operation_id"), req.get("input_digest")
     if not all(isinstance(v, str) and v and len(v) <= 256 for v in (op, digest)):
         raise KandevError("invalid_config", "operation_id and input_digest are required")
-    name = kandev_name(env)
+    name = managed_name(dialect.name_prefix, env)
 
     def existing():
-        found = kandev_lookup(env)
+        found = managed_lookup(dialect, env)
         if found:
             if found[1].get("operation_id") == op and found[1].get("input_digest") == digest:
-                return kandev_record(*found)
+                return kandev_record(*found, client=dialect.record_has_client)
             raise KandevError("conflict", "this environment was provisioned by another operation "
                               "or with different input")
         if os.path.exists(registry_path_for(name)):
-            raise KandevError("conflict", f"{name} is a sandbox that is not Kandev's")
-        for _other, entry in kandev_entries():
+            if dialect.client == "kandev":      # protocol 1's words, as the plugin knows them
+                raise KandevError("conflict", f"{name} is a sandbox that is not Kandev's")
+            # Not the name, which may be the operator's own sandbox's.
+            raise KandevError("conflict", "this environment's name is taken on this host by a sandbox "
+                              f"that is not {dialect.owner}'s")
+        for _other, entry in managed_entries(dialect.client):
             if entry.get("operation_id") == op:
                 raise KandevError("conflict", "that operation_id belongs to another environment")
         return None
@@ -12954,7 +13768,7 @@ def kandev_provision(args, config, settings):
     expires = parse_iso(req.get("expires_at"), "expires_at")
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
-    values, bindings = kandev_bound_values(req.get("secrets"))
+    values, bindings = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
     if any(not hosts for _, hosts in bindings):
         raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
     guest_env = req.get("env") or []
@@ -12964,15 +13778,26 @@ def kandev_provision(args, config, settings):
     for item in guest_env:
         if not isinstance(item, dict) or not isinstance(item.get("value"), str):
             raise KandevError("invalid_config", "each env item is {name, value}")
-        problem = kandev_name_problem(item.get("name"))
+        problem = kandev_name_problem(item.get("name"), dialect.env_prefix)
         if problem or item["name"] in values:
             raise KandevError("invalid_config", f"env {problem or item['name'] + ' is also a secret'}")
         if "\n" in item["value"] or "\0" in item["value"] or len(item["value"]) > 4096:
             raise KandevError("invalid_config", f"env {item['name']}: one line of at most 4096 characters")
         env_pairs.append((item["name"], item["value"]))
+    guest_ports = list(dialect.default_ports)
+    # Protocol 1 never read guest_ports. Protocol 2 does, but Kandev's are
+    # fixed (its agentctl is protocol 1's first port): any others are refused.
+    if dialect.protocol == 2 and req.get("guest_ports") is not None:
+        if not dialect.guest_ports_settable and req["guest_ports"] != guest_ports:
+            raise KandevError("invalid_config", f"guest_ports: {dialect.owner}'s are fixed at "
+                              f"{toml_literal(guest_ports)}")
+        guest_ports = req["guest_ports"]
+        problem = guest_ports_problem(guest_ports)
+        if problem:
+            raise KandevError("invalid_config", f"guest_ports: {problem}")
     egress = kandev_egress(req.get("egress_allow"), settings)
     private = kandev_private_names(req.get("private_names"), settings, req.get("egress_allow"))
-    api_host, api_addr, api_port, api_rule = kandev_api(req.get("kandev_api"))
+    callback = request_callback(req, dialect, settings)
     registry = kandev_registry(req.get("registry"), image)
 
     with kandev_lock():
@@ -12980,35 +13805,50 @@ def kandev_provision(args, config, settings):
         again = existing()
         if again:
             return again
-        count, used_cpus, used_mem = kandev_usage(table)
+        count, used_cpus, used_mem = managed_usage(table, dialect.client)
         if (count + 1 > settings["max_sandboxes"] or used_cpus + cpus > settings["max_cpus"]
                 or used_mem + mem > settings["max_memory_mib"]):
-            raise KandevError("rate_limited", "this host is at its [kandev] limits", 30)
-        host_ports = kandev_alloc_ports(settings)
-        ports = [f"127.0.0.1:{h}:{g}" for h, g in zip(host_ports, KANDEV_GUEST_PORTS, strict=True)]
+            raise KandevError("rate_limited", f"this host is at its [{settings.get('table', 'kandev')}] "
+                              "limits", 30)
+        totals = [settings.get(f"host_{k}") for k in ("max_sandboxes", "max_cpus", "max_memory_mib")]
+        if any(t is not None for t in totals):
+            count, used_cpus, used_mem = managed_usage(table)
+            if any(t is not None and used + more > t for t, used, more in
+                   zip(totals, (count, used_cpus, used_mem), (1, cpus, mem), strict=True)):
+                raise KandevError("rate_limited", "this host is at its [managed] limits", 30)
+        host_ports = alloc_ports(settings, len(guest_ports))
+        ports = [f"127.0.0.1:{h}:{g}" for h, g in zip(host_ports, guest_ports, strict=True)]
         public = []
         if settings["serve"] == "proxy":
-            public = [f"{p}:{g}" for p, g in zip(kandev_alloc_proxy_ports(settings), KANDEV_GUEST_PORTS,
+            public = [f"{p}:{g}" for p, g in zip(alloc_proxy_ports(settings, len(guest_ports)), guest_ports,
                                                  strict=True)]
         binds = [f"{n}@{','.join(h)}" for n, h in bindings]
         now = utc_now()
         os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
+        common = dict(
+            NAME=name, DATE=now.date().isoformat(),
+            ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
+            IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
+            WORKSPACE=f"{workspace}G",
+            CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
+            PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
+            PROXY_PORTS=f"proxy_ports = {toml_literal(public)}",
+            RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
+            EXTRA_RULES=f"extra_rules = {toml_literal(egress + ([callback[3]] if callback else []))}",
+            BINDINGS=f"secret_binds = {toml_literal(binds)}",
+            PRIVATE=f"private_names = {toml_literal(private)}")
         # The entry FIRST: a crash between here and the end leaves something
-        # `reap` finds, never a VM nobody knows about.
+        # `reap` finds, never a VM nobody knows about. Kandev's entries keep
+        # their own form (source = "kandev"), whichever protocol made them.
+        if dialect.client == "kandev":
+            text = render("registry-kandev.toml.in", **common, API=toml_literal(callback[0]),
+                          API_IP=toml_literal(callback[1]))
+        else:
+            text = render("registry-managed.toml.in", **common, CLIENT=toml_literal(dialect.client),
+                          CALLBACK=toml_literal(callback[0] if callback else ""),
+                          CALLBACK_IP=toml_literal(callback[1] if callback else ""))
         with open(registry_path_for(name), "w", encoding="utf-8") as fh:
-            fh.write(render(
-                "registry-kandev.toml.in", NAME=name, DATE=now.date().isoformat(),
-                ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
-                IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
-                WORKSPACE=f"{workspace}G",
-                CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
-                PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
-                PROXY_PORTS=f"proxy_ports = {toml_literal(public)}", API=toml_literal(api_host),
-                API_IP=toml_literal(api_addr),
-                RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
-                EXTRA_RULES=f"extra_rules = {toml_literal(egress + [api_rule])}",
-                BINDINGS=f"secret_binds = {toml_literal(binds)}",
-                PRIVATE=f"private_names = {toml_literal(private)}"))
+            fh.write(text)
 
     box = Sandbox(name, config)
     rules = _kandev_try(box.net_rules)
@@ -13034,11 +13874,12 @@ def kandev_provision(args, config, settings):
     for key, value in env_pairs:
         argv += ["--env", f"{key}={value}"]
     for spec in binds:
-        argv += ["--secret", with_transcript_passthrough(spec)]
+        argv += ["--secret", body_passthrough(spec, dialect)]
     if binds:
         argv += ["--secret-violation-action", "block-and-log"]
-    argv += ["--label", KANDEV_OWNER_LABEL, "--label", f"kandev.env={env}",
-             "--max-duration", f"{seconds}s", image]
+    for label in owner_labels(dialect.client, env):
+        argv += ["--label", label]
+    argv += ["--max-duration", f"{seconds}s", image]
     proc = run(argv, env=values, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
@@ -13046,11 +13887,15 @@ def kandev_provision(args, config, settings):
     kandev_pin_api(name, entry)
     kandev_serve(settings["serve"], name, kandev_ports(entry), True)
     kandev_set(name, state="running", generation=1, agentctl_running=False)
-    return kandev_record(name, read_toml(registry_path_for(name)))
+    return kandev_record(name, read_toml(registry_path_for(name)), client=dialect.record_has_client)
 
 
 def kandev_agentctl(args, config, settings):
-    name, entry = kandev_need(args.env)
+    return managed_agentctl(args, config, settings, KANDEV_DIALECT)
+
+
+def managed_agentctl(args, config, settings, dialect):
+    name, entry = managed_need(dialect, args.env)
     header = kandev_read_header()
     sha, size = header.get("sha256"), header.get("size")
     if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{64}", sha):
@@ -13061,18 +13906,22 @@ def kandev_agentctl(args, config, settings):
     if not isinstance(nonce, str) or not nonce or len(nonce) > 4096 or re.search(r"[\0\n\r]", nonce):
         raise KandevError("invalid_config", "nonce is one line")
     ports = kandev_ports(entry)
-    runtime = header.get("runtime_port", KANDEV_GUEST_PORTS[0])
+    runtime = header.get("runtime_port", agentctl_port(entry))
     if runtime not in ports:
         raise KandevError("invalid_config", "runtime_port is not one of this sandbox's ports")
     extra_args = header.get("args", [f"-port={runtime}"])
     if not isinstance(extra_args, list) or any(
             not isinstance(a, str) or len(a) > 4096 or "\0" in a for a in extra_args):
         raise KandevError("invalid_config", "args is a list of strings")
+    # The prefix is checked config (CLIENT_ENV_PREFIX: A-Z 0-9 _), so it is
+    # safe in a pattern and in the shell line below.
+    prefix, guest = dialect.env_prefix, dialect.agentctl_path
+    nonce_var = f"{prefix}BOOTSTRAP_NONCE"
     agent_env = header.get("env", {})
     if not isinstance(agent_env, dict) or any(
-            not re.fullmatch(r"AGENTCTL_[A-Z0-9_]+", k) or k == "AGENTCTL_BOOTSTRAP_NONCE"
+            not re.fullmatch(rf"{prefix}[A-Z0-9_]+", k) or k == nonce_var
             or not isinstance(v, str) or re.search(r"[\0\n]", v) for k, v in agent_env.items()):
-        raise KandevError("invalid_config", "env keys are AGENTCTL_*, values one line")
+        raise KandevError("invalid_config", f"env keys are {prefix}*, values one line")
     # Exactly `size` bytes, then the digest, before anything reaches the guest.
     blob, digest = bytearray(), hashlib.sha256()
     while len(blob) < size:
@@ -13085,14 +13934,15 @@ def kandev_agentctl(args, config, settings):
         raise KandevError("invalid_config", "the binary does not match its sha256")
     if state_of(name) != "running":
         raise KandevError("unavailable", "the sandbox is not running")
+    record = functools.partial(kandev_record, client=dialect.record_has_client)
     if entry.get("agentctl_sha256") == sha and kandev_probe(ports[runtime]):
         kandev_set(name, agentctl_running=True)
-        return kandev_record(name, read_toml(registry_path_for(name)))
-    parent = GUEST_AGENTCTL.rsplit("/", 1)[0]
+        return record(name, read_toml(registry_path_for(name)))
+    parent = guest.rsplit("/", 1)[0]
     write = subprocess.run(
         ["msb", "exec", name, "--no-tty", "--", "sh", "-c",
-         f"mkdir -p {parent} && cat > {GUEST_AGENTCTL}.new && chmod 0755 {GUEST_AGENTCTL}.new "
-         f"&& mv -f {GUEST_AGENTCTL}.new {GUEST_AGENTCTL}"],
+         f"mkdir -p {parent} && cat > {guest}.new && chmod 0755 {guest}.new "
+         f"&& mv -f {guest}.new {guest}"],
         input=bytes(blob), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     if write.returncode != 0:
         raise KandevError("unavailable", "could not write agentctl into the guest")
@@ -13101,13 +13951,13 @@ def kandev_agentctl(args, config, settings):
     # exec and the ssh session that ran msbctl (spike 16).
     start = ("read -r n; "
              "[ -f /run/agentctl.pid ] && kill \"$(cat /run/agentctl.pid)\" 2>/dev/null; "
-             "AGENTCTL_BOOTSTRAP_NONCE=\"$n\" setsid \"$0\" \"$@\" </dev/null "
+             f"{nonce_var}=\"$n\" setsid \"$0\" \"$@\" </dev/null "
              ">/var/log/agentctl.log 2>&1 & echo $! > /run/agentctl.pid")
     flags = []
     for key, value in sorted(agent_env.items()):
         flags += ["-e", f"{key}={value}"]
     launch = subprocess.run(["msb", "exec", name, "--no-tty", *flags, "--", "sh", "-c", start,
-                             GUEST_AGENTCTL, *extra_args],
+                             guest, *extra_args],
                             input=(nonce + "\n").encode(), stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     if launch.returncode != 0:
@@ -13118,19 +13968,24 @@ def kandev_agentctl(args, config, settings):
     while time.monotonic() < deadline:
         if kandev_probe(ports[runtime]):
             kandev_set(name, agentctl_running=True)
-            return kandev_record(name, read_toml(registry_path_for(name)))
+            return record(name, read_toml(registry_path_for(name)))
         time.sleep(0.5)
     raise KandevError("unavailable", "agentctl did not answer on its control port")
 
 
 def kandev_start(args, config, settings):
-    name, entry = kandev_need(args.env)
+    return managed_start(args, config, settings, KANDEV_DIALECT)
+
+
+def managed_start(args, config, settings, dialect):
+    name, entry = managed_need(dialect, args.env)
+    record = functools.partial(kandev_record, client=dialect.record_has_client)
     req = kandev_read_header(allow_empty=True)
     if state_of(name) == "running":
-        return kandev_record(name, entry)
+        return record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
-    given, _ = kandev_bound_values(req.get("secrets"))
+    given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
     bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):
         # Never a half-bound start: a missing value would reach the guest's
@@ -13142,20 +13997,27 @@ def kandev_start(args, config, settings):
     kandev_pin_api(name, entry)
     kandev_set(name, state="running", generation=int(entry.get("generation", 0)) + 1,
                agentctl_running=False)
-    return kandev_record(name, read_toml(registry_path_for(name)))
-
+    return record(name, read_toml(registry_path_for(name)))
 
 
 def kandev_expiry(args, config, settings):
-    name, entry = kandev_need(args.env)
+    return managed_expiry(args, config, settings, KANDEV_DIALECT)
+
+
+def managed_expiry(args, config, settings, dialect):
+    name, entry = managed_need(dialect, args.env)
     when = parse_iso(args.at, "--at")
     ceiling = parse_iso(entry.get("max_expires_at"), "max_expires_at")
     kandev_set(name, expires_at=iso(min(when, ceiling)))
-    return kandev_record(name, read_toml(registry_path_for(name)))
+    return kandev_record(name, read_toml(registry_path_for(name)), client=dialect.record_has_client)
 
 
 def kandev_lease(args, config, settings):
-    name, entry = kandev_need(args.env)
+    return managed_lease(args, config, settings, KANDEV_DIALECT)
+
+
+def managed_lease(args, config, settings, dialect):
+    name, entry = managed_need(dialect, args.env)
     try:
         port = int(args.port)
     except (TypeError, ValueError):
@@ -13163,7 +14025,7 @@ def kandev_lease(args, config, settings):
     if port not in kandev_ports(entry):
         raise KandevError("not_found", "that port is not one of this sandbox's")
     if not settings["base_url"]:
-        raise KandevError("unavailable", "[kandev] base_url is not set")
+        raise KandevError("unavailable", f"[{host_table(settings, 'base_url')}] base_url is not set")
     if kandev_state(name, entry, msb_table()) != "running":
         raise KandevError("unavailable", "the sandbox is not running")
     expires = utc_now() + dt.timedelta(seconds=KANDEV_LEASE_SECONDS)
@@ -13193,35 +14055,46 @@ def kandev_lease(args, config, settings):
 def kandev_remove(name, entry, labelled):
     """Serve mappings, then the VM, then the entry: each step only once the one
     before it worked, so a failure leaves the entry for a retry or the reaper.
-    A VM under this name that does not carry the Kandev label is not Kandev's
-    and is never removed."""
+    A VM under this name that does not carry its client's owner label
+    (`labelled`: managed_labelled() of the entry's own client) is not that
+    client's and is never removed."""
     mode, strict = kandev_entry_serve(entry)
     kandev_serve(mode, name, kandev_ports(entry), False, strict=strict)
     if state_of(name) != "absent":
         if name not in labelled:
-            raise KandevError("conflict", f"{name} exists without the Kandev label — left alone")
+            client = entry_client(entry)
+            raise KandevError("conflict", f"{name} exists without the "
+                              f"{'Kandev' if client == 'kandev' else client} label — left alone")
         if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode != 0:
             raise KandevError("unavailable", "msb rm failed — the entry is kept for a retry")
     os.remove(registry_path_for(name))
 
 
 def kandev_reap(args, config, settings):
-    """One pass: expiry, stuck creates, gone VMs, orphans. Exits; the systemd
-    timer from `host kandev install` runs it every minute."""
+    """One pass over every client's sandboxes: expiry, stuck creates, gone
+    VMs, orphans. Exits; the systemd timer from `host kandev install` runs it
+    every minute. A VM is only ever removed by the label of the client whose
+    entry (or, for an orphan, whose configured name) it carries. `settings`
+    is the host's (managed_host_settings()): no client's table stops it, and
+    a sandbox expires whether its client's table checks out or not."""
     out = {"destroyed": [], "marked_absent": [], "orphans_removed": [], "errors": []}
+    clients = [n for n, found in clients_settings(config).items() if isinstance(found, dict)]
     with kandev_lock():
         table = msb_table()
-        rows = kandev_labelled(fmt_json=True)
-        labelled = {r.get("name") for r in rows}
+        entries = managed_entries()
+        rows = {}
+        for client in clients + sorted({entry_client(e) for _, e in entries} - set(clients)):
+            rows[client] = managed_labelled(client, fmt_json=True)
+        labelled = {client: {r.get("name") for r in found} for client, found in rows.items()}
         now = utc_now()
-        for name, entry in kandev_entries():
+        for name, entry in entries:
             try:
                 state = kandev_state(name, entry, table)
                 expired = parse_iso(entry.get("expires_at"), "expires_at") <= now
                 stuck = state == "creating" and (
                     now - parse_iso(entry.get("created_at"), "created_at")).total_seconds() > KANDEV_STUCK_CREATE
                 if expired or stuck:
-                    kandev_remove(name, entry, labelled)
+                    kandev_remove(name, entry, labelled[entry_client(entry)])
                     out["destroyed"].append(name)
                 elif state == "absent" and entry.get("state") != "absent":
                     kandev_set(name, state="absent", agentctl_running=False)
@@ -13229,9 +14102,10 @@ def kandev_reap(args, config, settings):
             except KandevError:
                 out["errors"].append(name)
         # Listed before this pass removed anything: what it just destroyed is
-        # not an orphan.
+        # not an orphan. Only a configured client's: the label of one whose
+        # table is gone (or broken) is left for the operator.
         known = set(registered()) | set(out["destroyed"])
-        for row in rows:
+        for row in [r for client in clients for r in rows[client]]:
             name = row.get("name")
             if not name or name in known:
                 continue
@@ -13245,6 +14119,7 @@ def kandev_reap(args, config, settings):
                     out["orphans_removed"].append(name)
                 else:
                     out["errors"].append(name)
+                known.add(name)
     return out
 
 
@@ -13314,8 +14189,8 @@ def kandev_tls(args, config, settings):
 # included. Never a token, a request head or a byte of what passes through.
 
 class _ProxyListener:
-    def __init__(self, sock, name, guest):
-        self.sock, self.name, self.guest = sock, name, guest
+    def __init__(self, sock, name, guest, client="kandev"):
+        self.sock, self.name, self.guest, self.client = sock, name, guest, client
         self.port = sock.getsockname()[1]
         self.closed = False
         self.conns = set()
@@ -13335,26 +14210,76 @@ def kandev_proxy_log(message):
     print(f"msbctl host kandev proxy: {message}", file=sys.stderr, flush=True)
 
 
-def kandev_proxy_wanted():
-    """({(address, public port): (name, guest port)}, why it is empty or None)."""
-    settings = kandev_settings(load_config())
-    if not settings["enabled"]:
-        return {}, "[kandev] enabled is false"
-    if settings["serve"] != "proxy":
-        return {}, f'[kandev] serve is "{settings["serve"]}"'
-    if not settings["proxy_listen"]:
-        return {}, "[kandev] proxy_listen is not set"
-    want = {}
-    for name, entry in kandev_entries():
-        if kandev_entry_serve(entry)[0] == "proxy":
+_PROXY_SAID = set()     # broken tables the proxy has logged, each once while broken
+_PROXY_CLIENTS = ["kandev"]     # the clients the last scan saw
+
+
+def kandev_proxy_backed(current, entries):
+    """The part of `current` ({key: (name, guest port, client)}) that the
+    registry `entries` still back: that sandbox, that client, that guest
+    port on that public port. A listener whose sandbox is gone is no one's."""
+    if not current:
+        return {}
+    live = {(name, guest, entry_client(entry), public) for name, entry in entries
+            for guest, public in kandev_proxy_ports(entry).items()}
+    return {k: v for k, v in (current or {}).items() if (*v, k[1]) in live}
+
+
+def kandev_proxy_wanted(current=None):
+    """({(address, public port): (name, guest port, client)}, why it is empty
+    or None): the proxy ports of every ENABLED client's sandboxes. A client
+    whose table does not check out (one being edited, or clashing with
+    another's) keeps exactly the ports it has open (`current`, the loop's
+    {key: (name, guest port, client)}) and gets no new ones, as a broken
+    config always did: after a restart, none until it is fixed, and none
+    of a sandbox removed meanwhile. It is said once each time it breaks.
+    The others, Kandev included, are served as their own tables say, so
+    Kandev behaves as on a host where it is the only client."""
+    config = load_config()
+    clients = clients_settings(config)
+    host = managed_host_settings(config)
+    _PROXY_CLIENTS[:] = list(clients)
+    broken = sorted(n for n, found in clients.items() if not isinstance(found, dict))
+    if broken and len(broken) == len(clients):
+        raise clients[broken[0]]
+    lines = {f"{clients[name].message}: its sandboxes keep the ports they have open, "
+             "and get no new ones, until it is fixed" for name in broken}
+    for line in sorted(lines - _PROXY_SAID):
+        kandev_proxy_log(line)
+    # Once while broken: a table fixed and broken again is said again.
+    _PROXY_SAID.clear()
+    _PROXY_SAID.update(lines)
+    # Frozen: never rebuilt from the registry, so a broken table can neither
+    # reopen what `enabled = false` closed nor open a port after a restart;
+    # only narrowed by it, so a sandbox removed meanwhile loses its ports.
+    entries = managed_entries()
+    kept = {k: v for k, v in kandev_proxy_backed(current, entries).items() if v[2] in broken}
+    enabled = [n for n, found in clients.items() if isinstance(found, dict) and found["enabled"]]
+    if not enabled:
+        if list(clients) == ["kandev"]:
+            return kept, "[kandev] enabled is false"
+        return kept, ("no client is enabled and checks out" if broken
+                      else "no client is enabled ([kandev], [clients.*] enabled)")
+    # The table each key is in; one set nowhere is [kandev]'s on a Kandev-only host.
+    where = {k: host["host_tables"].get(k, "kandev" if list(clients) == ["kandev"] else "managed")
+             for k in ("serve", "proxy_listen")}
+    if host["serve"] != "proxy":
+        return kept, f'[{where["serve"]}] serve is "{host["serve"]}"'
+    if not host["proxy_listen"]:
+        return kept, f"[{where['proxy_listen']}] proxy_listen is not set"
+    want = dict(kept)
+    for name, entry in entries:
+        client = entry_client(entry)
+        if client in enabled and kandev_entry_serve(entry)[0] == "proxy":
             for guest, public in kandev_proxy_ports(entry).items():
-                want[(settings["proxy_listen"], public)] = (name, guest)
+                want[(host["proxy_listen"], public)] = (name, guest, client)
     return want, None
 
 
-def kandev_proxy_summary(count, wanted, why):
+def kandev_proxy_summary(count, wanted, why, shared=False):
     """The proxy's one-line state: how many public ports it has open, of how
-    many the Kandev entries want, and why that is none (or few) when it is."""
+    many the managed entries want, and why that is none (or few) when it is.
+    `shared`: a host with clients other than Kandev."""
     plural = "" if count == 1 else "s"
     if why:
         return f"listening on nothing: {why}" if not count else f"keeping {count} port{plural} open: {why}"
@@ -13362,7 +14287,7 @@ def kandev_proxy_summary(count, wanted, why):
     if wanted > count:
         line += f" ({wanted - count} could not be bound)"
     elif not count:
-        line += ": no Kandev sandbox is published through the proxy"
+        line += f": no {'managed' if shared else 'Kandev'} sandbox is published through the proxy"
     return line
 
 
@@ -13456,7 +14381,9 @@ def kandev_proxy_conn(raw, listener, ctx, slots):
             entry = read_toml(path) if os.path.exists(path) else {}
         except SystemExit:
             entry = {}
-        ok = (entry.get("source") == "kandev"
+        # The entry of the client this listener was opened for, still: a name
+        # that now holds someone else's sandbox (or none) is refused.
+        ok = (entry_client(entry) is not None and entry_client(entry) == listener.client
               and kandev_proxy_ports(entry).get(listener.guest) == listener.port
               and kandev_token_ok(kandev_lease_keys(), _lease_token(head), listener.name,
                                   listener.guest, kandev_incarnation(entry)))
@@ -13527,11 +14454,22 @@ def kandev_proxy(stop=None):
             if time.monotonic() >= next_scan:
                 next_scan = time.monotonic() + KANDEV_PROXY_SCAN
                 try:
-                    want, why = kandev_proxy_wanted()
-                except (KandevError, SystemExit) as exc:
-                    # A config being edited: keep what is open, say so once.
-                    want, why = {k: (v.name, v.guest) for k, v in listeners.items()}, \
-                        f"config: {getattr(exc, 'message', exc)}"
+                    want, why = kandev_proxy_wanted(
+                        {k: (v.name, v.guest, v.client) for k, v in listeners.items()})
+                except (Exception, SystemExit) as exc:
+                    # A config being edited: keep what is open and, when the
+                    # registry can be read, still backed (a port whose sandbox
+                    # is gone meanwhile closes; when it cannot, every port is
+                    # kept, and each connection is still checked). Said once
+                    # while the reason reads the same. Anything else the
+                    # config or the registry holds that no check foresaw is
+                    # kept the same way, never the end of the proxy (and of
+                    # every client's ports with it).
+                    want = {k: (v.name, v.guest, v.client) for k, v in listeners.items()}
+                    with contextlib.suppress(Exception, SystemExit):
+                        want = kandev_proxy_backed(want, managed_entries())
+                    why = (f"config: {getattr(exc, 'message', exc)}" if isinstance(exc, (KandevError, SystemExit))
+                           else f"unexpected {type(exc).__name__} reading the config or registry: {exc}")
                 try:
                     now = tuple(os.stat(p).st_mtime_ns for p in (KANDEV_TLS_CERT, KANDEV_TLS_KEY))
                 except OSError:
@@ -13543,12 +14481,12 @@ def kandev_proxy(stop=None):
                         kandev_proxy_log("certificate loaded" if ctx else "no certificate")
                 if ctx is None:
                     want, why = {}, why or "no certificate (`kandev tls install`)"
-                for key in [k for k, v in listeners.items() if want.get(k) != (v.name, v.guest)]:
+                for key in [k for k, v in listeners.items() if want.get(k) != (v.name, v.guest, v.client)]:
                     sel.unregister(listeners[key].sock)
                     gone = listeners.pop(key)
                     gone.close()
                     kandev_proxy_log(f"{gone.name} {gone.guest} closed port {key[1]}")
-                for key, (name, guest) in want.items():
+                for key, (name, guest, client) in want.items():
                     if key in listeners:
                         continue
                     family = socket.AF_INET6 if ":" in key[0] else socket.AF_INET
@@ -13562,12 +14500,13 @@ def kandev_proxy(stop=None):
                         kandev_proxy_log(f"{name} {guest} cannot listen on port {key[1]}: {exc.strerror}")
                         continue
                     sock.setblocking(False)
-                    listeners[key] = _ProxyListener(sock, name, guest)
+                    listeners[key] = _ProxyListener(sock, name, guest, client)
                     sel.register(sock, selectors.EVENT_READ, listeners[key])
                     kandev_proxy_log(f"{name} {guest} listening on port {key[1]}")
                 # One line whenever the picture changes, with the count even at
                 # 0: "serving" with nothing open looked like a failed bind.
-                summary = kandev_proxy_summary(len(listeners), len(want), why)
+                summary = kandev_proxy_summary(len(listeners), len(want), why,
+                                               shared=_PROXY_CLIENTS != ["kandev"])
                 if summary != said:
                     kandev_proxy_log(summary)
                     said = summary
@@ -13613,6 +14552,64 @@ KANDEV_VERBS = {
 KANDEV_ENV_VERBS = ("provision", "agentctl", "start", "expiry", "lease")
 
 
+def managed_health(args, config, settings, dialect):
+    """Protocol 1's document, for this client, and what protocol 2 adds:
+    which protocols the key may speak, the client's own settings, and the
+    host totals when [managed] sets them."""
+    doc = kandev_health(args, config, settings, dialect.client)
+    doc.update({
+        "protocol": 2, "protocols": [1, 2] if dialect.client == "kandev" else [2],
+        "client": dialect.client,
+        "client_settings": {"name_prefix": dialect.name_prefix, "env_prefix": dialect.env_prefix,
+                            "guest_ports": list(dialect.default_ports),
+                            "require_callback": dialect.callback_required,
+                            "body_secret_hosts": list(dialect.body_secret_hosts)}})
+    totals = {k: settings[f"host_{k}"] for k in ("max_sandboxes", "max_cpus", "max_memory_mib")}
+    if any(v is not None for v in totals.values()):
+        count, cpus, mem = managed_usage(msb_table())
+        doc["host_capacity"] = {**{k: v for k, v in totals.items() if v is not None},
+                                "sandboxes": count, "cpus": cpus, "memory_mib": mem}
+    return doc
+
+
+# Protocol 2, `msbctl managed <verb>`: Kandev's verbs, for any client. Not
+# tls, restart-proxy or self-update: those are the host's (one certificate,
+# one proxy, one msbctl), and stay with the Kandev key and the operator.
+MANAGED_VERBS = {
+    "health": managed_health, "provision": managed_provision, "agentctl": managed_agentctl,
+    "start": managed_start, "expiry": managed_expiry, "lease": managed_lease,
+}
+
+
+def client_verb_settings(config, client):
+    """{host keys, the client's keys} for one client's verbs. A problem in
+    another client's table, or a clash between two others, is not this
+    one's. A client with no table is a disabled one."""
+    clients = clients_settings(config)
+    found = clients.get(client)
+    if found is None:
+        found = client_settings(config, client)
+    if isinstance(found, KandevError):
+        raise found
+    return {**managed_host_settings(config), **found}
+
+
+def run_client_verb(args, config, client, dialect=None):
+    """One protocol-1 (`dialect` KANDEV_DIALECT) or protocol-2 verb of
+    `client`'s. Health always answers; everything else needs it enabled."""
+    settings = client_verb_settings(config, client)
+    dialect = dialect or managed_dialect(settings)
+    if args.verb != "health" and not settings["enabled"]:
+        raise KandevError("denied", f"{owner_name(client)} is not enabled on this host "
+                          f"([{settings['table']}] enabled)")
+    if args.verb in KANDEV_ENV_VERBS and not args.env:
+        verb = "kandev" if dialect.protocol == 1 else "managed"
+        raise KandevError("invalid_config", f"{verb} {args.verb} needs an environment id")
+    if dialect.protocol == 1:
+        return KANDEV_VERBS[args.verb](args, config, settings)
+    return MANAGED_VERBS[args.verb](args, config, settings, dialect)
+
+
 def json_document(body):
     """Run body() and print what it returns as the one JSON document on stdout,
     then exit 0; on failure, exit 3 with {"error": {"code", "message"}}, the
@@ -13647,8 +14644,12 @@ JSON_VERBS = (cmd_ls, cmd_show, cmd_stop, cmd_purge, cmd_self_update, cmd_observ
 def json_verb(args, config):
     """`ls`, `show`, `stop`, `purge`, `self-update` or `observe` with --json: one
     document for all the names given, built from what each call returns."""
-    if kandev_key() and not kandev_settings(config)["enabled"]:
-        raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
+    client = key_client()
+    if client:
+        settings = client_verb_settings(config, client)
+        if not settings["enabled"]:
+            raise KandevError("denied", f"{owner_name(client)} is not enabled on this host "
+                              f"([{settings['table']}] enabled)")
     if args.func is cmd_purge and not args.yes:
         die("purge --json needs -y: there is no one to ask")
     if not hasattr(args, "names"):
@@ -13668,46 +14669,70 @@ def json_verb(args, config):
 
 
 def cmd_kandev(args, config):
-    """`msbctl kandev <verb>`: one JSON document on stdout (json_document())."""
+    """`msbctl kandev <verb>`: protocol 1, one JSON document on stdout
+    (json_document()). Frozen: the Kandev plugin requires it as it is."""
+    json_document(lambda: run_client_verb(args, config, "kandev", KANDEV_DIALECT))
+
+
+def cmd_managed(args, config):
+    """`msbctl managed <verb>`: protocol 2, for the client the key is
+    (`host serve --client NAME`, or Kandev's), one JSON document on stdout.
+    At the host, unrestricted, `--client NAME` says which (the operator
+    trying a client's verbs); under a key it may only repeat the key's own."""
     def body():
-        settings = kandev_settings(config)
-        if args.verb != "health" and not settings["enabled"]:
-            raise KandevError("denied", "Kandev is not enabled on this host ([kandev] enabled)")
-        if args.verb in KANDEV_ENV_VERBS and not args.env:
-            raise KandevError("invalid_config", f"kandev {args.verb} needs an environment id")
-        return KANDEV_VERBS[args.verb](args, config, settings)
+        client = key_client()
+        if client is None:
+            if restricted():
+                raise KandevError("denied", "managed verbs are for a client's key")
+            if not args.client:
+                raise KandevError("invalid_config", "at the host, say which client: --client NAME")
+            client = args.client
+            if client != "kandev" and client_name_problem(client):
+                raise KandevError("invalid_config", f"--client: {client_name_problem(client)}")
+        elif args.client and args.client != client:
+            raise KandevError("denied", "this key is another client's")
+        return run_client_verb(args, config, client)
     json_document(body)
 
 
-def kandev_guard(args):
-    """Keep operator verbs and Kandev's sandboxes apart, both ways.
+def managed_guard(args):
+    """Keep operator verbs and the clients' sandboxes apart, all ways.
 
     The operator may look at one, shell into it while it runs, and stop or
     purge it at the host itself; never from the laptop's restricted key.
-    Starting one would boot it without its secrets, which exist only in
-    Kandev's requests, and everything else would change what Kandev owns.
+    Starting one would boot it without its secrets, which exist only in the
+    client's requests, and everything else would change what it owns.
 
-    Under the Kandev key, `show` and `stop` see only Kandev's sandboxes: any
-    other name is not found. (`purge` makes the same check itself, since a
-    name with nothing under it is a success there.)"""
+    Under a client's key, `show` and `stop` see only that client's sandboxes:
+    any other name, the operator's or another client's, is not found.
+    (`purge` makes the same check itself, since a name with nothing under it
+    is a success there.)"""
     names = [getattr(args, "name", None)] + list(getattr(args, "names", None) or [])
     for name in names:
         if not name or split_remote(name) or not SANDBOX_NAME.fullmatch(str(name)):
             continue
         path = registry_path_for(name)
         entry = read_toml(path) if os.path.exists(path) else {}
-        if kandev_key():
-            if args.func in (cmd_show, cmd_stop) and entry.get("source") != "kandev":
+        client = key_client()
+        if client:
+            if args.func in (cmd_show, cmd_stop) and entry_client(entry) != client:
                 raise NoSuchSandbox(name)
             continue
-        if entry.get("source") != "kandev":
+        owner = entry_client(entry)
+        if owner is None:
             continue
-        if args.func in (cmd_ls, cmd_status, cmd_show, cmd_shell, cmd_exec, cmd_kandev, cmd_host):
+        if args.func in (cmd_ls, cmd_status, cmd_show, cmd_shell, cmd_exec, cmd_kandev, cmd_managed,
+                         cmd_host):
             continue
         if args.func in (cmd_stop, cmd_purge) and not restricted():
             continue
-        die(f"{name} is a Kandev sandbox: Kandev owns it. You can ls, show, and shell or exec "
+        who = owner_name(owner)
+        what = "a Kandev sandbox" if who == "Kandev" else f"client {who}'s sandbox"
+        die(f"{name} is {what}: {who} owns it. You can ls, show, and shell or exec "
             f"into it while it runs, and stop or purge it on this host itself.")
+
+
+kandev_guard = managed_guard
 
 
 # `host kandev configure` flag → [kandev] key.
@@ -13734,8 +14759,20 @@ def kandev_configure(args):
         with os.fdopen(fd, "w", encoding="utf-8") as out, open(target, encoding="utf-8") as src:
             out.write(src.read())
         shutil.copymode(target, tmp)
-        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table="kandev")]
-        settings = kandev_settings(merge_config(read_toml(DEFAULTS_FILE), read_toml(tmp)))
+        # Each key into the table that already holds it, so a host moved to
+        # [managed] or [clients.kandev] is not given a conflicting second copy.
+        op = read_toml(tmp)
+
+        def table_for(key):
+            if key in MANAGED_HOST_KEYS and key in _table(op, "managed"):
+                return "managed"
+            if key not in MANAGED_HOST_KEYS and _table(op, "clients", "kandev"):
+                return "clients.kandev"
+            return "kandev"
+
+        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table=table_for(key))]
+        settings = kandev_settings(merge_config(read_toml(DEFAULTS_FILE), read_toml(tmp)),
+                                   operator=read_toml(tmp))
         if changed:
             os.replace(tmp, target)
     finally:
@@ -13745,6 +14782,119 @@ def kandev_configure(args):
     for key in ("port_pool", "proxy_port_pool"):
         effective[key] = "%d-%d" % effective[key]
     return {"changed": changed, "kandev": effective, "warnings": kandev_pool_warnings(settings)}
+
+
+# `host managed configure` flag → key. Host keys go to [managed] (or [kandev],
+# on a host that keeps them there); with --client, the client's keys go to its
+# table, [clients.NAME] (Kandev's: [kandev], or [clients.kandev]).
+MANAGED_CONFIGURE_HOST_KEYS = (("serve", "serve"), ("proxy_listen", "proxy_listen"),
+                               ("base_url", "base_url"), ("max_sandboxes", "max_sandboxes"),
+                               ("max_cpus", "max_cpus"), ("max_memory", "max_memory"))
+MANAGED_CONFIGURE_CLIENT_KEYS = (("enabled", "enabled"), ("max_sandboxes", "max_sandboxes"),
+                                 ("max_cpus", "max_cpus"), ("max_memory", "max_memory"),
+                                 ("allow_extra", "allow_extra"), ("private_names", "private_names"),
+                                 ("name_prefix", "name_prefix"), ("env_prefix", "env_prefix"),
+                                 ("guest_ports", "guest_ports"), ("require_callback", "require_callback"),
+                                 ("body_secret_hosts", "body_secret_hosts"))
+MANAGED_CONFIGURE_FLAGS = ("enabled", "serve", "proxy_listen", "base_url", "allow_extra", "private_names",
+                           "max_sandboxes", "max_cpus", "max_memory", "name_prefix", "env_prefix",
+                           "guest_ports", "require_callback", "body_secret_hosts")
+
+
+def managed_configure(args):
+    """`host managed configure [--client NAME]`: set the keys given, in
+    place in config.toml (comments and every other table kept), and only if
+    the host's keys still check out and, with --client, that client's table
+    does too (a name_prefix another client has included) and its
+    name_prefix is the start of no sandbox it does not own. Another client's
+    table that does not check out refuses nothing: it is reported under
+    `problems`, as each verb keeps it to that client. Without --client, the
+    host-wide keys; with it, that client's. A refused value leaves the file
+    as it was. Run from the host or an admin login, never from a client's
+    key: a client deciding its own egress is what allow_extra exists to
+    prevent."""
+    client = args.client
+    if client and client != "kandev" and client_name_problem(client):
+        raise KandevError("invalid_config", f"--client: {client_name_problem(client)}")
+    pairs = MANAGED_CONFIGURE_CLIENT_KEYS if client else MANAGED_CONFIGURE_HOST_KEYS
+    given = {attr for attr in MANAGED_CONFIGURE_FLAGS if getattr(args, attr, None) is not None}
+    stray = sorted(given - {attr for attr, _ in pairs})
+    if stray:
+        flag = "--" + stray[0].replace("_", "-")
+        raise KandevError("invalid_config", f"{flag} is a client's key: add --client NAME" if client is None
+                          else f"{flag} is the host's: leave --client out")
+    changes = []
+    for attr, key in pairs:
+        value = getattr(args, attr, None)
+        if value is None:
+            continue
+        if key in ("allow_extra", "private_names", "body_secret_hosts"):
+            value = [e for e in value if e.strip()]
+        changes.append((key, value))
+    ensure_local_config()
+    target = os.path.realpath(CONFIG_FILE)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".config-", suffix=".toml")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out, open(target, encoding="utf-8") as src:
+            out.write(src.read())
+        shutil.copymode(target, tmp)
+        op = read_toml(tmp)
+
+        def table_for(key):
+            if client == "kandev":
+                return "clients.kandev" if _table(op, "clients", "kandev") else "kandev"
+            if client:
+                return f"clients.{client}"
+            # A host key the operator keeps in [kandev] stays there: one copy.
+            return "kandev" if key in MANAGED_HOST_KEYS and key in _table(op, "kandev") else "managed"
+
+        changed = [key for key, value in changes if set_toml_key(tmp, key, value, table=table_for(key))]
+        op = read_toml(tmp)
+        config = merge_config(read_toml(DEFAULTS_FILE), op)
+        host = managed_host_settings(config, operator=op)
+        clients = clients_settings(config, operator=op)
+        if client:
+            mine = clients.get(client) or client_settings(config, client, operator=op)
+            if isinstance(mine, KandevError):
+                raise mine
+            if client != "kandev":
+                taken = sorted(n for n in registered() if n.startswith(mine["name_prefix"])
+                               and entry_client(read_toml(registry_path_for(n))) != client)
+                if taken:
+                    raise KandevError("invalid_config", f"[clients.{client}] name_prefix "
+                                      f"{mine['name_prefix']!r}: already the start of "
+                                      f"{', '.join(taken[:5])}, which {client} does not own")
+                # Its sandboxes are found by the prefix: one left under the
+                # old one would be cut off from its own client's verbs.
+                stranded = "name_prefix" in changed and sorted(
+                    n for n in registered() if not n.startswith(mine["name_prefix"])
+                    and entry_client(read_toml(registry_path_for(n))) == client)
+                if stranded:
+                    raise KandevError("invalid_config", f"[clients.{client}] name_prefix "
+                                      f"{mine['name_prefix']!r}: {client} still has "
+                                      f"{', '.join(stranded[:5])}{', …' if len(stranded) > 5 else ''} "
+                                      "under its old prefix, which its verbs would no longer "
+                                      "find; purge them first (`msbctl purge NAME`)")
+        if changed:
+            os.replace(tmp, target)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+    def shown(settings):
+        out = {k: v for k, v in settings.items() if k not in ("allow_extra_entries", "table", "host_tables")}
+        for key in ("port_pool", "proxy_port_pool"):
+            if key in out:
+                out[key] = "%d-%d" % out[key]
+        return out
+
+    doc = {"changed": changed, "host": shown(host),
+           "warnings": kandev_pool_warnings(host),
+           "problems": {n: e.message for n, e in clients.items() if isinstance(e, KandevError)}}
+    if client:
+        doc["client"] = client
+        doc["settings"] = shown(mine)
+    return doc
 
 
 def kandev_pool_warnings(settings):
@@ -13764,6 +14914,26 @@ def kandev_pool_warnings(settings):
     return out
 
 
+def host_managed(args, config):
+    """`host managed configure [--client NAME]`: the [managed] and
+    [clients.NAME] keys, as `host kandev configure` sets [kandev]'s."""
+    if args.arg != "configure":
+        die("host managed: configure")
+    if args.json:
+        json_document(lambda: managed_configure(args))
+    try:
+        done = managed_configure(args)
+    except KandevError as exc:
+        die(f"{exc.message}; {tilde(CONFIG_FILE)} is unchanged")
+    where = f"client {args.client}" if args.client else "the host"
+    note(f"{where} in {tilde(CONFIG_FILE)}: " +
+         (f"set {', '.join(done['changed'])}" if done["changed"] else "nothing to change"))
+    for line in done["warnings"]:
+        warn(line)
+    for name, problem in done["problems"].items():
+        warn(f"client {name}: {problem}")
+
+
 def host_kandev(args, config):
     """`host kandev install|reap|proxy`. What runs on the host for Kandev and
     is never the plugin's to call: `reap`, one pass of the reaper (a JSON
@@ -13771,7 +14941,9 @@ def host_kandev(args, config):
     the first every minute from a systemd user timer and the second as a user
     service. The proxy listens on nothing unless serve = "proxy"."""
     if args.arg == "reap":
-        json_document(lambda: kandev_reap(args, config, kandev_settings(config)))
+        # The host's keys only: one client's table (Kandev's [kandev]
+        # included) stops no one's expiry, its own sandboxes' neither.
+        json_document(lambda: kandev_reap(args, config, managed_host_settings(config)))
     if args.arg == "proxy":
         stop = threading.Event()
         kandev_proxy_on_sigterm(stop)
@@ -13782,6 +14954,10 @@ def host_kandev(args, config):
         kandev_rotate_lease_key()
         return
     if args.arg == "configure":
+        extra = sorted(a for a in MANAGED_CONFIGURE_FLAGS if getattr(args, a, None) is not None
+                       and a not in dict(KANDEV_CONFIGURE_KEYS))
+        if extra:
+            die(f"--{extra[0].replace('_', '-')} goes with host managed configure")
         if args.json:
             json_document(lambda: kandev_configure(args))
         try:
@@ -15313,7 +16489,7 @@ def preflight(args):
     # `host check` reports a missing msb or /dev/kvm itself; the other host
     # verbs need neither (serve re-runs msbctl, which checks then). `kandev`
     # answers in JSON whatever happens, and `kandev health` reports both.
-    if args.func in (cmd_host, cmd_remote, cmd_kandev):
+    if args.func in (cmd_host, cmd_remote, cmd_kandev, cmd_managed):
         return
     # A sandbox on a remote needs ssh here, not msb; nor does `ls` once there
     # are remotes (this machine's rows simply are not shown without msb).
@@ -15620,20 +16796,26 @@ def build_parser():
                    help="remove the restriction: every host key")
     p.set_defaults(func=cmd_keys)
 
-    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, kandev")
-    p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev"])
+    p = sub.add_parser("host", help="run this machine as a remote host: serve, authorize, check, autostart, "
+                       "kandev, managed")
+    p.add_argument("action", choices=["serve", "authorize", "check", "autostart", "kandev", "managed"])
     p.add_argument("arg", nargs="?", metavar="KEY|install|reap|proxy|rotate-lease-key|configure",
                    help="authorize: one public key line, quoted; autostart: install; "
                    "kandev: install, reap (one pass), proxy (the TLS proxy, long-running), "
                    "rotate-lease-key (the old key is still accepted for 15 minutes) "
-                   "or configure (set [kandev] keys in config.toml)")
+                   "or configure (set [kandev] keys in config.toml); managed: configure (set "
+                   "[managed] keys, or with --client NAME [clients.NAME]'s)")
     p.add_argument("--admin", action="store_true",
                    help="authorize: no forced command (use a FIDO2 sk- key)")
     p.add_argument("--kandev", action="store_true",
                    help="authorize, serve: the Kandev plugin's key, which runs `msbctl kandev` verbs only")
+    p.add_argument("--client", metavar="NAME",
+                   help="authorize, serve: a client's key ([clients.NAME]), which runs `msbctl managed` "
+                   "verbs for that client only; `--client kandev` is --kandev")
     p.add_argument("--replace", action="store_true",
                    help="authorize: rewrite the key's existing line instead of refusing")
-    p.add_argument("--json", action="store_true", help="check, kandev configure: one JSON document")
+    p.add_argument("--json", action="store_true",
+                   help="check, kandev configure, managed configure: one JSON document")
     p.add_argument("--enabled", action=argparse.BooleanOptionalAction, default=None,
                    help="kandev configure: [kandev] enabled")
     p.add_argument("--serve", metavar="MODE", help="kandev configure: proxy, tailscale or none")
@@ -15645,6 +16827,21 @@ def build_parser():
     p.add_argument("--private-name", dest="private_names", action="append", metavar="HOST",
                    help="kandev configure: the whole private_names list, one host per flag; "
                    "'' alone empties it")
+    p.add_argument("--max-sandboxes", type=int, metavar="N",
+                   help="managed configure: the client's cap, or without --client the host's total")
+    p.add_argument("--max-cpus", type=int, metavar="N",
+                   help="managed configure: the client's cap, or without --client the host's total")
+    p.add_argument("--max-memory", metavar="SIZE",
+                   help="managed configure: like 96G; the client's cap, or the host's total")
+    p.add_argument("--name-prefix", metavar="PREFIX", help="managed configure --client: like c-")
+    p.add_argument("--env-prefix", metavar="PREFIX", help="managed configure --client: like CI_")
+    p.add_argument("--guest-port", dest="guest_ports", type=int, action="append", metavar="PORT",
+                   help="managed configure --client: the default guest ports, one per flag (1 to 4)")
+    p.add_argument("--require-callback", action=argparse.BooleanOptionalAction, default=None,
+                   help="managed configure --client: refuse a provision with no callback")
+    p.add_argument("--body-secret-host", dest="body_secret_hosts", action="append", metavar="HOST",
+                   help="managed configure --client: the whole body_secret_hosts list, one host per "
+                   "flag; '' alone empties it")
     p.set_defaults(func=cmd_host)
 
     p = sub.add_parser("kandev", help="this host's Kandev sandboxes, for the Kandev plugin (JSON only)",
@@ -15658,6 +16855,20 @@ def build_parser():
     p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
     p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")
     p.set_defaults(func=cmd_kandev)
+
+    p = sub.add_parser("managed", help="this host's sandboxes for a client's key (protocol 2, JSON only)",
+                       description="Verbs a client ([clients.NAME] in config.toml, or Kandev) runs over "
+                       "ssh through `host serve --client NAME`. Each prints one JSON document; "
+                       "secrets, the agentctl binary and its nonce come on stdin. The client is the "
+                       "key's: --client may only repeat it, and is needed only at the host itself. "
+                       "Listing, inspecting, stopping and removing its sandboxes are `ls`, `show`, "
+                       "`stop` and `purge` with --json.")
+    p.add_argument("verb", choices=list(MANAGED_VERBS))
+    p.add_argument("env", nargs="?", metavar="ENV", help="the client's environment id")
+    p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
+    p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")
+    p.add_argument("--client", metavar="NAME", help="which client: at the host only, or the key's own")
+    p.set_defaults(func=cmd_managed)
 
     p = sub.add_parser("remote", help="the other machines this one drives over ssh: add, setup, ls, test, rm")
     p.add_argument("action", choices=["add", "setup", "ls", "test", "rm"])
@@ -15718,6 +16929,7 @@ def parse_cli(argv, parser=None):
 
 def main():
     keyring_forget()
+    key_client()            # a MSB_RESTRICTED no `host serve` sets refuses every verb
     args = parse_cli(sys.argv[1:])
     # Before the preflight and the config: a Tab must answer on a laptop with
     # no msb, and quickly, and a broken config.toml only costs remote names.

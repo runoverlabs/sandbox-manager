@@ -1,0 +1,13 @@
+{
+ "argv": [
+  "host",
+  "authorize",
+  "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl plugin@example",
+  "--kandev",
+  "--replace"
+ ],
+ "exit": 0,
+ "key": null,
+ "msb": [],
+ "stdout": "   replaced in ~/.ssh/authorized_keys:\n     restrict,command=\"/opt/msb/bin/msbctl host serve --kandev\" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl plugin@example\n   this key can run `msbctl kandev` verbs, and nothing else\n"
+}

@@ -1,0 +1,20 @@
+{
+ "argv": [
+  "doctor",
+  "--json"
+ ],
+ "exit": 0,
+ "key": "kandev",
+ "msb": [
+  [
+   "--help"
+  ],
+  [
+   "ls",
+   "--label",
+   "msbctl.owner=kandev",
+   "-q"
+  ]
+ ],
+ "stdout": "{\n  \"left_out\": [\n    \"github-token\",\n    \"secret-store\",\n    \"autostart\"\n  ],\n  \"restricted\": true,\n  \"scoped\": [\n    {\n      \"fix\": \"\",\n      \"id\": \"registry\",\n      \"message\": \"2 Kandev sandbox(es) registered\",\n      \"status\": \"ok\"\n    },\n    {\n      \"fix\": \"\",\n      \"id\": \"orphans\",\n      \"message\": \"every Kandev VM has a registry entry\",\n      \"status\": \"ok\"\n    }\n  ]\n}"
+}

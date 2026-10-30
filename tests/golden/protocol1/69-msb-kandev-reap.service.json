@@ -1,0 +1,3 @@
+{
+ "file": "# Written by `msbctl host kandev install`. One pass of the Kandev reaper:\n# destroys Kandev sandboxes past their expiry, cleans up stuck creates and\n# orphans. Run by msb-kandev-reap.timer; it exits after each pass.\n[Unit]\nDescription=msb-manager: reap expired Kandev sandboxes\n\n[Service]\nType=oneshot\nEnvironment=PATH=<TMP>/home/.local/bin:/usr/local/bin:/usr/bin:/bin\nExecStart=/opt/msb/bin/msbctl host kandev reap\n"
+}
