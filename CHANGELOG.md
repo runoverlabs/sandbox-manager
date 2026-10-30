@@ -9,10 +9,12 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `msbctl kandev health` reports, under `serve`, the public ports the Kandev proxy has open (`ports`, `[]` when no sandbox is live) and how many ports in `proxy_port_pool` your own sandboxes publish (`pool_overlap`), advertised as the `serve_ports` feature; `host kandev configure` warns, naming them, when your sandboxes publish ports inside `port_pool` or `proxy_port_pool`. The proxy picks this up on its next restart (`kandev restart-proxy`).
 - `msbctl add` lets a repo on another forge through egress: a rule group that already allows its host and port is preselected, and when none does, the wizard writes a machine-local `forge-<host>` group into `config.toml` (`:443`, plus the SSH port for an ssh URL), listed under `private_dns_groups` when the name resolves to a LAN address, and gives it to the sandbox. It never goes into the project's `sandbox.toml`. A shipped `codeberg` group covers Codeberg.
 - `[defaults] agents` (`["claude"]` by default; `msbctl setup` → Coding agents) decides which coding agents a new sandbox gets ticked, `[]` for none; pi is still ticked too when `[defaults] llm` names an endpoint. The first-run setup skips the Claude login when no new sandbox gets Claude, and the model endpoints when none gets pi.
 
 ### Changed
+- The Kandev proxy logs how many ports it serves whenever that changes, 0 included (`serving 0 ports: no Kandev sandbox is published through the proxy`), and each port it opens or closes with the sandbox and guest port behind it; before, an idle proxy logged just "serving", which looked like a failed bind. The Kandev page now says that in proxy mode nothing listens on `base_url`'s port and there is no `/health` URL: check a host with `msbctl kandev health` over ssh and a real lease.
 - `msbctl add` asks for the coding agents right after the repo, and the steps after follow the answer: no Claude token step without Claude Code, and the guest-path note no longer assumes Claude. `msbctl edit` → Claude token says it is not used in a sandbox without Claude.
 
 ### Fixed
