@@ -160,6 +160,7 @@ class Protocol1Golden(MsbctlTest):
                     mock.patch.object(m, "kandev_host_facts", lambda: dict(HOST_FACTS)), \
                     mock.patch.object(m, "host_platform", lambda: "linux-amd64"), \
                     mock.patch.object(m, "kvm_status", lambda: "rw"), \
+                    mock.patch.object(m, "lingering", lambda user=None: False), \
                     mock.patch.object(m, "IS_CHECKOUT", True), \
                     mock.patch.object(m.shutil, "which", self.which):
                 code, out, _err = self.run_main(*argv, stdin=stdin)
