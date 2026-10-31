@@ -8,6 +8,12 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- Nested virtualization: a sandbox's guest gets `/dev/kvm` when `nested_virt = true`, set in its project's `.msb/sandbox.toml` (approved like the egress rules), its registry entry (`msbctl edit <name>` → Nested virtualization) or, for every sandbox whose project doesn't say, `[defaults] nested_virt` in `config.toml` (`msbctl setup` → New-sandbox defaults; off as shipped). The `podman` feature turns it on. msb 0.7.12 made KVM in the guest a create-time switch that is off by default, and msbctl now always passes it (`--nested-virt=true|false`), so a sandbox that relies on `/dev/kvm` needs `nested_virt = true` and a rebuild. `show` lists it as `kvm`, and `show --json` as `nested_virt`.
+
+### Changed
+- Kandev's and every managed client's sandboxes are created with `--nested-virt=false`, so msb's own `sandbox_defaults.nested_virt` can never give them `/dev/kvm`.
+
 ## [0.10.0] - 2026-10-30
 
 ### Added
