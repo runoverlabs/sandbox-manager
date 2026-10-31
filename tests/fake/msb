@@ -10,8 +10,8 @@ refuses anything it does not know so that an unexpected call fails loudly.
     FAKE_MSB_READ_STDIN  if set, `exec` reads its stdin and logs its sha256 and
                        length as "stdin" (never the bytes: they may be a secret)
     FAKE_MSB_FAIL      a verb (`create`, `pull`, …) that fails with exit 1
-    FAKE_MSB_VERSION   what `--version` says (default 0.7.7)
-    FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.7's
+    FAKE_MSB_VERSION   what `--version` says (default 0.7.12)
+    FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.12's
                        does: "ok", "warn" (exit 0 with a warning) or "fail"
 
 `ls` prints the text table msbctl's msb_table() parses (a header, then
@@ -109,7 +109,7 @@ def main():
     state = load()
     verb = argv[:1]
     if argv == ["--version"]:
-        print(f"msb {os.environ.get('FAKE_MSB_VERSION', '0.7.7')}")
+        print(f"msb {os.environ.get('FAKE_MSB_VERSION', '0.7.12')}")
     elif argv == ["--help"]:
         print("Usage: msb <COMMAND>\n\nCommands:\n  create  Create a sandbox\n  ls      List sandboxes")
         if os.environ.get("FAKE_MSB_DOCTOR"):
