@@ -69,13 +69,13 @@ class NestedVirtTest(MsbctlTest):
         self.assertIs(json.loads(out)["nested_virt"], True)
 
     def test_podman_turns_it_on(self):
-        features = lambda title, options, selected, locked=None: (  # noqa: E731
+        features = lambda title, options, selected, locked=None: (
             [o for o in options if o.startswith("podman")] if title == "features" else list(selected))
         with mock.patch.object(self.m, "toggle_list", features):
             plan = self.m.pick_features([], [], config={}, agents=[])
         self.assertEqual(plan["features"], ["podman"])
         self.assertIs(plan["nested_virt"], True)
-        none = lambda title, options, selected, locked=None: []  # noqa: E731
+        none = lambda title, options, selected, locked=None: []
         with mock.patch.object(self.m, "toggle_list", none):
             self.assertIs(self.m.pick_features([], [], config={}, agents=[])["nested_virt"], False)
 
