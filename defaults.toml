@@ -677,6 +677,13 @@ codeberg = [
 # that is what makes registry logins work). The value is stored per sandbox in
 # ~/.config/msb/secrets/<name>.env, never here.
 #
+# `headers` narrows that to the named header fields (msb 0.7.8+), matched
+# case-insensitively: the placeholder anywhere else goes out as the literal
+# `$MSB_<VAR>`. Every preset below is read from `Authorization` (Basic for the
+# registry logins, Bearer or a bare token otherwise), so that is all they get:
+# a host that echoes some other header back cannot be made to return the real
+# value to the guest. Leave it out to substitute in every header.
+#
 # `hosts` must ALSO be reachable: a secret does not open the network. Docker
 # Hub and ghcr.io are in the `containers` egress group; pypi upload is not.
 #
@@ -692,29 +699,34 @@ codeberg = [
 [secret_presets.npm]
 env   = "NPM_TOKEN"
 hosts = ["registry.npmjs.org"]
+headers = ["authorization"]
 help  = "https://www.npmjs.com/settings/~/tokens  (a granular, read-only token if you only install)"
 usage = "echo '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' >> ~/.npmrc"
 
 [secret_presets.dockerhub]
 env   = "DOCKERHUB_TOKEN"
 hosts = ["registry-1.docker.io", "auth.docker.io"]
+headers = ["authorization"]
 help  = "https://app.docker.com/settings/personal-access-tokens"
 usage = 'podman login docker.io -u YOURUSER -p "$DOCKERHUB_TOKEN"'
 
 [secret_presets.ghcr]
 env   = "GHCR_TOKEN"
 hosts = ["ghcr.io"]
+headers = ["authorization"]
 help  = "https://github.com/settings/tokens  (classic, read:packages / write:packages)"
 usage = 'podman login ghcr.io -u YOURUSER -p "$GHCR_TOKEN"'
 
 [secret_presets.pypi]
 env   = "PYPI_TOKEN"
 hosts = ["upload.pypi.org"]
+headers = ["authorization"]
 help  = "https://pypi.org/manage/account/token/"
 usage = 'twine upload -u __token__ -p "$PYPI_TOKEN" dist/*'
 
 [secret_presets.crates]
 env   = "CARGO_REGISTRY_TOKEN"
 hosts = ["crates.io"]
+headers = ["authorization"]
 help  = "https://crates.io/settings/tokens"
 usage = "cargo publish   (cargo reads CARGO_REGISTRY_TOKEN itself)"

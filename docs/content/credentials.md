@@ -29,6 +29,13 @@ What this means in practice:
   `Authorization` header before sending.
 - A placeholder in a **query string** or a **request body** is not substituted,
   unless the binding opts in with `:query` or `:body`.
+- The GitHub and Claude tokens, and every preset, are substituted in the
+  **`Authorization` header only** (`headers=[authorization]`, which a preset sets
+  with `headers = ["authorization"]`). In any other header the placeholder goes
+  out as itself, so an allowed host that echoes request headers back can't be
+  used to read the real value. A hand-written binding substitutes in every
+  header unless it says `NAME:headers=[x-api-key]@host`; `msbctl secret add` →
+  custom offers "auth only".
 - Sending a token to a host it isn't bound to sends the placeholder text, which
   is useless to whoever receives it.
 

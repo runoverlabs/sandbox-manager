@@ -254,7 +254,7 @@ def with_transcript_passthrough(spec, transcript_hosts=AGENT_TRANSCRIPT_HOSTS):
 
 
 # The Claude token's binding (see secret_env for why both hosts).
-CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com,platform.claude.com"
+CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN:headers=[authorization]@api.anthropic.com,platform.claude.com"
 
 
 # ------------------------------------------------------------- pi's models
@@ -2148,8 +2148,7 @@ class Sandbox:
             token = own.get("GH_TOKEN")
             if token:
                 env["GH_TOKEN"] = token
-                flags += ["--secret", with_transcript_passthrough(
-                    "GH_TOKEN@github.com,api.github.com", self.transcript_hosts)]
+                flags += ["--secret", with_transcript_passthrough(GH_SPEC, self.transcript_hosts)]
             else:
                 note(f"no GH_TOKEN for {self.name} — " + (
                     "the clone of a private repo, git push and the GitHub API need one: "
@@ -6371,14 +6370,15 @@ def choose_secret(config, taken=()):
     """Pick one secret: a shipped preset or a custom one. Returns
     (spec, preset_info_or_None) or None."""
     presets = config.get("secret_presets", {})
+    bound = {binding_var(spec) for spec in taken}
     rows = [(f"{k:<10} {p['env']} -> {', '.join(p['hosts'])}", k) for k, p in presets.items()
-            if f"{p['env']}@{','.join(p['hosts'])}" not in taken]
+            if p["env"] not in bound]
     rows.append(("custom     your own variable and hosts", "custom"))
     label = choose_one("secret", [r for r, _ in rows], 0)
     key = dict(rows)[label]
     if key != "custom":
         p = presets[key]
-        return f"{p['env']}@{','.join(p['hosts'])}", p
+        return preset_spec(p), p
     var = ask("environment variable name (e.g. MY_API_TOKEN)").strip()
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var):
         warn("not a valid variable name")
@@ -6394,8 +6394,10 @@ def choose_secret(config, taken=()):
     where = choose_one("where may it appear", [
         "headers      Authorization etc, including Basic auth (the default)",
         "also query   in URL query strings too",
-        "also body    in request bodies too"], 0)
-    opt = ":query" if where.startswith("also query") else ":body" if where.startswith("also body") else ""
+        "also body    in request bodies too",
+        "auth only    the Authorization header alone (Basic auth too): safest, if the API reads it there"], 0)
+    opt = (":query" if where.startswith("also query") else ":body" if where.startswith("also body")
+           else ":headers=[authorization]" if where.startswith("auth only") else "")
     return f"{var}{opt}@{hosts}", None
 
 
@@ -8150,7 +8152,20 @@ def section_secrets(box, config, ctx):
             return
 
 
-GH_SPEC = "GH_TOKEN@github.com,api.github.com"
+# Both tokens are substituted in the Authorization header ONLY (msb 0.7.8's
+# `headers=`): git over https sends the GitHub token there as Basic auth, gh and
+# the API as `token`/`Bearer`, and Claude Code its OAuth token as `Bearer`
+# (checked in its binary). In any other header the placeholder goes out as the
+# literal `$MSB_<VAR>`, so a guest cannot have an allowed host reflect a header
+# it chose, with the real token in it, back to it.
+GH_SPEC = "GH_TOKEN:headers=[authorization]@github.com,api.github.com"
+
+
+def preset_spec(preset):
+    """A [secret_presets.*] table as a binding: `ENV[:headers=[...]]@HOSTS`."""
+    headers = preset.get("headers") or []
+    opts = f":headers=[{','.join(headers)}]" if headers else ""
+    return f"{preset['env']}{opts}@{','.join(preset['hosts'])}"
 
 
 def _github_state(box):
