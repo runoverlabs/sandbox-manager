@@ -6471,17 +6471,20 @@ def msb_bound_secrets(name):
 
 def rotate_live(box, var, flags, env):
     """Give a RUNNING sandbox the value `env` now holds for `var`, which msb
-    already binds: `msb modify --secret` with the very spec the sandbox was
-    started with (from secret_env()'s `flags`), so its hosts and substitution
-    rule are restated unchanged and only the value differs. msb applies that
-    live (0.7.12, checked: the guest kept running and its next request carried
-    the new value): no restart. False when `flags` has no spec for `var`
-    (no value stored for it now)."""
+    already binds: `msb modify --secret VAR@HOSTS`, the hosts from the spec it
+    would be started with (secret_env()'s `flags`) and NO options. Without
+    options msb (0.7.9+) keeps the binding's stored substitution rule and its
+    passthrough hosts, so only the value changes, which it applies live
+    (0.7.12, checked: the guest kept running, its next request carried the new
+    value, the rule and passthrough were unchanged). Restating the options
+    instead would turn a rule that changed since create into a restart msb
+    refuses to do unasked. False when `flags` has no spec for `var` (no value
+    stored for it now)."""
     spec = next((flags[i + 1] for i, f in enumerate(flags)
                  if f == "--secret" and binding_var(flags[i + 1]) == var), None)
     if spec is None:
         return False
-    run(["msb", "modify", box.name, "--secret", spec], env=env)
+    run(["msb", "modify", box.name, "--secret", f"{var}@{spec.rpartition('@')[2]}"], env=env)
     return True
 
 
