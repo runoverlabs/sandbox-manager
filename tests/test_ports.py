@@ -113,5 +113,71 @@ class PortUrlTest(MsbctlTest):
         self.assertEqual(doc["port_urls"], {"3000:5173": "http://127.0.0.1:3000/"})
 
 
+
+class PortApplyTest(MsbctlTest):
+    """`msbctl port` changes an existing sandbox with `msb modify` (msb 0.7.9+),
+    which keeps it: no rebuild. A running one gets it on its next start, or
+    now with --restart."""
+
+    def setUp(self):
+        super().setUp()
+        self.make_folder_sandbox("web", entry_extra='ports = ["3000:5173"]\n')
+
+    def created(self, state="running"):
+        code, _, err = self.run_main("start", "web")
+        self.assertEqual(code, 0, err)
+        self.set_state(web=state)
+
+    def port(self, *argv):
+        code, out, err = self.run_main("port", "web", *argv)
+        self.assertEqual(code, 0, err)
+        return out + err
+
+    def modifies(self):
+        return [c["argv"][2:] for c in self.msb_calls("modify")]
+
+    def ports_in_msb(self):
+        return self.fake_state()["_ports"]["web"]
+
+    def test_not_created_yet_only_records(self):
+        out = self.port("8080")
+        self.assertIn("published when the sandbox is created", out)
+        self.assertEqual(self.modifies(), [])
+        self.assertIn("8080:8080", self.m.read_toml(self.entry_path("web"))["ports"])
+
+    def test_stopped_applies_without_a_restart(self):
+        self.created("stopped")
+        out = self.port("8080")
+        self.assertEqual(self.modifies(), [["--port", "8080:8080"]])
+        self.assertIn("published from the next start", out)
+        self.assertNotIn("rebuild", out)
+        self.assertEqual(self.msb_calls("rm"), [])
+
+    def test_running_waits_for_the_next_start_unless_restart(self):
+        self.created()
+        self.port("8080")
+        self.assertEqual(self.modifies(), [["--port", "8080:8080", "--next-start"]])
+        self.port("9090", "--restart")
+        self.assertEqual(self.modifies()[-1], ["--port", "9090:9090", "--restart"])
+
+    def test_removal_names_the_host_endpoint(self):
+        self.created("stopped")
+        self.port("--rm", "3000:5173")
+        self.assertEqual(self.modifies(), [["--port-rm", "127.0.0.1:3000/tcp"]])
+        self.assertEqual(self.ports_in_msb(), [])
+
+    def test_the_old_rebuild_flag_restarts_instead(self):
+        self.created()
+        out = self.port("8080", "--rebuild")
+        self.assertEqual(self.modifies(), [["--port", "8080:8080", "--restart"]])
+        self.assertIn("--restart applies it now", out)
+        self.assertEqual(self.msb_calls("rm"), [])
+
+    def test_nothing_to_send_when_msb_already_has_them(self):
+        self.created("stopped")
+        self.m.apply_ports(self.m.Sandbox("web", self.m.load_config()), restart=False)
+        self.assertEqual(self.modifies(), [])
+
+
 if __name__ == "__main__":
     main()

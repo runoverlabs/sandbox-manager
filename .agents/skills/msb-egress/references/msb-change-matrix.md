@@ -16,7 +16,7 @@ a rebuild cycle you could have planned for.
 | TLS interception | **no** | rebuild | emitted at create with the rules |
 | DNS rebind protection | **no** | rebuild | `allow_private_dns` |
 | mounts (dir, named, owned) | **no** | rebuild | `mount`, `edit` → Extra folders |
-| published ports | **no** (`modify` has no port option in the 0.7.7 source) | rebuild | `port` |
+| published ports | yes (0.7.9+: `--port`, `--port-rm [BIND:]HOST[/proto]`; removing one msb lacks fails) | next start, or `--restart` | `port`, `edit` → Ports (`apply_ports()`, which diffs against `msb inspect`) |
 | owned / named disks | **no** | rebuild | `pick_caches()`, `pick_disks()` |
 | image | **no** | rebuild | `dev.yaml` `image:` + `rebuild` |
 

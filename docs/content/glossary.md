@@ -13,7 +13,7 @@ covered in full.
 | **agent filter** | the per-sandbox process on the host that stands in front of your SSH agent. It lists and signs only with the keys you picked, and nothing reaches the guest but its answers. [Credentials & SSH](credentials.md#ssh-the-filtered-agent) |
 | **`base`** | the rule group every sandbox gets, always first: DNS, the Ubuntu mirrors over HTTPS, and a deny of plain HTTP. [Rule groups](egress.md#rule-groups) |
 | **bootstrap** | `bootstrap.sh`, run once inside a new sandbox to install its packages, node, the agents and what its features ask for. It reports every failure at the end rather than stopping at the first. [The bootstrap](how-it-works.md#the-bootstrap) |
-| **create time** | when the VM is made, by the first `start` or a `rebuild`. Egress rules, mounts, ports, the image and environment variables are fixed then, so changing one needs a rebuild. [Create time vs. restart](how-it-works.md#create-time-vs-restart) |
+| **create time** | when the VM is made, by the first `start` or a `rebuild`. Egress rules, mounts, the image and environment variables are fixed then, so changing one needs a rebuild. [Create time vs. restart](how-it-works.md#create-time-vs-restart) |
 | **egress** | connections from the sandbox out. Deny-by-default: only what a rule allows gets out. [Network & egress](egress.md) |
 | **feature** | what the wizard offers instead of raw rules: `python`, `podman` and so on. Each brings its packages *and* the rule groups it needs. [Get started](quickstart.md#2-register-a-project) |
 | **guest** | the inside of the VM. The **host** is the machine running it, where msbctl, your config and your tokens live. |

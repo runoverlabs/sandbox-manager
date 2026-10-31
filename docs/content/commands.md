@@ -418,18 +418,22 @@ Add an [extra host folder](folders.md#extra-folders). `DEST` defaults to
 ### `msbctl port`
 
 ```text
-msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--rebuild]
+msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--restart]
 ```
 
 Publish a host port to a server inside the sandbox, so `http://localhost:PORT`
 on this machine reaches it. A bare `PORT` is the same on both sides. With no
 ports given it lists them, each tcp port's host side a clickable hyperlink to
-its URL (on a terminal). Needs a rebuild. See [Reaching a server in the
+its URL (on a terminal). No rebuild: an existing sandbox is changed with
+`msb modify` and keeps its state. A stopped one has the change when it next
+starts; a running one on its next start, or now with `--restart` (on a
+terminal, msbctl asks). See [Reaching a server in the
 sandbox](folders.md#reaching-a-server-in-the-sandbox).
 
 | Option | Meaning |
 | --- | --- |
 | `--rm PORT` | stop publishing this one; repeatable |
+| `--restart` | apply it now, restarting the sandbox if it is running |
 | `--rebuild` | rebuild now, so it takes effect |
 
 ### `msbctl secret`
