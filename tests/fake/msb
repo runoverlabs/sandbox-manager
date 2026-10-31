@@ -14,8 +14,9 @@ refuses anything it does not know so that an unexpected call fails loudly.
     FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.12's
                        does: "ok", "warn" (exit 0 with a warning) or "fail"
 
-`ls` prints the text table msbctl's msb_table() parses (a header, then
-`name image state created`); keep scripts/screenshots/bin/msb on the same shape.
+`ls --format json` prints what msbctl's msb_table() reads (`name`, `status`
+as msb spells it, `Running`), plain `ls` msb's text table; keep
+scripts/screenshots/bin/msb on the same shape.
 """
 import hashlib
 import json
