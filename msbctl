@@ -1620,13 +1620,12 @@ class Sandbox:
                                           defaults.get("containers_disk", ""))
         # Whether the guest gets /dev/kvm. A pinned project key (it hands the
         # guest the host's KVM), which the registry entry overrides and
-        # [defaults] fills in. See NESTED_VIRT_NOTE.
-        self.nested_virt = self._pick("nested_virt", defaults.get("nested_virt", False))
-        if not isinstance(self.nested_virt, bool):
-            where = (registry_path(self) if "nested_virt" in self.entry else
-                     project_path(self) if "nested_virt" in self.project_cfg else CONFIG_FILE)
-            die(f"{self.name}: nested_virt {self.nested_virt!r} is not true or false "
-                f"— fix it in {tilde(where)}")
+        # [defaults] fills in. See NESTED_VIRT_NOTE. Checked at create
+        # (create_flags()), not here: sandbox.toml is writable from the guest,
+        # and a bad value must not stop `show` or `stop`. A client's sandbox
+        # never gets it (managed_provision() passes false).
+        self.nested_virt_setting = self._pick("nested_virt", defaults.get("nested_virt", False))
+        self.nested_virt = self.nested_virt_setting is True and not self.is_managed
         self.claude_auth = defaults.get("claude_auth", "secret")
         # Registry only: token names exist on this machine, not in the project.
         self.claude_token_pinned = self.entry.get("claude_token", "")
@@ -2394,6 +2393,11 @@ class Sandbox:
         # Always stated, true or false: left out, msb falls back to its own
         # `sandbox_defaults.nested_virt`, a file msbctl neither writes nor shows.
         # `=` is required: msb's flag takes an optional value.
+        if not isinstance(self.nested_virt_setting, bool):
+            where = (self._origin("nested_virt") if "nested_virt" in self.entry
+                     or "nested_virt" in self.project_cfg else CONFIG_FILE)
+            die(f"{self.name}: nested_virt {self.nested_virt_setting!r} is not true or false "
+                f"— fix it in {tilde(where)}")
         flags += [f"--nested-virt={'true' if self.nested_virt else 'false'}"]
         # From sandbox.toml / the registry / [defaults], never from dev.yaml,
         # which is not passed to msb. Flags also win over an msb_conf
@@ -7290,8 +7294,8 @@ def section_defaults(config, ctx):
                 note(line)
             note("This is the default for sandboxes whose project does not say: a project's")
             note("`nested_virt` (podman sets it) and `msbctl edit` → Nested virtualization win.")
-            on = choose_one("give sandboxes /dev/kvm by default", ["off", "on"],
-                            1 if d.get("nested_virt", False) is True else 0) == "on"
+            on = choose_one("give sandboxes /dev/kvm by default", ["on", "off"],
+                            0 if d.get("nested_virt", False) is True else 1) == "on"
             set_toml_key(CONFIG_FILE, "nested_virt", on, table="defaults")
             note("applies at each sandbox's next create or rebuild")
         else:
@@ -7933,9 +7937,11 @@ def section_features(box, config, ctx):
             changed.append(True)
     if any(changed):
         ctx["rebuild"].add("features, egress groups and packages")
-    # Only ever turned ON here: KVM may be wanted for more than the feature
-    # that brought it, so unticking podman leaves it to its own section.
-    if plan.get("nested_virt") and not box.nested_virt:
+    # Only ever turned ON here, and only as podman is ADDED: KVM may be wanted
+    # for more than the feature that brought it, so unticking podman leaves it
+    # to its own section, and so does a later visit with podman still ticked
+    # (which must not undo an explicit off there).
+    if plan.get("nested_virt") and not box.nested_virt and "podman" not in cur["features"]:
         set_toml_key(edit_target(box, "nested_virt"), "nested_virt", True)
         note("podman turns on nested virtualization: the guest gets /dev/kvm")
         ctx["rebuild"].add("nested virtualization")
@@ -8035,13 +8041,14 @@ NESTED_VIRT_NOTE = (
 )
 
 
-def _nested_virt_origin(box):
-    return ("this machine's entry" if "nested_virt" in box.entry else
-            "the project" if "nested_virt" in box.project_cfg else "the default")
-
-
 def _summary_nested_virt(box):
-    return f"{'on' if box.nested_virt else 'off'} ({_nested_virt_origin(box)})"
+    if box.is_managed:
+        return "off (always, for a client's sandbox)"
+    if "nested_virt" not in box.entry and "nested_virt" not in box.project_cfg:
+        origin = "the default"
+    else:
+        origin = "this machine's entry" if box._origin("nested_virt") == registry_path(box) else "the project"
+    return f"{_onoff(box.nested_virt_setting)} ({origin})"
 
 
 def section_nested_virt(box, config, ctx):
@@ -8049,7 +8056,7 @@ def section_nested_virt(box, config, ctx):
     for line in NESTED_VIRT_NOTE:
         note(line)
     on = choose_one("/dev/kvm in this sandbox", ["on", "off"], 0 if box.nested_virt else 1) == "on"
-    if on != box.nested_virt and set_toml_key(edit_target(box, "nested_virt"), "nested_virt", on):
+    if on != box.nested_virt_setting and set_toml_key(edit_target(box, "nested_virt"), "nested_virt", on):
         ctx["rebuild"].add("nested virtualization")
 
 
