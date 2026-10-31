@@ -6,8 +6,9 @@ description: "What ships and how it installs: install.sh --dev versus --package 
 # Packaging
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 - `install.sh` — two modes: `--dev` (a git checkout; symlinks the commands into it) and `--package` (copies the tree to `~/.local/share/msb-manager/versions/<v>/`, `current` link, commands link through it; keeps current + previous). Seeds `~/.config/msb/` from templates, never overwrites, `--uninstall` removes only what it owns. Never reads stdin (it runs under `curl | sh`) and has no backticks in its unquoted heredoc (they execute).
 - `get.sh` — the `curl | sh` entry point (POSIX sh, modeled on microsandbox's installer): resolves the latest release via the GitHub API, downloads the tarball, verifies its sha256, runs the installer inside it. `@@GITHUB_REPO@@` is filled in by `scripts/package.sh`; `MSB_MANAGER_BASE_URL` (+ `--version`) serves assets from a mirror or `file://` for testing.
