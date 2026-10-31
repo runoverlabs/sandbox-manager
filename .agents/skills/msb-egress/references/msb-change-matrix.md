@@ -26,8 +26,10 @@ use it and everything else cannot. **CLI flags override `--conf`.**
 
 ## Passing secrets to `modify`
 
-Always pass `box.secret_env()` when applying `modify`: on 0.7.6 the call fails
-if any bound secret's host-side variable is unset. Re-enabling interception
+Always pass `box.secret_env()` when applying `modify`: a binding added or
+rotated takes its value from msb's environment. (0.7.6 also failed the call
+when any bound variable was unset; 0.7.12 does not, checked with a label
+change.) Re-enabling interception
 after it was lost also goes through `modify --secret`.
 
 ## Disks
