@@ -1968,11 +1968,13 @@ class Sandbox:
         """"enforce" (deny-by-default, the point of this tool) or "observe".
 
         OBSERVE IS A DELIBERATE, TEMPORARY DOWNGRADE, not a softer policy. It
-        exists because msb cannot report a denial: it logs what it ALLOWS and
-        says nothing at all about what it blocks, at any log level (re-verified
-        on 0.7.7 at --debug and --trace). So there is no "warn but permit" to
-        emit, and the only way to learn what a sandbox actually needs is to let
-        it through and write down where it went.
+        exists because msb hardly reports a denial: it logs what it ALLOWS, and
+        of what it blocks only an HTTPS connection on an intercepted port, at
+        DEBUG (`TLS egress denied by default policy sni=…`, since 0.7.12), which
+        an enforcing sandbox does not run at: msb has no per-module filter, and
+        DEBUG is ~6 KB of virtio noise per request. Off :443 nothing at all. So
+        there is no "warn but permit" to emit, and the only way to learn what a
+        sandbox actually needs is to let it through and write down where it went.
 
         What that costs while it is on: egress is unrestricted, so a sandbox can
         reach anywhere and anything in it could exfiltrate. Secrets are NOT
@@ -5668,10 +5670,11 @@ def cmd_allow(args, config):
 # ------------------------------------------------------- the observation log
 #
 # msb's own log is the only record of where a sandbox went, and it is a record
-# of SUCCESSES: a denied connection is logged at no level at all (checked on
-# 0.7.7 at --debug and --trace), which is the whole reason observe mode has to
-# unblock before it can measure. Two line shapes carry a destination, both at
-# DEBUG only:
+# of SUCCESSES. Of a denial it logs only an HTTPS one on an intercepted port, at
+# DEBUG (`TLS egress denied by default policy sni=<host> dst=<ip:port>`, 0.7.12),
+# which an enforcing sandbox does not run at (see Sandbox.egress_mode), and off
+# :443 nothing — which is why observe mode has to unblock before it can
+# measure. Two line shapes carry a destination, both at DEBUG only:
 #
 #   …engine::tls::proxy: TLS intercept sni=github.com dst=140.82.113.3:443
 #   …engine::dns::forwarder: DNS query family is inactive … domain=github.com
@@ -5747,9 +5750,11 @@ LOG_FIELD = re.compile(r"\b(\w+)=(\S*)")
 def secret_violations(name):
     """{(var, host, location): {hits, last}} — requests msb KILLED over a secret.
 
-    Nothing else reports these. The guest sees its TLS connection drop and calls
-    it ECONNRESET; the rule set is irrelevant and allowing the host does not
-    help, because this is the secret policy and not the network one. See
+    Nothing else reports these. The guest gets an HTTP 403 whose JSON says
+    `secret_policy_denied` where msb can safely answer (msb 0.7.9+: the first
+    HTTP/1 request on a connection), and otherwise sees its TLS connection
+    drop and calls it ECONNRESET; the rule set is irrelevant and allowing the
+    host does not help, because this is the secret policy and not the network one. See
     AGENT_TRANSCRIPT_HOSTS. Logged at WARN, so unlike the host record this is
     there in enforce mode too, at msb's default verbosity.
     """
@@ -5782,7 +5787,8 @@ def report_secret_violations(box):
         return False
     say(f"{RED}{BOLD}Requests BLOCKED by the secret policy{RESET}")
     note("These never reached the network, whatever the egress rules say. The")
-    note("guest sees only a dropped connection — an agent reports it as")
+    note("guest gets a 403 saying `secret_policy_denied` or, where msb cannot answer,")
+    note("a dropped connection — an agent reports that as")
     note("`API Error: Connection dropped (ECONNRESET)`.")
     note("")
     for (var, host, where), info in sorted(hits.items(), key=lambda kv: -kv[1]["hits"]):

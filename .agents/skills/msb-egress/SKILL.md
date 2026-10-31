@@ -104,8 +104,12 @@ in the guest can unmount it, so the pin is the actual control.
 
 ## Measuring instead of guessing
 
-msb **never logs a denial at any log level** (re-checked on 0.7.7 at
-`--debug`/`--trace`). It logs what it allows: at debug, `TLS intercept
+msb logs a denial only for HTTPS on an intercepted port, at debug (0.7.12:
+`TLS egress denied by default policy sni=<host> dst=<ip:port>`), and enforce
+mode does not run at debug: msb has no per-module filter and debug is ~6 KB of
+virtio noise per request. Off :443 a denial is never logged. The guest, though,
+gets a JSON 403 (`network_policy_denied` / `secret_policy_denied`, with
+`domain`) for a refused HTTP(S) request since 0.7.9. It logs what it allows: at debug, `TLS intercept
 sni=<host> dst=<ip:port>` and a `dns::` line for a resolved name, in
 `~/.microsandbox/sandboxes/<name>/logs/runtime.log`. **Nothing is logged for a
 plain TCP connect on a non-443 port** — off 443, a DNS lookup is the only

@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Changed
+- The CLAUDE.md every sandbox's agent gets explains msb's JSON `403` denials (msb 0.7.9+): `network_policy_denied` names the refused `domain` to report, and `secret_policy_denied` means a credential placeholder went where it isn't bound. The docs no longer say msb never logs a denial: it logs a refused HTTPS connection at debug level, which is why observe mode is still how to learn what a sandbox needs.
+
 ## [0.10.0] - 2026-10-30
 
 ### Added

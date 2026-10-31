@@ -37,6 +37,18 @@ in the project's `.msb/sandbox.toml`, made and approved by the operator on the
 host, and the whole allowlist is deliberately built from denials that actually
 happened rather than from guesses.
 
+A refused HTTP or HTTPS request usually comes back as **`403 Forbidden`** with a
+JSON body from the sandbox itself, not from the server:
+
+- `{"code":"network_policy_denied","domain":"…"}` — that host isn't allowed.
+  Report the `domain` and the port; don't retry or route around it.
+- `{"code":"secret_policy_denied","domain":"…"}` — a credential placeholder
+  (`$GH_TOKEN` and the like) went somewhere it isn't bound to, or into a part of
+  the request where it isn't substituted. Report what you sent and where. Never
+  try to get the real value some other way.
+
+Anything that isn't HTTP just fails to connect.
+
 If a fetch over `http://` fails, the fix is its `https://` URL. A hostname rule
 on a plaintext port is enforced as a set of IP addresses and breaks against
 address pools, which is why plaintext is simply off.
