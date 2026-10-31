@@ -11,7 +11,7 @@ a rebuild cycle you could have planned for.
 | memory | yes | after restart | `resize`, `edit` → Resources |
 | root disk | yes, **grow only** | live | `resize`, `pick_disks()` |
 | env | yes | after restart | `modify -e` |
-| secrets | yes | add on next start, removal live | `secret set/add/rm`, `bind_secret_live()` |
+| secrets | yes | a new value for a bound one LIVE (restate its exact spec; 0.7.12), add on next start, removal live | `secret set/add/rm`, `bind_secret_live()`, `rotate_live()` |
 | network rules | **no** | rebuild | `allow`, `edit` → Egress |
 | TLS interception | **no** | rebuild | emitted at create with the rules |
 | DNS rebind protection | **no** | rebuild | `allow_private_dns` |

@@ -6469,27 +6469,46 @@ def msb_bound_secrets(name):
         return None
 
 
+def rotate_live(box, var, flags, env):
+    """Give a RUNNING sandbox the value `env` now holds for `var`, which msb
+    already binds: `msb modify --secret` with the very spec the sandbox was
+    started with (from secret_env()'s `flags`), so its hosts and substitution
+    rule are restated unchanged and only the value differs. msb applies that
+    live (0.7.12, checked: the guest kept running and its next request carried
+    the new value): no restart. False when `flags` has no spec for `var`
+    (no value stored for it now)."""
+    spec = next((flags[i + 1] for i, f in enumerate(flags)
+                 if f == "--secret" and binding_var(flags[i + 1]) == var), None)
+    if spec is None:
+        return False
+    run(["msb", "modify", box.name, "--secret", spec], env=env)
+    return True
+
+
 def bind_secret_live(box, config, spec, restart):
     """After a value for `spec` was stored: make the existing sandbox use it.
-    Already bound, a restart is all it takes (msb reads the value at start);
-    not bound yet, `msb modify --secret` adds the binding, applied at the next
-    start or, with `restart`, now."""
+    Already bound, a running sandbox gets the new value live (rotate_live()),
+    and a stopped one reads it at its next start. Not bound yet, `msb modify
+    --secret` adds the binding, which msb applies at the next start or, with
+    `restart`, now; `restart` None asks, on a terminal."""
     state = state_of(box.name)
     if state == "absent":
         note("not created yet, so it is bound at first start")
         return
     box = Sandbox(box.name, config)
-    _, env = box.secret_env()
+    flags, env = box.secret_env()
     bound = msb_bound_secrets(box.name)
     if bound is not None and binding_var(spec) in bound:
-        if restart and state == "running":
-            run(["msb", "stop", box.name], check=False, quiet=True)
-            ensure_running(box)
-            note(f"{box.name} restarted with the new value")
+        if state != "running":
+            note(f"used from the next start of {box.name}")
+        elif rotate_live(box, binding_var(spec), flags, env):
+            note(f"{box.name} uses the new value now (nothing restarted)")
         else:
-            note(f"used from the next start of {box.name}"
-                 + ("" if state != "running" else f" (`--restart`, or `msbctl stop {box.name}` and start)"))
+            note(f"no value for {binding_var(spec)} now: nothing to hand {box.name}")
         return
+    if restart is None:
+        restart = state == "running" and sys.stdin.isatty() and confirm(
+            f"binding it is new to {box.name}: apply now — this restarts it?")
     if ":" in spec.split("@", 1)[0]:
         note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
         return
@@ -7727,11 +7746,34 @@ def store_claude_token(args):
     value = read_secret_input(f"the Claude token {name!r}", args.stdin)
     set_env_file_value(GLOBAL_ENV, claude_token_var(name), value)
     note(f"Claude token {name!r} stored in {stored_where(GLOBAL_ENV, claude_token_var(name))}; "
-         "read at each sandbox's next start")
+         "running sandboxes using it get it now, the others at their next start")
+    rotate_claude_token(name)
     if args.default:
         ensure_local_config()
         set_toml_key(CONFIG_FILE, "claude_token", name, table="defaults")
         note(f"{name!r} is now the default Claude token for new sandboxes")
+
+
+def rotate_claude_token(name):
+    """Hand a replaced Claude token to every RUNNING sandbox that logs in with
+    it, live (rotate_live()). One that cannot be read or updated is warned
+    about and skipped: the value is stored, and it reads it at its next start."""
+    table = msb_table()
+    config = load_config()
+    for other in registered():
+        if table.get(other) != "running":
+            continue
+        try:
+            box = Sandbox(other, config)
+            # A client's sandbox binds what its client provisioned, not this.
+            if box.is_managed or box.claude_token != name or \
+                    CLAUDE_TOKEN_VAR not in (msb_bound_secrets(other) or ()):
+                continue
+            flags, env = box.secret_env()
+            if rotate_live(box, CLAUDE_TOKEN_VAR, flags, env):
+                note(f"{other} uses it now")
+        except (SystemExit, subprocess.CalledProcessError) as exc:
+            warn(f"{other}: not updated ({exc}) — it gets the token at its next start")
 
 
 def store_identity(args):
@@ -8164,9 +8206,9 @@ def section_github(box, config, ctx):
             return
         if project:
             set_toml_key(project, "github", True, table="secrets")
-        # A running guest keeps its current placeholder bindings until restarted.
-        restart = state == "running" and confirm(f"apply now — this restarts {box.name}?")
-        bind_secret_live(box, config, GH_SPEC, restart)
+        # A new value for a binding msb has is applied live; only a binding
+        # that is new to the running sandbox needs a restart, which it asks.
+        bind_secret_live(box, config, GH_SPEC, None)
     elif action.startswith("remove"):
         set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), "GH_TOKEN", None)
         if project:
@@ -8189,8 +8231,8 @@ def _summary_claude_token(box):
 
 
 def section_claude_token(box, config, ctx):
-    """Which named Claude token this sandbox logs in with. The value is read on
-    every start, so a change is a restart, never a rebuild."""
+    """Which named Claude token this sandbox logs in with. The binding stays
+    the same and only its value changes, so a running sandbox gets it live."""
     say("Claude token")
     tokens = claude_tokens()
     if not box.wants_component("claude"):
@@ -8211,17 +8253,9 @@ def section_claude_token(box, config, ctx):
     if pin == box.claude_token_pinned:
         return
     set_toml_key(registry_path(box), "claude_token", pin)
-    state = state_of(box.name)
-    if state != "running":
-        note("used from its next start")
-        return
-    if not confirm(f"apply now — this restarts {box.name}?"):
-        note("saved; used from the next restart")
-        return
-    # msb reads a secret's value at start, so a restart is the whole change: the
-    # binding and the guest's placeholder stay the same, only the value differs.
-    run(["msb", "stop", box.name], check=False, quiet=True)
-    ensure_running(Sandbox(box.name, config))
+    # The binding and the guest's placeholder stay the same, only the value
+    # differs: live where msb binds it already.
+    bind_secret_live(Sandbox(box.name, config), config, CLAUDE_SPEC, None)
 
 
 def _summary_git_push(box):
@@ -16693,7 +16727,8 @@ def build_parser():
     one.add_argument("--stdin", action="store_true",
                      help="for set: read the value from stdin (one trailing newline dropped)")
     one.add_argument("--restart", action="store_true",
-                     help="for set: restart a running sandbox so the value is used now")
+                     help="for set: a binding new to a running sandbox is applied now, which "
+                          "restarts it (a new value for one it has is live anyway)")
     for verb, about in (("add", "bind an extra secret to a host"), ("rm", "unbind one"),
                         ("ls", "list them, and whether each has a value"),
                         ("set", "store the value of one already bound")):

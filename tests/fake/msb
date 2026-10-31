@@ -80,6 +80,26 @@ def create(argv, state):
         state.setdefault("_labels", {})[name] = labels
     state.setdefault("_created", {})[name] = os.environ.get(
         "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
+    state.setdefault("_secrets", {})[name] = [secret_var(argv[i + 1]) for i, a in enumerate(argv)
+                                              if a == "--secret"]
+
+
+def secret_var(spec):
+    """The variable an `ENV[:OPTIONS]@HOST` spec binds."""
+    return spec.split("@", 1)[0].split(":", 1)[0]
+
+
+def modify(argv, state):
+    """--secret / --secret-rm change the recorded bindings; anything else is a no-op."""
+    name = argv[1]
+    if name not in state:
+        sys.exit(f"fake msb: no sandbox {name}")
+    bound = state.setdefault("_secrets", {}).setdefault(name, [])
+    for i, a in enumerate(argv):
+        if a == "--secret" and secret_var(argv[i + 1]) not in bound:
+            bound.append(secret_var(argv[i + 1]))
+        elif a == "--secret-rm" and argv[i + 1] in bound:
+            bound.remove(argv[i + 1])
 
 
 def ls(argv, state):
@@ -145,10 +165,13 @@ def main():
     elif verb == ["exec"]:
         sys.stdout.write(os.environ.get("FAKE_MSB_EXEC_OUT", ""))
     elif verb == ["modify"]:
-        pass
+        modify(argv, state)
     elif verb == ["inspect"]:
         sock = os.path.join(os.environ["MSB_STATE_DIR"], "agent", f"{argv[1]}.sock")
-        print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]}}}))
+        bound = state.get("_secrets", {}).get(argv[1], [])
+        print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]},
+                                     "network": {"secrets": {"secrets": [
+                                         {"env_var": v} for v in bound]}}}}))
     elif argv[:2] == ["volume", "ls"]:
         vols = state.get("_volumes", {})
         print(json.dumps([{"name": n, **v} for n, v in vols.items()]))

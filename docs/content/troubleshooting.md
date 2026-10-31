@@ -77,7 +77,8 @@ startup. Both hosts in the `claude` group are needed: check the project's
 The sandbox's Claude token isn't stored: `msbctl show <name>` says which one it
 uses and flags it as NOT STORED. Run `msbctl setup` → "Claude login" to add it
 (or `claude setup-token` on the host and paste the result), or pick a token you
-have with `msbctl edit <name>` → "Claude token", then restart the sandbox.
+have with `msbctl edit <name>` → "Claude token". A sandbox that started with no
+token at all has nothing bound, so it needs a restart; msbctl offers one.
 
 ## pi asks "Trust project folder?", or opens with "What's New"
 

@@ -144,5 +144,61 @@ class ClaudeTokenTest(MsbctlTest):
         self.assertNotEqual(code, 0)
 
 
+class LiveRotationTest(MsbctlTest):
+    """A new value for a binding msb already has reaches a running sandbox
+    live, through `msb modify --secret` with the spec it was started with: no
+    restart, and the value only ever in msb's environment."""
+    env_keys = ("NPM_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
+    NEW = "planted-rotated-value-5d2e"
+
+    def setUp(self):
+        super().setUp()
+        self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["NPM_TOKEN@registry.npmjs.org"]\n'
+                                                     "[bootstrap]\nclaude = true\n")
+        self.store_secret(self.secrets_file("web"), "NPM_TOKEN", PLANTED)
+        self.store_secret(self.m.GLOBAL_ENV, "CLAUDE_CODE_OAUTH_TOKEN", PLANTED)
+        code, _, err = self.run_main("start", "web")
+        self.assertEqual(code, 0, err)
+
+    def modifies(self):
+        return [c for c in self.msb_calls("modify")]
+
+    def test_secret_set_rotates_without_a_restart(self):
+        code, out, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        [call] = self.modifies()
+        self.assertEqual(call["argv"][:3], ["modify", "web", "--secret"])
+        self.assertTrue(call["argv"][3].startswith("NPM_TOKEN"))
+        self.assertTrue(call["argv"][3].endswith("@registry.npmjs.org"))
+        self.assertNotIn("--restart", call["argv"])
+        self.assertNotIn("--next-start", call["argv"])
+        self.assertEqual(call["env"]["NPM_TOKEN"], self.NEW)
+        self.assertEqual(self.msb_calls("stop"), [])
+        self.assertIn("uses the new value now", out + err)
+        self.assert_not_in_argv(self.NEW)
+
+    def test_a_stopped_sandbox_reads_it_at_its_next_start(self):
+        self.set_state(web="stopped")
+        code, out, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.modifies(), [])
+        self.assertIn("next start", out + err)
+
+    def test_a_replaced_claude_token_reaches_running_sandboxes(self):
+        code, out, err = self.run_main("setup", "--claude-token", "main", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        [call] = self.modifies()
+        self.assertTrue(call["argv"][3].startswith("CLAUDE_CODE_OAUTH_TOKEN"))
+        self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], self.NEW)
+        self.assertEqual(self.msb_calls("stop"), [])
+        self.assert_not_in_argv(self.NEW)
+        self.assert_not_in_output(self.NEW, out, err)
+
+    def test_another_token_name_leaves_it_alone(self):
+        code, _, err = self.run_main("setup", "--claude-token", "work", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.modifies(), [])
+
+
 if __name__ == "__main__":
     unittest.main()

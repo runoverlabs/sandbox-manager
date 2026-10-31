@@ -449,13 +449,13 @@ Tokens the sandbox can use but never see.
 | `add` | bind a new variable: offers the presets, or takes your own binding |
 | `ls` | list the sandbox's extra bindings, and whether each has a value stored |
 | `rm VAR` | unbind one; substitution stops at once |
-| `set VAR` | store a new value for a variable the sandbox already binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt. A running sandbox uses it from its next start |
+| `set VAR` | store a new value for a variable the sandbox already binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt. A running sandbox that binds it already uses it at once, with no restart; a stopped one from its next start |
 | `migrate` | move every stored value, for every sandbox, into the desktop keyring or back into the files, and set `[secrets] store` to match |
 
 | Option | Meaning |
 | --- | --- |
 | `--stdin` | `set`: read the value from standard input; one trailing newline is dropped |
-| `--restart` | `set`: restart a running sandbox, so the value is used now |
+| `--restart` | `set`: when the binding is new to a running sandbox (its value was stored after it started), apply it now, which restarts it. Not needed for a new value |
 | `--to keyring\|file` | `migrate`: where the values go |
 | `--json` | `migrate`: print what moved as one JSON document, never a value |
 
