@@ -94,6 +94,17 @@ class DoctorTest(MsbctlTest):
         self.assertIn("older than 0.7.12", checks["msb"]["message"])
         self.assertIn("install.sh", checks["msb"]["fix"])
 
+    def test_msb_table_reads_the_json_listing(self):
+        listing = json.dumps([{"name": "web", "status": "Running"}, {"name": "api", "status": "Stopped"},
+                              {"name": "odd"}, "not a row", {"status": "Running"}])
+        done = subprocess.CompletedProcess(["msb"], 0, listing, "")
+        with mock.patch.object(self.m.subprocess, "run", lambda *a, **k: done):
+            self.assertEqual(self.m.msb_table(), {"web": "running", "api": "stopped"})
+        for out, code in (("not json", 0), ("[]", 1), ('{"name": "web"}', 0)):
+            bad = subprocess.CompletedProcess(["msb"], code, out, "")
+            with mock.patch.object(self.m.subprocess, "run", lambda *a, _b=bad, **k: _b):
+                self.assertEqual(self.m.msb_table(), {}, out)
+
     def test_every_other_command_refuses_an_older_msb(self):
         self.assertIsNone(self.m.local_problem())
         os.environ["FAKE_MSB_VERSION"] = "0.7.11"

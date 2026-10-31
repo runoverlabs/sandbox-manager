@@ -88,6 +88,16 @@ class RemoteSetupTest(RemoteBase):
             self.run_main("remote", "setup", "sbx-01", stdin="y\n\n")
         self.assertTrue(any(c.endswith(f"sh {self.m.MSB_RELEASES} 0.7.12") for c in self.commands(calls)))
 
+    def test_an_older_msb_here_is_never_copied(self):
+        patch, calls = self.ssh(probe(msb="msb 0.7.12", msbctl=f"msbctl {self.mine}"))
+        with patch, mock.patch.object(self.m, "local_msb_version", lambda: "0.7.7"):
+            code, out, err = self.run_main("remote", "setup", "sbx-01", stdin="\n")
+        self.assertEqual(code, 0, err)
+        self.assertIn("older than 0.7.12", err)
+        # The host already has the minimum: nothing to replace, no downgrade offered.
+        self.assertNotIn("replace msb", out)
+        self.assertFalse(any("get_latest_version" in c for c in self.commands(calls)))
+
     def test_without_msb_here_the_latest(self):
         patch, calls = self.ssh(probe(msb="", msbctl=f"msbctl {self.mine}"))
         with patch, mock.patch.object(self.m, "local_msb_version", lambda: None):
