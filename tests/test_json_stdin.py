@@ -3,6 +3,7 @@
 import json
 import os
 import unittest
+from unittest import mock
 
 from tests.harness import MsbctlTest
 
@@ -197,6 +198,45 @@ class LiveRotationTest(MsbctlTest):
         code, _, err = self.run_main("setup", "--claude-token", "work", "--stdin", stdin=self.NEW)
         self.assertEqual(code, 0, err)
         self.assertEqual(self.modifies(), [])
+
+
+class SecretOptionsTest(MsbctlTest):
+    """A binding with options (`:query`, `:body`) goes through `msb modify`
+    like any other (msb 0.7.9+ keeps them): no rebuild."""
+    env_keys = ("API_KEY",)
+
+    def setUp(self):
+        super().setUp()
+        self.make_folder_sandbox("web")
+        code, _, err = self.run_main("start", "web")
+        self.assertEqual(code, 0, err)
+
+    def test_secret_add_with_query_is_bound_with_modify(self):
+        presets = len(self.m.load_config().get("secret_presets", {}))
+        # custom, its name, its host, "also query"; the value from the hidden prompt.
+        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
+            code, out, err = self.run_main("secret", "add", "web",
+                                           stdin=f"{presets + 1}\nAPI_KEY\napi.example.org\n2\n")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("rebuild", out + err)
+        [call] = self.msb_calls("modify")
+        spec = call["argv"][call["argv"].index("--secret") + 1]
+        self.assertTrue(spec.startswith("API_KEY:query,passthrough=["), spec)
+        self.assertTrue(spec.endswith("@api.example.org"), spec)
+        # Not a terminal, so not asked: bound for the next start.
+        self.assertIn("--next-start", call["argv"])
+        self.assertEqual(call["env"]["API_KEY"], PLANTED)
+        self.assert_not_in_argv(PLANTED)
+
+    def test_a_stopped_sandbox_takes_it_without_a_flag(self):
+        self.set_state(web="stopped")
+        self.store_secret(self.secrets_file("web"), "API_KEY", PLANTED)
+        box = self.m.Sandbox("web", self.m.load_config())
+        self.m.bind_secret_live(box, self.m.load_config(), "API_KEY:body@api.example.org", None)
+        [call] = self.msb_calls("modify")
+        self.assertTrue(call["argv"][3].startswith("API_KEY:body,passthrough=["))
+        self.assertNotIn("--restart", call["argv"])
+        self.assertNotIn("--next-start", call["argv"])
 
 
 if __name__ == "__main__":

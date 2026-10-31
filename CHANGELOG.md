@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Changed
+- `msbctl secret add` (and a value stored for such a binding with `secret set`) binds a secret with options, `VAR:query@host` or `VAR:body@host`, on an existing sandbox without a rebuild, like any other binding. Declining the restart it offers now binds it for the next start instead of not at all, and the binding gets the same transcript passthrough as at create.
 - A new value for a secret a running sandbox already binds reaches it live, with nothing restarted: `msbctl secret set`, `edit` → GitHub token, `edit` → Claude token, and replacing a stored Claude token with `msbctl setup --claude-token NAME`, which updates every running sandbox that uses it. `secret set --restart` is now only needed for a binding the running sandbox does not have yet.
 
 ## [0.10.0] - 2026-10-30

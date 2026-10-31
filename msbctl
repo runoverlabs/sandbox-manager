@@ -6512,9 +6512,8 @@ def bind_secret_live(box, config, spec, restart):
     if restart is None:
         restart = state == "running" and sys.stdin.isatty() and confirm(
             f"binding it is new to {box.name}: apply now — this restarts it?")
-    if ":" in spec.split("@", 1)[0]:
-        note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
-        return
+    # The spec as create would pass it, options included (`:query`, `:body`,
+    # `headers=`): msb 0.7.9+ stores a binding's options from `modify` too.
     argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec, box.transcript_hosts)]
     if state == "running":
         argv.append("--restart" if restart else "--next-start")
@@ -6710,14 +6709,11 @@ def cmd_secret(args, config):
     note(f"recorded in {tilde(target)}")
     if state_of(box.name) == "absent":
         return
-    if ":" in spec.split("@", 1)[0]:
-        note(f"it uses a non-default location, which `msb modify` cannot set: `msbctl rebuild {box.name}`")
-        return
-    if confirm(f"apply now — this restarts {box.name}?"):
-        # Re-read the sandbox so every binding, including the one just added,
-        # contributes its variable: modify validates them all.
-        _, secret_vars = Sandbox(box.name, config).secret_env()
-        run(["msb", "modify", box.name, "--secret", spec, "--restart"], env=secret_vars)
+    # Re-read the sandbox so the binding just added contributes its variable.
+    # New to msb, so a running sandbox gets it now with a restart (asked) or
+    # at its next start; the spec carries the transcript passthrough a create
+    # would give it.
+    bind_secret_live(Sandbox(box.name, config), config, spec, None)
 
 
 def remove_from_toml_list(path, key, item):
