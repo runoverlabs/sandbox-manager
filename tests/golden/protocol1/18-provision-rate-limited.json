@@ -8,7 +8,9 @@
  "key": "kandev",
  "msb": [
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ]
  ],
  "stdout": "{\n  \"error\": {\n    \"code\": \"rate_limited\",\n    \"message\": \"this host is at its [kandev] limits\",\n    \"retry_after_seconds\": 30\n  }\n}\n"
