@@ -72,8 +72,8 @@ way git rewrites the remote's URL itself (`insteadOf` in `/etc/gitconfig`), so
 never change a remote's URL or add a credential helper to make a push work.
 
 **`GH_TOKEN`** is an opaque placeholder. The real token is substituted on the
-host, into request **headers only**, on the way out to `github.com` and
-`api.github.com`. So this works:
+host, into the **`Authorization` header only**, on the way out to `github.com`
+and `api.github.com`. So this works:
 
 ```sh
 curl -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/user
@@ -81,10 +81,10 @@ gh api user
 ```
 
 `https://x:$GH_TOKEN@api.github.com/…` works as well — curl turns userinfo into
-an `Authorization: Basic` header before sending, so that is a header too.
+an `Authorization: Basic` header before sending, so that is the same header.
 
-What does **not** work is a placeholder in a query string or a request body.
-Those are outside the headers, so the real value is never substituted there and
+What does **not** work is a placeholder in any other header, a query string or
+a request body. The real value is never substituted there, and
 the request either fails or carries meaningless literal text. That is the
 design, not a bug. Never try to work around it by moving a credential into a
 URL — report what refused you instead.

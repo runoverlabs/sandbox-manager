@@ -68,7 +68,13 @@ close egress.
 `msb --secret ENV[:OPTIONS]@HOST` puts a **placeholder** in the guest env and
 substitutes the real value host-side, into **request headers only** (HTTP
 Basic auth included) for the named hosts. Query strings and bodies are not
-substituted unless the binding opts in with `:query` / `:body`. Never put a
+substituted unless the binding opts in with `:query` / `:body`. `headers=[a,b]`
+(msb 0.7.8+) narrows headers to those fields; `GH_SPEC` and the presets
+(`preset_spec()`) say `headers=[authorization]`, so a host echoing a header
+back cannot leak the value. `CLAUDE_SPEC` does not yet: scope it only after a
+live Claude Code login through a scoped binding works, since a wrong scope
+logs every sandbox out. Rotation (`rotate_live()`) sends no options
+and so keeps whatever rule a sandbox was created with. Never put a
 credential in a URL, and never work around the restriction.
 
 **A placeholder in a request body is destroyed, and that breaks coding
@@ -93,10 +99,13 @@ Two authority rules, both enforced in `secret_env()`:
 
 ## Applying a change
 
-Network rules, TLS interception, DNS rebind protection, mounts, published
-ports, owned disks and the image are **create-time**: `msbctl allow` / `mount`
-/ `port` record them and say a rebuild is needed. `msb modify` cannot change
-them. Full verified matrix: [references/msb-change-matrix.md](references/msb-change-matrix.md).
+Network rules, TLS interception, DNS rebind protection, mounts, owned disks
+and the image are **create-time**: `msbctl allow` / `mount` record them and say
+a rebuild is needed; `msb modify` cannot change them. Published ports are not
+(msb 0.7.9+): `port` and `edit` → Ports save them with `msb modify --port` /
+`--port-rm --next-start` (`apply_ports()`), then restart through msbctl's own
+stop + `ensure_running()`, never `modify --restart`, which skips the secrets'
+environment and the per-boot plumbing. Full verified matrix: [references/msb-change-matrix.md](references/msb-change-matrix.md).
 
 Anything that writes a pinned key (`PINNED_KEYS`: egress, bindings, `[secrets]`,
 resources, caches) must call `check_policy()` **before** writing — so a pending

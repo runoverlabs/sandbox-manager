@@ -43,7 +43,7 @@ create time.
 ## Reaching a server in the sandbox
 
 ```console
-$ msbctl port . 8080 --rebuild        # http://localhost:8080 reaches :8080 inside
+$ msbctl port . 8080 --restart        # http://localhost:8080 reaches :8080 inside
 $ msbctl port . 3000:5173             # host 3000 to a dev server on 5173
 $ msbctl port .                       # list them; --rm 8080 removes one
 ```
@@ -59,5 +59,6 @@ port binds to `127.0.0.1` only; `0.0.0.0:8080:8080` opens it to your network,
 and `msbctl` says so. The connection comes in rather than going out, so the
 egress rules don't apply. Ports are stored in the registry entry, not the
 project, since a host port is one machine's to hand out; `msbctl` warns when
-another sandbox already publishes the same one. They're fixed at create time,
-and `msbctl edit` → "Published ports" changes them too.
+another sandbox already publishes the same one. A change needs no rebuild: the
+sandbox keeps its state and has the new ports from its next start, or at once
+with `--restart`. `msbctl edit` → "Published ports" changes them too.

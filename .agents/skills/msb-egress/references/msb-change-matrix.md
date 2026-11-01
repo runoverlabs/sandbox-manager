@@ -11,14 +11,15 @@ a rebuild cycle you could have planned for.
 | memory | yes | after restart | `resize`, `edit` → Resources |
 | root disk | yes, **grow only** | live | `resize`, `pick_disks()` |
 | env | yes | after restart | `modify -e` |
-| secrets | yes | add on next start, removal live | `secret set/add/rm`, `bind_secret_live()` |
+| secrets | yes | a new value for a bound one LIVE (`VAR@HOSTS`, no options: the stored rule and passthrough are kept; 0.7.12), add on next start, removal live | `secret set/add/rm`, `bind_secret_live()`, `rotate_running()` |
 | network rules | **no** | rebuild | `allow`, `edit` → Egress |
 | TLS interception | **no** | rebuild | emitted at create with the rules |
 | DNS rebind protection | **no** | rebuild | `allow_private_dns` |
 | mounts (dir, named, owned) | **no** | rebuild | `mount`, `edit` → Extra folders |
-| published ports | **no** (`modify` has no port option in the 0.7.7 source) | rebuild | `port` |
+| published ports | yes (0.7.9+: `--port`, `--port-rm [BIND:]HOST[/proto]`; removing one msb lacks fails) | next start, or `--restart` | `port`, `edit` → Ports (`apply_ports()`: adds what `msb inspect` lacks, removes only what msbctl dropped, restarts via stop + `ensure_running()`) |
 | owned / named disks | **no** | rebuild | `pick_caches()`, `pick_disks()` |
 | image | **no** | rebuild | `dev.yaml` `image:` + `rebuild` |
+| nested virtualization (`/dev/kvm`) | **no** (0.7.12: create-time `--nested-virt` only) | rebuild | `nested_virt`, `edit` → Nested virtualization |
 
 `msb modify` keeps the sandbox's state, which is why `resize` and `secret` can
 use it and everything else cannot. **CLI flags override `--conf`.**

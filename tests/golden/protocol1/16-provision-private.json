@@ -77,6 +77,7 @@
    "--net-rule",
    "allow@platform.claude.com:tcp:443",
    "--tls-intercept",
+   "--nested-virt=false",
    "--no-dns-rebind-protection",
    "--mount-owned",
    "/workspace:kind=disk,size=20G",

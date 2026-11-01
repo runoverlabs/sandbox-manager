@@ -123,8 +123,10 @@ changes them. Others can change on a running sandbox.
 | mounts, extra folders, project folder | `msbctl rebuild` |
 | the image, environment variables, disks | `msbctl rebuild` |
 | cpus, memory | `msbctl resize`: a restart, state kept |
+| published ports | `msbctl port`: the next start, or a restart now (`--restart`), state kept |
 | root disk | `msbctl resize`: grows live |
 | secrets (add or remove) | `msbctl secret`: live or a restart |
+| a secret's value, the Claude token in use | `msbctl secret set`, `edit`: live |
 | SSH key selection | `msbctl keys`: immediately |
 | git identity, autostart | the next start |
 
