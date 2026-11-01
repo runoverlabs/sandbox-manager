@@ -6511,13 +6511,16 @@ def rotate_running(box, var, value):
     return True
 
 
-def bind_secret_live(box, config, spec, restart):
+def bind_secret_live(box, config, spec, restart, rebind=False):
     """After a value for `spec` was stored: make the existing sandbox use it.
     Already bound, a running sandbox gets the new value live
     (rotate_running()), or by a restart when `restart` asks for one, and a
-    stopped one reads it at its next start. Not bound yet, `msb modify
-    --secret` adds the binding for the next start, and `restart` (None asks,
-    on a terminal) restarts a running sandbox so it applies now."""
+    stopped one reads it at its next start. Not bound yet, or `rebind` (a
+    binding just added, which may bring new hosts or options to a variable
+    msb has), `msb modify --secret` sends every spec the sandbox lists for
+    the variable (msb merges them into one binding: hosts and options
+    combined, checked on 0.7.12) for the next start, and `restart` (None
+    asks, on a terminal) restarts a running sandbox so it applies now."""
     state = state_of(box.name)
     if state == "absent":
         note("not created yet, so it is bound at first start")
@@ -6532,7 +6535,7 @@ def bind_secret_live(box, config, spec, restart):
         else:
             note(f"no value for {var} now: nothing to bind in {box.name}")
         return
-    if bound is not None and var in bound:
+    if bound is not None and var in bound and not rebind:
         if state != "running":
             note(f"used from the next start of {box.name}")
         elif restart:
@@ -6546,7 +6549,9 @@ def bind_secret_live(box, config, spec, restart):
             f"binding it is new to {box.name}: apply now — this restarts it?")
     # The spec as create would pass it, options included (`:query`, `:body`,
     # `headers=`): msb 0.7.9+ stores a binding's options from `modify` too.
-    argv = ["msb", "modify", box.name, "--secret", with_transcript_passthrough(spec, box.transcript_hosts)]
+    argv = ["msb", "modify", box.name]
+    for one in [s for s in box.secret_binds if binding_var(s) == var] or [spec]:
+        argv += ["--secret", with_transcript_passthrough(one, box.transcript_hosts)]
     run(argv + (["--next-start"] if state == "running" else []), env=env)
     if state == "running" and restart:
         restart_sandbox(box, config)
@@ -6741,13 +6746,11 @@ def cmd_secret(args, config):
         set_env_file_value(os.path.join(SECRETS_DIR, f"{box.name}.env"), binding_var(spec), value)
         append_toml_list(target, "secret_binds", [spec], after_key="extra_rules")
     note(f"recorded in {tilde(target)}")
-    if state_of(box.name) == "absent":
-        return
-    # Re-read the sandbox so the binding just added contributes its variable.
-    # New to msb, so a running sandbox gets it now with a restart (asked) or
-    # at its next start; the spec carries the transcript passthrough a create
-    # would give it.
-    bind_secret_live(Sandbox(box.name, config), config, spec, None)
+    # Re-read the sandbox so the binding just added contributes its variable,
+    # and send it even if msb binds the variable already: it may bring new
+    # hosts or options. Asked as it always was, from whatever stdin is.
+    restart = state_of(box.name) == "running" and confirm(f"apply now — this restarts {box.name}?")
+    bind_secret_live(Sandbox(box.name, config), config, spec, restart, rebind=True)
 
 
 def remove_from_toml_list(path, key, item):

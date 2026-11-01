@@ -263,6 +263,26 @@ class SecretOptionsTest(MsbctlTest):
         self.assertEqual(call["env"]["API_KEY"], PLANTED)
         self.assert_not_in_argv(PLANTED)
 
+    def add_custom(self, var, host, where, restart):
+        presets = len(self.m.load_config().get("secret_presets", {}))
+        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
+            return self.run_main("secret", "add", "web",
+                                 stdin=f"{presets + 1}\n{var}\n{host}\n{where}\n{restart}\n")
+
+    def test_adding_hosts_to_a_variable_msb_binds_rebinds_it(self):
+        code, _, err = self.add_custom("API_KEY", "a.example.org", 1, "n")
+        self.assertEqual(code, 0, err)
+        code, _, err = self.add_custom("API_KEY", "b.example.org", 2, "y")
+        self.assertEqual(code, 0, err)
+        call = self.msb_calls("modify")[-1]["argv"]
+        specs = [call[i + 1] for i, a in enumerate(call) if a == "--secret"]
+        # Every binding of the variable, so msb merges them: not a bare rotation.
+        self.assertEqual([s.rpartition("@")[2] for s in specs], ["a.example.org", "b.example.org"])
+        self.assertTrue(specs[1].startswith("API_KEY:query,passthrough=["))
+        self.assertIn("--next-start", call)
+        # "y" to the restart, read from the pipe as before: msbctl restarts it.
+        self.assertEqual(len(self.msb_calls("stop")), 1)
+
     def test_a_stopped_sandbox_takes_it_without_a_flag(self):
         self.set_state(web="stopped")
         # Declared, as `secret add` writes it: nothing is bound without a value.
@@ -271,7 +291,8 @@ class SecretOptionsTest(MsbctlTest):
         box = self.m.Sandbox("web", self.m.load_config())
         self.m.bind_secret_live(box, self.m.load_config(), "API_KEY:body@api.example.org", None)
         [call] = self.msb_calls("modify")
-        self.assertTrue(call["argv"][3].startswith("API_KEY:body,passthrough=["))
+        spec = call["argv"][call["argv"].index("--secret") + 1]
+        self.assertTrue(spec.startswith("API_KEY:body,passthrough=["), spec)
         self.assertNotIn("--restart", call["argv"])
         self.assertNotIn("--next-start", call["argv"])
 
