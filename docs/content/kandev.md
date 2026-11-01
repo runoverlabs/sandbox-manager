@@ -311,7 +311,10 @@ one port per lease means a connection can only ever reach one VM port.
   stdin and checks it whole before writing anything: the key matches the leaf,
   the leaf is valid now and names `base_url`'s host, and the certificate after
   it issued it. The pair is stored in `~/.config/msb/kandev/tls/` (the key
-  0600), and the proxy picks a new one up without a restart. Until one is
+  0600), and the proxy picks a new one up without a restart. Once another
+  client's table sets `tls = true` that client installs it instead, and the
+  Kandev key's `tls install` is `denied` ([managed clients](managed.md#the-proxys-certificate)).
+  Until one is
   installed it listens on nothing, and `health` says why. `health.tls` gives
   `not_after`, which drives the plugin's renewal, and `issuer_sha256`, the
   SHA-256 of the issuing certificate, so the plugin can tell a certificate from

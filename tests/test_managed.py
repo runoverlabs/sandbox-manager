@@ -10,7 +10,7 @@ import tomllib
 from unittest import main, mock
 
 from tests.harness import MsbctlTest
-from tests.test_kandev import IMAGE, KandevTest, request
+from tests.test_kandev import IMAGE, PLANTED_NPM, KandevTest, request
 
 PLANTED_CI = "planted-ci-secret"
 PLANTED_CI_NONCE = "planted-ci-nonce"
@@ -97,7 +97,7 @@ WRONG_TYPES = {"int": "7", "str": '"x"', "list of lists": '[["base"]]', "dict": 
                "bool": "true", "float": "1.5", "nested table": None}
 UNKNOWN_KEYS = ("colour", "Enabled", "max-sandboxes")
 # Client keys for which that type is the right one: not a wrong value there.
-RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("allow_nested_virt", "bool"),
+RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("allow_nested_virt", "bool"), ("tls", "bool"),
                ("max_sandboxes", "int"),
                ("max_cpus", "int")}
 
@@ -529,8 +529,10 @@ class Health(ManagedTest):
         self.assertEqual(doc["client_settings"], {
             "name_prefix": "c-", "env_prefix": "CI_", "guest_ports": [8765, 9000],
             "require_callback": False, "body_secret_hosts": ["llm.example.org"],
-        "allow_nested_virt": False})
+        "allow_nested_virt": False, "tls": False})
         self.assertIn("managed_namespace", doc["features"])
+        self.assertIn("secret_headers", doc["features"])
+        self.assertIn("live_secrets", doc["features"])
         self.assertEqual(doc["capacity"]["max_sandboxes"], 3)
         self.assertEqual(doc["egress"]["allow_extra"], ["pypi.org", "*.example.org"])
         self.assertNotIn("host_capacity", doc)
@@ -541,6 +543,9 @@ class Health(ManagedTest):
         doc = self.ok("health")
         self.assertEqual(doc["protocol"], 1)
         self.assertIn("managed_namespace", doc["features"])
+        # Protocol 1 is frozen: what only protocol 2 does is listed there alone.
+        self.assertNotIn("secret_headers", doc["features"])
+        self.assertNotIn("live_secrets", doc["features"])
         doc = self.jok("managed", "health")
         self.assertEqual((doc["protocol"], doc["protocols"], doc["client"]), (2, [1, 2], "kandev"))
         self.assertEqual(doc["client_settings"]["name_prefix"], "k-")
@@ -1683,6 +1688,96 @@ class Configure(ManagedTest):
         os.remove(self.m.registry_path_for("c-web"))
         checks = {c["id"]: c for c in self.m.doctor_checks(self.m.load_config())}
         self.assertNotIn("client-prefixes", checks)
+
+
+
+class SecretHeaders(ManagedTest):
+    """A secret's optional `headers`: the only header fields msb fills it in."""
+
+    def secret(self, **over):
+        return [{"name": "LLM_KEY", "value": PLANTED_CI, "hosts": ["llm.example.org"], **over}]
+
+    def test_scoped_to_the_headers_named(self):
+        rec = self.ci_provision(secrets=self.secret(headers=["X-Api-Key", "authorization", "x-api-key"]))
+        [spec] = [a for i, a in enumerate(self.msb_calls("create")[0]["argv"])
+                  if self.msb_calls("create")[0]["argv"][i - 1] == "--secret"]
+        # Lowercased, once each, and with the client's body_secret_hosts as before.
+        self.assertEqual(spec, "LLM_KEY:headers=[x-api-key,authorization],passthrough=[llm.example.org]"
+                               "@llm.example.org")
+        entry = self.m.read_toml(self.entry_path(rec["name"]))
+        self.assertEqual(entry["secret_binds"], ["LLM_KEY:headers=[x-api-key,authorization]@llm.example.org"])
+        self.assertEqual(self.fake_state()["_scopes"]["c-e1"]["LLM_KEY"], ["x-api-key", "authorization"])
+        self.assert_not_in_argv(PLANTED_CI)
+        # start sends the values only: the scope is the entry's, unchanged.
+        self.ci_ok("stop", "c-e1", "--json")
+        self.ci_ok("managed", "start", "e1", stdin=json.dumps({"secrets": self.secret()}) + "\n")
+
+    def test_without_headers_every_header_as_before(self):
+        self.ci_provision()
+        argv = self.msb_calls("create")[0]["argv"]
+        self.assertIn("LLM_KEY:passthrough=[llm.example.org]@llm.example.org", argv)
+
+    def test_checked(self):
+        for bad in ([], "authorization", [""], ["a b"], ["a,b"], ["a]"], [5], ["x"] * 17, ["-lead"]):
+            with self.subTest(headers=bad):
+                message = self.ci_error("invalid_config", "managed", "provision", "e1",
+                                        stdin=ci_request(secrets=self.secret(headers=bad)))["message"]
+                self.assertIn("headers", message)
+        self.assertEqual(self.msb_calls("create"), [])
+
+
+class LiveSecrets(ManagedTest):
+    """Protocol 2's start of a running sandbox, with its secrets: the new
+    values reach it live, nothing restarted."""
+
+    NEW = "planted-rotated-ci-secret"
+    env_keys = ("NPM_TOKEN", "LLM_KEY")
+
+    def start(self, value, key="client:ci", verb=("managed", "start", "e1"), **over):
+        body = {"secrets": [{"name": "LLM_KEY", "value": value, "hosts": ["llm.example.org"], **over}]}
+        return self.as_ci(*verb, stdin=json.dumps(body) + "\n", key=key)
+
+    def test_a_running_sandbox_takes_the_new_value(self):
+        self.ci_provision(secrets=[{"name": "LLM_KEY", "value": PLANTED_CI, "hosts": ["llm.example.org"],
+                                    "headers": ["x-api-key"]}])
+        code, doc = self.start(self.NEW)
+        self.assertEqual(code, 0, doc)
+        [call] = self.msb_calls("modify")
+        # The hosts msb holds and no options: the header scope stays as it is.
+        self.assertEqual(call["argv"], ["modify", "c-e1", "--secret", "LLM_KEY@llm.example.org"])
+        self.assertEqual(call["env"]["LLM_KEY"], self.NEW)
+        self.assertEqual(self.fake_state()["_scopes"]["c-e1"]["LLM_KEY"], ["x-api-key"])
+        self.assertEqual(self.msb_calls("start"), [])
+        self.assertEqual(self.fake_state()["c-e1"], "running")
+        self.assert_not_in_argv(self.NEW)
+
+    def test_without_secrets_nothing_changes(self):
+        self.ci_provision()
+        self.ci_ok("managed", "start", "e1", stdin="")
+        self.assertEqual(self.msb_calls("modify"), [])
+
+    def test_exactly_the_secrets_it_binds(self):
+        self.ci_provision()
+        body = {"secrets": [{"name": "OTHER", "value": self.NEW, "hosts": ["llm.example.org"]}]}
+        self.ci_error("invalid_config", "managed", "start", "e1", stdin=json.dumps(body) + "\n")
+        self.assertEqual(self.msb_calls("modify"), [])
+
+    def test_a_refusal_is_an_error(self):
+        self.ci_provision()
+        os.environ["FAKE_MSB_FAIL"] = "modify"
+        try:
+            code, doc = self.start(self.NEW)
+        finally:
+            del os.environ["FAKE_MSB_FAIL"]
+        self.assertEqual((code, doc["error"]["code"]), (3, "unavailable"), doc)
+        self.assertNotIn(self.NEW, json.dumps(doc))
+
+    def test_protocol_1_is_unchanged(self):
+        self.ok("provision", "e1", stdin=request())
+        code, doc = self.start(PLANTED_NPM, key="kandev", verb=("kandev", "start", "e1"),
+                               name="NPM_TOKEN", hosts=["registry.npmjs.org"])
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(self.msb_calls("modify"), [])
 
 
 if __name__ == "__main__":

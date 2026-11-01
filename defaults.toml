@@ -516,6 +516,10 @@ private_names = []
 #   # false; a request asking where it isn't allowed is refused. A client's
 #   # sandbox never follows [defaults] nested_virt, which is for yours.
 #   allow_nested_virt = true
+#   # Whether this client's key installs the proxy's certificate
+#   # (`msbctl managed tls install`). Default false. One client at most:
+#   # Kandev's until another table sets it (never set in Kandev's own).
+#   tls = true
 
 # ---------------------------------------------------------------------------
 # Egress rule groups

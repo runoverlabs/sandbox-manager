@@ -130,6 +130,79 @@ class TlsInstall(TlsTest):
         self.error("invalid_config", "tls", "remove", stdin=self.pair())
 
 
+class ClientGrant(TlsTest):
+    """[clients.NAME] tls = true: that client's key installs the certificate,
+    and Kandev's no longer does. One client at most."""
+
+    def configure(self, clients="", **over):
+        super().configure(**over)
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(clients)
+
+    def as_client(self, client, *argv, stdin=""):
+        os.environ["MSB_RESTRICTED"] = f"client:{client}"
+        try:
+            return self._msbctl_json(argv, stdin)
+        finally:
+            os.environ.pop("MSB_RESTRICTED", None)
+
+    def test_kandevs_until_another_client_is_given_it(self):
+        self.configure('\n[clients.ci]\nenabled = true\n')
+        code, doc = self.as_client("ci", "managed", "tls", "install", stdin=self.pair())
+        self.assertEqual((code, doc["error"]["code"]), (3, "denied"), doc)
+        self.assertFalse(os.path.exists(self.m.KANDEV_TLS_CERT))
+        self.install()
+        code, doc = self.as_client("ci", "managed", "health")
+        self.assertFalse(doc["client_settings"]["tls"])
+        self.assertTrue(self.jok("managed", "health")["client_settings"]["tls"])
+
+    def test_the_client_given_it_installs_and_kandev_may_not(self):
+        # Kandev itself disabled: renewing needs neither its key nor [kandev] on.
+        self.configure('\n[clients.ci]\nenabled = true\ntls = true\n', enabled=False)
+        code, doc = self.as_client("ci", "managed", "health")
+        self.assertTrue(doc["client_settings"]["tls"])
+        self.assertIn("this client installs one", doc["serve"]["reason"])
+        code, doc = self.as_client("ci", "managed", "tls", "install", stdin=self.pair())
+        self.assertEqual(code, 0, doc)
+        self.assertTrue(doc["tls"]["installed"])
+        self.assertEqual(read(self.m.KANDEV_TLS_KEY), read(self.pki["leaf.key"]))
+        self.configure('\n[clients.ci]\nenabled = true\ntls = true\n')
+        self.assertIn("may not install", self.error("denied", "tls", "install", stdin=self.pair())["message"])
+        self.jerror("denied", "managed", "tls", "install")
+        # Kandev's health names no other client.
+        os.remove(self.m.KANDEV_TLS_CERT)
+        reason = self.ok("health")["serve"]["reason"]
+        self.assertIn("tls = true", reason)
+        self.assertNotIn("ci", reason.replace("client", ""))
+        # The operator, at the host, always may.
+        code, doc = self.msbctl_json("kandev", "tls", "install", stdin=self.pair(), plugin=False)
+        self.assertEqual(code, 0, doc)
+
+    def test_one_client_at_most(self):
+        self.configure('\n[clients.ci]\nenabled = true\ntls = true\n'
+                       '\n[clients.lab]\nenabled = true\ntls = true\n')
+        for client in ("ci", "lab"):
+            with self.subTest(client=client):
+                code, doc = self.as_client(client, "managed", "tls", "install", stdin=self.pair())
+                self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+                self.assertNotIn("lab" if client == "ci" else "ci", doc["error"]["message"])
+        # Never back to Kandev while two tables claim it.
+        self.error("denied", "tls", "install", stdin=self.pair())
+        self.assertFalse(os.path.exists(self.m.KANDEV_TLS_CERT))
+
+    def test_kandevs_table_never_names_it(self):
+        self.configure(tls=True)
+        self.assertIn("tls", self.error("invalid_config", "health")["message"])
+
+    def test_configure(self):
+        self.configure('\n[clients.ci]\nenabled = true\n')
+        code, out, err = self.run_main("host", "managed", "configure", "--client", "ci", "--tls", "--json")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(json.loads(out)["settings"]["tls"])
+        code, doc = self.as_client("ci", "managed", "tls", "install", stdin=self.pair())
+        self.assertEqual(code, 0, doc)
+
+
 class Health(TlsTest):
 
     def serve_doc(self):

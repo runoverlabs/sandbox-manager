@@ -90,6 +90,7 @@ groups, and is off until `enabled = true`.
 | `require_callback` | `false` | whether a provision must name a callback; leave it off for a client that is never called back, so nothing is pinned in its guests' `/etc/hosts`. A callback is egress to one address and port, so `allow_extra` must admit it either way, and a name admitted only by a hostname pattern (or `*`) must resolve to a public address unless it is in `private_names`, while `*` admits any address given as one, private included ([below](#protocol-2)) |
 | `body_secret_hosts` | `[]` | hosts a secret's placeholder may travel to in a request body; see [below](#secrets-in-request-bodies) |
 | `allow_nested_virt` | `false` | whether its provisions may ask for `/dev/kvm` (`"nested_virt": true`), as for [Kandev](kandev.md#kvm-in-a-sandbox). Never from this host's `[defaults]` |
+| `tls` | `false` | whether its key may install the proxy's certificate; see [below](#the-proxys-certificate). One client at most, and never set in Kandev's table |
 
 Kandev's own table is `[kandev]`, or `[clients.kandev]`, but not both. Its
 `name_prefix`, `env_prefix`, `guest_ports`, `require_callback` and
@@ -157,6 +158,30 @@ of its `private_names`. The trade-off: those hosts see the
 placeholder's text, never the real value, which still goes only into headers
 for the secret's own hosts. Empty, the default, lets it go nowhere.
 
+## The proxy's certificate
+
+There is one certificate, so one client's key installs it: Kandev's, until
+another client's table sets `tls = true`
+(`msbctl host managed configure --client NAME --tls`). From then on that
+client renews it with `msbctl managed tls install`, as Kandev's
+[`tls install`](kandev.md#the-tls-proxy) does, and the Kandev key's is
+`denied`. It needs no Kandev key and no `[kandev] enabled`, and it brings none
+of the host's other verbs (`restart-proxy`, `self-update`): a new pair is
+picked up by the running proxy. Two tables that set it are both
+`invalid_config`, and while they do no client's key installs it; the operator
+always may, at the host.
+
+## Secrets in headers
+
+Each secret in a request may name the only headers msb fills it in:
+`{"name": "LLM_KEY", "value": "…", "hosts": ["llm.example.org"], "headers":
+["x-api-key"]}`. Without `headers`, msb fills it into every header sent to its
+hosts, so an allowed host that echoes a header the guest chose back would
+hand the guest the real value. Names are letters, digits and `-`, up to 16,
+compared without case. The scope is fixed at provision: `start` sends the
+values only. `health` lists the `secret_headers` feature on a host that takes
+it.
+
 ## Protocol 2
 
 `msbctl managed <verb>` is protocol 1's [verbs](kandev.md#the-verbs) with these
@@ -164,7 +189,9 @@ differences:
 
 - `health` adds `protocols` (`[2]`, or `[1, 2]` for the Kandev key), `client`,
   `client_settings` (its `name_prefix`, `env_prefix`, `guest_ports`,
-  `require_callback`, `body_secret_hosts` and `allow_nested_virt`), and `host_capacity` when
+  `require_callback`, `body_secret_hosts`, `allow_nested_virt`, and `tls`: whether
+  this key installs the certificate), the features `secret_headers` and
+  `live_secrets`, and `host_capacity` when
   `[managed]` sets totals. Its capacity, egress and proxy ports are the
   client's own. A client with no table answers `enabled: false`.
 - `provision` takes an optional `callback` `{host, port}` (`kandev_api` is the
@@ -204,9 +231,16 @@ differences:
 - `ls --json` and `show --json` give a row `source` `managed`, `client`,
   `location` `NAME:ENV`, and the record under `record`. Kandev's rows keep
   `kandev`, byte for byte.
-- `tls install`, `restart-proxy` and `self-update` are not here: they act for
-  the whole host, and one client must not disturb another. They stay with the
-  Kandev key and the operator.
+- `start` of a sandbox that is already running, with its secrets (exactly the
+  ones it binds, as for any start), hands msb the new values live, nothing
+  restarted: a rotated token reaches it now, not at its next start. Each
+  binding keeps its hosts and header scope. A refusal is `unavailable`, and
+  the sandbox keeps the old values; with no secrets, `start` answers as before.
+  Protocol 1's `start` still answers a running sandbox without touching it.
+- `tls install` is only the key's of the client [given it](#the-proxys-certificate).
+  `restart-proxy` and `self-update` are not here: they act for the whole host,
+  and one client must not disturb another. They stay with the Kandev key and
+  the operator.
 
 Exit 126 from `managed health` means a host that predates protocol 2, or a
 key not authorized with `--client`. `kandev health` lists the
