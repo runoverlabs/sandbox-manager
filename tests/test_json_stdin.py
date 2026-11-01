@@ -265,6 +265,8 @@ class SecretOptionsTest(MsbctlTest):
 
     def test_a_stopped_sandbox_takes_it_without_a_flag(self):
         self.set_state(web="stopped")
+        # Declared, as `secret add` writes it: nothing is bound without a value.
+        self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["API_KEY:body@api.example.org"]\n')
         self.store_secret(self.secrets_file("web"), "API_KEY", PLANTED)
         box = self.m.Sandbox("web", self.m.load_config())
         self.m.bind_secret_live(box, self.m.load_config(), "API_KEY:body@api.example.org", None)
