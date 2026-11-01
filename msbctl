@@ -218,8 +218,10 @@ EGRESS_MODES = ("enforce", "observe")
 # request carrying one where substitution is not permitted — bodies are not,
 # only headers. The moment an agent so much as runs `env`, the literal text
 # `$MSB_GH_TOKEN` is in its transcript, and from then on EVERY request it makes
-# is blocked: msb tears the TLS connection down and the agent reports it as
-# `API Error: Connection dropped (ECONNRESET)`, which names nothing. The tell is
+# is blocked: msb answers a 403 saying `secret_policy_denied` where it still can
+# (0.7.9+: the first HTTP/1 request on a connection) and otherwise tears the TLS
+# connection down, which the agent reports as `API Error: Connection dropped
+# (ECONNRESET)`, naming nothing. The tell is
 # that a brand-new session works and then degrades, because a fresh transcript
 # is clean and never gets clean again.
 #
@@ -1970,7 +1972,7 @@ class Sandbox:
         OBSERVE IS A DELIBERATE, TEMPORARY DOWNGRADE, not a softer policy. It
         exists because msb hardly reports a denial: it logs what it ALLOWS, and
         of what it blocks only an HTTPS connection on an intercepted port, at
-        DEBUG (`TLS egress denied by default policy sni=…`, since 0.7.12), which
+        DEBUG (`TLS egress denied by default policy sni=…`, seen on 0.7.12), which
         an enforcing sandbox does not run at: msb has no per-module filter, and
         DEBUG is ~6 KB of virtio noise per request. Off :443 nothing at all. So
         there is no "warn but permit" to emit, and the only way to learn what a
