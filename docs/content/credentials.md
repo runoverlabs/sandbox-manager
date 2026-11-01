@@ -164,6 +164,10 @@ MY_TOKEN:query@api.example.com          # also substitute in the query string
 MY_TOKEN@one.example.com,two.example.com
 ```
 
+`msbctl secret add` binds it on an existing sandbox without a rebuild, options
+and all: a stopped sandbox has it at its next start, a running one after a
+restart, which msbctl offers.
+
 **Where the value comes from** depends on where the binding is written. A
 binding in the project's `.msb/sandbox.toml` takes its value from that
 sandbox's own `secrets/<name>.env` only, never from `global.env`: that file is
