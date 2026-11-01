@@ -87,6 +87,14 @@ extra_rules = []
 # root is an overlayfs and podman's overlay driver cannot sit on it, so without
 # this it falls back to vfs (slow, ~3x the disk). Fixed at create time.
 {{CONTAINERS_DISK}}
+#
+# Nested virtualization: the guest gets /dev/kvm, so it can run VMs of its own
+# (podman with a krun or kata runtime, an emulator, msb itself). It is the
+# host's KVM, so this is approved like the egress rules. A host without nested
+# virtualization (a VM that does not pass it on, an ARM64 Linux host) cannot
+# start such a sandbox at all. Omit it to follow the machine's [defaults]
+# nested_virt (off as shipped); the podman feature sets it. Fixed at create time.
+{{NESTED_VIRT}}
 
 # ----------------------------------------------------------------- identity
 #
