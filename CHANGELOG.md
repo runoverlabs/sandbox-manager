@@ -13,6 +13,7 @@ release notes.
 - `msbctl exec` passes msb's `-d`/`--detach` on, which leaves the command running as a job msb owns.
 
 ### Changed
+- `msbctl port` and `msbctl edit` → Published ports no longer need a rebuild: they change an existing sandbox with `msb modify`, which keeps its state. A stopped sandbox has the new ports when it next starts, and a running one on its next start, or at once with `msbctl port --restart` (asked on a terminal), which is msbctl's own stop and start. `--rebuild` still rebuilds, for when other create-time changes are pending too. A new guest port for a host port already published replaces that mapping, and a port msbctl didn't publish (an `msb_conf` one) is never removed.
 - Kandev's and every managed client's sandboxes are created with `--nested-virt=false`, so msb's own `sandbox_defaults.nested_virt` can never give them `/dev/kvm`.
 - msbctl requires msb 0.7.12 or newer, the release it is now developed against: every command that uses this machine's msb refuses an older one with the command that installs a newer one, and `msbctl doctor` fails it. microsandbox is pre-1.0 and changes quickly, so from now on the oldest msb msbctl accepts is the one it was last developed against. Upgrade msb first (`curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh`); see the nested-virtualization entry before upgrading a host whose sandboxes use KVM.
 

@@ -260,7 +260,7 @@ Any key it sets overrides the project's file.
 | `ssh_keys` | list of fingerprints | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | list | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
 | `extra_rule_groups` | list of groups | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
-| `ports` | list | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
+| `ports` | list | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. `msbctl port` applies a change without a rebuild |
 | `egress_mode` | `"enforce"` or `"observe"` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | string | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
 | `policy_pin` | string | written by msbctl: the digest of the project policy last approved |
