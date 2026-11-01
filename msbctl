@@ -6487,7 +6487,10 @@ def msb_secret_header_scope(name, var):
             if item.get("env_var") == var:
                 return list((item.get("substitution") or {}).get("header_fields") or [])
     except (ValueError, KeyError, TypeError, AttributeError):
-        pass
+        # Output msb did not give in the shape read above: unknown, the same
+        # answer as a sandbox that has no binding for `var`. Only a hint
+        # (bind_secret_live()'s rebuild note) depends on it.
+        return None
     return None
 
 
