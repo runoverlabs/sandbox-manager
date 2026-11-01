@@ -2156,8 +2156,7 @@ class Sandbox:
             token = own.get("GH_TOKEN")
             if token:
                 env["GH_TOKEN"] = token
-                flags += ["--secret", with_transcript_passthrough(
-                    "GH_TOKEN@github.com,api.github.com", self.transcript_hosts)]
+                flags += ["--secret", with_transcript_passthrough(GH_SPEC, self.transcript_hosts)]
             else:
                 note(f"no GH_TOKEN for {self.name} — " + (
                     "the clone of a private repo, git push and the GitHub API need one: "
@@ -6475,14 +6474,17 @@ def choose_secret(config, taken=()):
     """Pick one secret: a shipped preset or a custom one. Returns
     (spec, preset_info_or_None) or None."""
     presets = config.get("secret_presets", {})
+    # The same variable to the same hosts, whatever the options say (one bound
+    # before presets were scoped has none): another host is another binding.
+    bound = {f"{binding_var(spec)}@{spec.rpartition('@')[2]}" for spec in taken}
     rows = [(f"{k:<10} {p['env']} -> {', '.join(p['hosts'])}", k) for k, p in presets.items()
-            if f"{p['env']}@{','.join(p['hosts'])}" not in taken]
+            if f"{p['env']}@{','.join(p['hosts'])}" not in bound]
     rows.append(("custom     your own variable and hosts", "custom"))
     label = choose_one("secret", [r for r, _ in rows], 0)
     key = dict(rows)[label]
     if key != "custom":
         p = presets[key]
-        return f"{p['env']}@{','.join(p['hosts'])}", p
+        return preset_spec(p), p
     var = ask("environment variable name (e.g. MY_API_TOKEN)").strip()
     if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", var):
         warn("not a valid variable name")
@@ -6495,11 +6497,14 @@ def choose_secret(config, taken=()):
     if not hosts:
         warn("a secret needs at least one host")
         return None
-    where = choose_one("where may it appear", [
-        "headers      Authorization etc, including Basic auth (the default)",
-        "also query   in URL query strings too",
-        "also body    in request bodies too"], 0)
-    opt = ":query" if where.startswith("also query") else ":body" if where.startswith("also body") else ""
+    places = {
+        "headers      Authorization etc, including Basic auth (the default)": "",
+        "also query   in URL query strings too": ":query",
+        "also body    in request bodies too": ":body",
+        "auth only    the Authorization header alone (Basic auth too): safest, if the API reads it there":
+            ":headers=[authorization]",
+    }
+    opt = places[choose_one("where may it appear", list(places), 0)]
     return f"{var}{opt}@{hosts}", None
 
 
@@ -6576,6 +6581,23 @@ def msb_secret_hosts(name):
         return None
 
 
+def msb_secret_header_scope(name, var):
+    """The header fields msb substitutes `var` in for this sandbox: [] for
+    every header, None if it cannot say."""
+    proc = subprocess.run(["msb", "inspect", name, "--format", "json"],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    try:
+        for item in json.loads(proc.stdout)["config"]["network"]["secrets"]["secrets"]:
+            if item.get("env_var") == var:
+                return list((item.get("substitution") or {}).get("header_fields") or [])
+    except (ValueError, KeyError, TypeError, AttributeError):
+        # Output msb did not give in the shape read above: unknown, the same
+        # answer as a sandbox that has no binding for `var`. Only a hint
+        # (bind_secret_live()'s rebuild note) depends on it.
+        return None
+    return None
+
+
 def msb_bound_secrets(name):
     """The variables msb has a binding for in this sandbox, or None if it
     cannot say (see msb_secret_hosts())."""
@@ -6647,6 +6669,11 @@ def bind_secret_live(box, config, spec, restart, rebind=False):
             note(f"{box.name} restarted with the new value")
         elif rotate_running(box, var, env[var]):
             note(f"{box.name} uses the new value now (nothing restarted)")
+        # A rotation keeps the rule msb has, so a binding made before msbctl
+        # scoped it to named headers still substitutes in every one.
+        if "headers=" in spec.split("@", 1)[0] and msb_secret_header_scope(box.name, var) == []:
+            note(f"{box.name} still substitutes {var} in every header, as when it was created: "
+                 f"`msbctl rebuild {box.name}` narrows it to the Authorization header")
         return
     if restart is None:
         restart = state == "running" and sys.stdin.isatty() and confirm(
@@ -8342,7 +8369,30 @@ def section_secrets(box, config, ctx):
             return
 
 
-GH_SPEC = "GH_TOKEN@github.com,api.github.com"
+# The GitHub token is substituted in the Authorization header ONLY (msb 0.7.8's
+# `headers=`): git over https sends it there as Basic auth, gh and the API as
+# `token`/`Bearer` (checked live on 0.7.12, push endpoint included). In any
+# other header the placeholder goes out as the literal `$MSB_<VAR>`, so a guest
+# cannot have an allowed host reflect a header it chose, with the real token
+# in it, back to it. CLAUDE_SPEC is not scoped yet: Claude Code's binary sends
+# its OAuth token as `Bearer`, but no live login has confirmed that nothing
+# else does, and a wrong scope logs every sandbox out.
+GH_SPEC = "GH_TOKEN:headers=[authorization]@github.com,api.github.com"
+
+
+def preset_spec(preset):
+    """A [secret_presets.*] table as a binding: `ENV[:headers=[...]]@HOSTS`.
+    `headers` is a list of names; one name as a plain string is taken as
+    that one, and anything else dies rather than becoming a scope nobody
+    meant (a string joined letter by letter)."""
+    headers = preset.get("headers") or []
+    if isinstance(headers, str):
+        headers = [headers]
+    if not (isinstance(headers, list) and all(isinstance(h, str) and h.strip() for h in headers)):
+        die(f"secret preset {preset.get('env', '?')}: `headers` must be a list of header names, "
+            f"not {headers!r}")
+    opts = f":headers=[{','.join(h.strip() for h in headers)}]" if headers else ""
+    return f"{preset['env']}{opts}@{','.join(preset['hosts'])}"
 
 
 def _github_state(box):
