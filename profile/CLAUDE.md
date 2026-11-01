@@ -41,6 +41,21 @@ If a fetch over `http://` fails, the fix is its `https://` URL. A hostname rule
 on a plaintext port is enforced as a set of IP addresses and breaks against
 address pools, which is why plaintext is simply off.
 
+A refused HTTP or HTTPS request usually comes back as **`403 Forbidden`** with a
+JSON body whose `code` is one of these two. That `code` is how you know the
+sandbox refused it, not the server:
+
+- `{"code":"network_policy_denied","domain":"…"}` — that host isn't allowed.
+  For an `http://` URL, switch to `https://` (above). Otherwise report the
+  `domain`, with the port from the URL you requested (443 for `https://`
+  unless it names another); don't retry or route around it.
+- `{"code":"secret_policy_denied","domain":"…"}` — a credential placeholder
+  (`$GH_TOKEN` and the like) went somewhere it isn't bound to, or into a part of
+  the request where it isn't substituted. Report what you sent and where. Never
+  try to get the real value some other way.
+
+Anything that isn't HTTP just fails to connect, with nothing naming the cause.
+
 ## Credentials: you are holding placeholders, not secrets
 
 Three things are wired in, and none of them puts a usable secret inside this VM.

@@ -66,12 +66,14 @@ unmapped paths give EIO, remapped ones give ESTALE.
 |---|---|
 | intercepted HTTPS connection | `TLS intercept sni=<host> dst=<ip:port>`, at `--log-level debug` |
 | a name resolved | a `dns::` line, debug |
-| **an egress denial** | **never, at any level** — checked on 0.7.7 at `--debug` and `--trace` |
+| **an egress denial**, HTTPS on an intercepted port | `TLS egress denied by default policy sni=<host> dst=<ip:port>`, debug only (0.7.12) |
+| **an egress denial**, anything else | **never, at any level** (0.7.7 at `--debug`/`--trace`; 0.7.12 likewise) |
 | a plain TCP connect on a non-443 port | nothing |
 
 So on :443 you can reconstruct where a sandbox went, and off :443 a DNS lookup
-is the only evidence. Combined with "denials are never logged", the only way
-to learn what a sandbox needs is to stop blocking and record: `egress_mode =
+is the only evidence. Combined with "denials are logged only at debug, and only
+on :443" (debug is far too noisy to enforce at), the only way to learn what a
+sandbox needs is to stop blocking and record: `egress_mode =
 "observe"`, then `msbctl observe <name>`.
 
 Location: `~/.microsandbox/sandboxes/<name>/logs/runtime.log`. Secret

@@ -14,11 +14,13 @@ When nothing starts at all, or on a machine you've just installed on, run
 and the SSH agent, and prints the fix for each problem
 ([Commands](commands.md#msbctl-doctor)).
 
-## "connection refused" / a host is unreachable
+## "connection refused", a 403 `network_policy_denied`, a host is unreachable
 
 **It's a missing egress rule until proven otherwise.** Don't retry, and don't
-reach for a proxy or another mirror. Find the exact host and port that was
-refused, then:
+reach for a proxy or another mirror. An HTTP or HTTPS request refused by the
+sandbox gets a `403` whose JSON body says `"code":"network_policy_denied"` and
+names the `domain`; anything else simply fails to connect. Find the exact host
+and port that was refused, then:
 
 ```console
 $ msbctl allow . that.host.example        # :443
@@ -48,10 +50,11 @@ create` itself fails (an image it can't pull, a flag it refuses) there is no
 sandbox until the next successful `rebuild` or `start`. The project, the Claude
 state, package caches and container images are kept either way.
 
-## Claude Code: `API Error: Connection dropped (ECONNRESET)`
+## Claude Code: `API Error: Connection dropped (ECONNRESET)`, or a 403 `secret_policy_denied`
 
 A fresh session works, then every request fails, permanently. This is the
-**secret policy**, not the network: the agent has read a token placeholder
+**secret policy**, not the network (msb answers with a `403` whose JSON says
+`secret_policy_denied` where it can, and otherwise drops the connection): the agent has read a token placeholder
 (`$MSB_GH_TOKEN`) at some point, and now carries it in every request body,
 which msb kills.
 

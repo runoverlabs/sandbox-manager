@@ -6,8 +6,10 @@ body:
     attributes:
       value: |
         Egress is deny-by-default on purpose, so a refusal is policy before it is a bug.
-        msb does not log denials, so what you saw fail is the evidence. Report the
-        exact host and port; do not guess at a wider rule.
+        msb barely logs denials, so what you saw fail is the evidence. An HTTP(S)
+        request refused by the sandbox gets a 403 whose JSON says
+        `network_policy_denied` and names the `domain`; anything else just fails to
+        connect. Report the exact host and port; do not guess at a wider rule.
   - type: input
     id: host
     attributes:

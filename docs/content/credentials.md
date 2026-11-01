@@ -217,8 +217,9 @@ msb blocks any outbound request carrying a placeholder in a place where
 substitution isn't allowed, such as a request body. Coding agents send their
 whole transcript in the request body on every turn. So once an agent has read
 `$MSB_GH_TOKEN` (from `env`, say), every later request would carry it and be
-killed, which Claude Code reports as `API Error: Connection dropped
-(ECONNRESET)`.
+killed: msb answers `403` with `secret_policy_denied` where it can, and
+otherwise drops the connection, which Claude Code reports as `API Error:
+Connection dropped (ECONNRESET)`.
 
 msbctl prevents this by adding `passthrough=` for the agent's own API hosts to
 every binding it emits: Anthropic's, and in a sandbox with pi, each of its

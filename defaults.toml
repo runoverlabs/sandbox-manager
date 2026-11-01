@@ -67,9 +67,10 @@ rule_groups = ["github", "claude"]
 #             sandbox reaches is written to its runtime.log, for
 #             `msbctl observe <name>` to read back.
 #
-# Observe exists because msb will not tell you what it DENIED: it logs what it
-# allows and is silent about the rest, at every log level (re-checked on 0.7.7
-# at --debug and --trace). So there is no "warn but permit" to switch on, and
+# Observe exists because msb hardly tells you what it DENIED: it logs what it
+# allows, and of the rest only an HTTPS connection on an intercepted port, at
+# debug level (0.7.12), which an enforcing sandbox does not run at; off :443,
+# nothing. So there is no "warn but permit" to switch on, and
 # the only way to learn what a sandbox actually needs is to let it through and
 # write down where it went. The intended use is a round trip, not a setting:
 #
@@ -706,7 +707,8 @@ codeberg = [
 # msbctl adds `passthrough=` for the coding agent's own endpoints to every
 # binding, and you want that: msb kills any request carrying a placeholder in
 # its BODY, and an agent that has once seen `$MSB_<VAR>` carries it in every
-# request from then on — which arrives as ECONNRESET naming nothing. Passthrough
+# request from then on — which arrives as a 403 `secret_policy_denied` or, where
+# msb can no longer answer, as ECONNRESET naming nothing. Passthrough
 # only lets the placeholder text travel; the real value stays headers-only and
 # goes to `hosts` and nowhere else.
 #

@@ -185,9 +185,13 @@ See [which keys are pinned](configuration.md#the-policy-pin).
 
 ## Finding out what a sandbox needs
 
-msb **never logs what it denied**, at any log level. It does log what it
-allows. So the only way to learn what a sandbox needs is to stop blocking for a
-while and write down where it goes. That's **observe mode**:
+msb logs what it allows, and almost nothing of what it denies: only a refused
+HTTPS connection, at a debug level far too noisy to leave on, and nothing at
+all off port 443. Inside the sandbox, a refused HTTP or HTTPS request gets a
+`403` whose JSON says `network_policy_denied` and names the `domain`, so an
+agent can report it; anything else simply fails to connect. So the way to learn
+everything a sandbox needs is to stop blocking for a while and write down where
+it goes. That's **observe mode**:
 
 ```console
 $ msbctl observe . on --rebuild       # stop blocking, start recording
