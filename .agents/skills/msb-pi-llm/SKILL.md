@@ -6,8 +6,9 @@ description: "pi and model endpoints: [bootstrap] pi and PI_PACKAGE, [llm.<name>
 # Pi Llm
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 `pi` (`[bootstrap] pi`, `PI_PACKAGE`) talks to `[llm.<name>]` tables in
 `config.toml` (`llm_problem()` validates: `base_url` HTTPS-only and `models`, or `provider` from `PI_PROVIDERS`), chosen per sandbox by `llm` in the registry entry, else `[defaults] llm` — machine-local only, never the project. `Sandbox.llms` turns each into an `allow@host:tcp:port` rule after the groups, `--tls-intercept-port` for a non-443 port (443 ALWAYS restated: one such flag replaces msb's default — spike 17), `--tls-upstream-ca-cert-for host=ca_cert`, `allow_private_dns` from `private_dns`, and a `LLM_KEY_<NAME>@host` binding (own env file, else `global.env`; `is_reserved_var()` reserves the prefix). Every binding's passthrough is `Sandbox.transcript_hosts` (Anthropic's plus each endpoint), not the bare constant. `ensure_pi()` writes `models.json` (a `$`-reference to the variable, never the value; see `llm_key_ref()`), merges `settings.json` and copies the profile as `AGENTS.md` into `STATE_DIR/pi/<name>/agent/` on the HOST, which is the guest's `/root/.pi`; no `msb exec`. Models are never a stored list by default: `served_models()` asks each custom endpoint on every start (`fetch_llm_models()`, host-side, real key, its `ca_cert`; cached in `STATE_DIR/llm/` as the fallback), `default_model` is the start model, and a stale one warns and falls back to the first served. `settings.json`'s default is set when msbctl's choice changed since `agent/.msbctl.json` recorded it, or when pi's names something gone; a switch made inside pi is otherwise kept.

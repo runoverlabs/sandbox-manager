@@ -6,8 +6,9 @@ description: "The documentation site and the README's pictures: how a page is wr
 # Docs
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 - `docs/` — the documentation site (GitHub Pages, `.github/workflows/docs.yml`). Pages are Markdown in `docs/content/` with `title`/`section`/`order` front matter; `docs/build.py` is a stdlib-only converter for a deliberate Markdown subset (extend it rather than adding a generator), plus `template.html` and `assets/` (terminal theme, light/dark/auto, client-side search over an index it writes as a script so the site works off `file://`). `CHANGELOG.md` is rendered as a page, never copied; the logo comes from the repo-level `assets/`. The same build writes the SEO/agent outputs (canonical, Open Graph, JSON-LD, `sitemap.xml`, `llms.txt`, `llms-full.txt`, a `.md` copy of each page), all derived from the pages and `--site-url`, so a new page needs only its front matter — including the `description`, which `--check` requires. `--check` (run by `check.sh`) fails on a broken internal link or anchor and on any `msbctl` subcommand without a `### \`msbctl <name>\`` section on the Commands page. **A user-visible change updates the relevant page in the same PR**, like its changelog line.
 - `assets/` — the logo: `msb-manager-mark-dotmatrix-dark.svg` (for dark grounds, also readable on light; the README's header) and `msb-manager-icon.svg`.

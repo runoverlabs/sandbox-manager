@@ -5,7 +5,8 @@ description: "Emitting, ordering, approving or debugging msb egress rules and se
 
 # Egress rules and secret bindings
 
-Everything here is verified against msb 0.7.6 and re-checked on 0.7.7. The
+Everything here was verified on msb 0.7.6–0.7.7; msbctl now requires 0.7.12
+(`MSB_MIN`), and where 0.7.12 changed something the text says so. The
 property that makes this area expensive: **almost every failure here looks
 like something else.** A blocked host looks like an outage, a denied
 placeholder looks like a network drop, and a silently-unapplied rule looks

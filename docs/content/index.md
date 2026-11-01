@@ -82,5 +82,6 @@ The pages come in four kinds, and the menu is grouped the same way:
 > file.
 
 > **Note:** msb-manager has been tested on Fedora with KVM, against `msb`
-> 0.7.6 and 0.7.7. Other distros and newer `msb` versions are untested so far;
+> 0.7.12, which is also the oldest it accepts. Other distros and newer `msb`
+> versions are untested so far;
 > issues and PRs from them are welcome.

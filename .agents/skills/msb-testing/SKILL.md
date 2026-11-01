@@ -6,8 +6,9 @@ description: "Tests and spikes: tests/harness.py MsbctlTest giving each test a t
 # Testing
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 - `tests/` — stdlib `unittest`, run by `check.sh`: `tests/harness.py` (`MsbctlTest`) gives each test a throwaway HOME and a freshly loaded `msbctl`, with `preflight()` and the agent filter patched out and the network off; `tests/fake/msb` records argv and the env vars a test names, keeps state, and exits 2 on any call it does not know; `tests/fake/tailscale` records `serve` calls. Assert what reaches `msb`, and with `assert_not_in_argv()` that a planted secret does not.
 - `spikes/NN-*.sh` — re-runnable PASS/FAIL scripts, one per mechanism the design relies on (SSH agent over vsock, mount ownership, per-port rules, persistence, hostname rules, memory reclaim, token placeholders, profile seeding, DNS rebind, a LAN model endpoint's key). Run one with `./spikes/07-claude-token-secret.sh`. Several need host-specific env vars (e.g. `ALLOW_HOST`, `ALLOW_PORT`) with no defaults, on purpose. Each must assert both the allowed and the denied half.

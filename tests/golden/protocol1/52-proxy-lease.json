@@ -9,7 +9,9 @@
  "key": "kandev",
  "msb": [
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ]
  ],
  "stdout": "{\n  \"lease\": {\n    \"base_url\": \"https://sbx-01.example.ts.net:30001\",\n    \"expires_at\": \"2030-01-01T00:10:00Z\",\n    \"generation\": \"1\",\n    \"headers\": {\n      \"X-Msb-Lease\": \"v1.1893456900.crZeyl2G9hduirZxLr3BUpcLH0lSQ-wzXDkZcQFzuXQ\"\n    }\n  }\n}\n"
