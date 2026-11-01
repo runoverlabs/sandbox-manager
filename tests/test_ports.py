@@ -116,12 +116,15 @@ class PortUrlTest(MsbctlTest):
 
 class PortApplyTest(MsbctlTest):
     """`msbctl port` changes an existing sandbox with `msb modify` (msb 0.7.9+),
-    which keeps it: no rebuild. A running one gets it on its next start, or
-    now with --restart."""
+    which keeps it: no rebuild. msb saves it for the next start; a restart,
+    when asked for, is msbctl's own stop and start."""
+    env_keys = ("NPM_TOKEN",)
 
     def setUp(self):
         super().setUp()
-        self.make_folder_sandbox("web", entry_extra='ports = ["3000:5173"]\n')
+        self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["NPM_TOKEN@registry.npmjs.org"]\n',
+                                 entry_extra='ports = ["3000:5173"]\n')
+        self.store_secret(self.secrets_file("web"), "NPM_TOKEN", "planted-port-test")
 
     def created(self, state="running"):
         code, _, err = self.run_main("start", "web")
@@ -150,15 +153,22 @@ class PortApplyTest(MsbctlTest):
         out = self.port("8080")
         self.assertEqual(self.modifies(), [["--port", "8080:8080"]])
         self.assertIn("published from the next start", out)
-        self.assertNotIn("rebuild", out)
         self.assertEqual(self.msb_calls("rm"), [])
+        self.assertEqual(self.msb_calls("modify")[0]["env"]["NPM_TOKEN"], "planted-port-test")
 
     def test_running_waits_for_the_next_start_unless_restart(self):
         self.created()
         self.port("8080")
         self.assertEqual(self.modifies(), [["--port", "8080:8080", "--next-start"]])
+        self.assertEqual(self.msb_calls("stop"), [])
+        starts = len(self.msb_calls("start"))
         self.port("9090", "--restart")
-        self.assertEqual(self.modifies()[-1], ["--port", "9090:9090", "--restart"])
+        self.assertEqual(self.modifies()[-1], ["--port", "9090:9090", "--next-start"])
+        # Restarted by msbctl, which binds the secrets again: never modify --restart.
+        self.assertEqual(len(self.msb_calls("stop")), 1)
+        self.assertEqual(len(self.msb_calls("start")), starts + 1)
+        self.assertEqual(self.msb_calls("start")[-1]["env"]["NPM_TOKEN"], "planted-port-test")
+        self.assertFalse(any("--restart" in m for m in self.modifies()))
 
     def test_removal_names_the_host_endpoint(self):
         self.created("stopped")
@@ -166,16 +176,33 @@ class PortApplyTest(MsbctlTest):
         self.assertEqual(self.modifies(), [["--port-rm", "127.0.0.1:3000/tcp"]])
         self.assertEqual(self.ports_in_msb(), [])
 
-    def test_the_old_rebuild_flag_restarts_instead(self):
+    def test_a_new_guest_port_replaces_the_mapping(self):
+        self.created("stopped")
+        out = self.port("3000:80")
+        self.assertIn("replaces  3000:5173", out)
+        self.assertEqual(self.m.read_toml(self.entry_path("web"))["ports"], ["3000:80"])
+        self.assertEqual(self.modifies(), [["--port", "3000:80"]])
+
+    def test_a_port_msbctl_did_not_publish_is_left_alone(self):
+        self.created("stopped")
+        state = self.fake_state()
+        state["_ports"]["web"].append({"host_bind": "127.0.0.1", "host_port": 5432,
+                                       "guest_port": 5432, "protocol": "tcp"})
+        with open(os.environ["FAKE_MSB_STATE"], "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+        self.port("8080")
+        self.assertEqual(self.modifies(), [["--port", "8080:8080"]])
+
+    def test_rebuild_still_rebuilds(self):
         self.created()
-        out = self.port("8080", "--rebuild")
-        self.assertEqual(self.modifies(), [["--port", "8080:8080", "--restart"]])
-        self.assertIn("--restart applies it now", out)
-        self.assertEqual(self.msb_calls("rm"), [])
+        with mock.patch.object(self.m, "cmd_rebuild") as rebuild:
+            self.port("8080", "--rebuild")
+        rebuild.assert_called_once()
+        self.assertEqual(self.modifies(), [])
 
     def test_nothing_to_send_when_msb_already_has_them(self):
         self.created("stopped")
-        self.m.apply_ports(self.m.Sandbox("web", self.m.load_config()), restart=False)
+        self.m.apply_ports(self.m.Sandbox("web", self.m.load_config()), self.m.load_config())
         self.assertEqual(self.modifies(), [])
 
 

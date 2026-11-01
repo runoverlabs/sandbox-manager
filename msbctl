@@ -6310,65 +6310,84 @@ def cmd_mount(args, config):
 
 def msb_published_ports(name):
     """{(bind, host port, protocol): canonical spec} that msb has for this
-    sandbox, or None if it cannot say."""
+    sandbox, or None if it cannot say (the reason warned)."""
     proc = subprocess.run(["msb", "inspect", name, "--format", "json"],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if proc.returncode:
+        warn(f"msb inspect {name} failed: {(proc.stderr or '').strip()[:200]}")
+        return None
     try:
         rows = json.loads(proc.stdout)["config"]["network"].get("ports") or []
         out = {}
         for row in rows:
-            bind, host, guest = str(ipaddress.ip_address(row["host_bind"])), int(row["host_port"]), int(row["guest_port"])
+            bind = str(ipaddress.ip_address(row["host_bind"]))
+            host, guest = int(row["host_port"]), int(row["guest_port"])
             proto = str(row.get("protocol", "tcp")).lower()
-            spec = parse_port_spec(f"{bracketed(bind)}:{host}:{guest}/{proto}")[0]
-            out[(bind, host, proto)] = spec
-        return out
-    except (ValueError, KeyError, TypeError, AttributeError, SystemExit):
+            if proto not in ("tcp", "udp") or not (1 <= host <= 65535 and 1 <= guest <= 65535):
+                raise ValueError(f"a port msbctl cannot read: {row!r}")
+            out[(bind, host, proto)] = f"{bracketed(bind)}:{host}:{guest}" + ("/udp" if proto == "udp" else "")
+        return {key: parse_port_spec(spec)[0] for key, spec in out.items()}
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        warn(f"msb inspect {name}: {exc}")
         return None
 
 
-def apply_ports(box, restart):
+def apply_ports(box, config, removed=(), restart=None):
     """Make an existing sandbox publish what its registry entry lists, with
-    `msb modify` (0.7.9+), which keeps the sandbox: no rebuild. What msb
-    has is read back and diffed, so a port it lacks is added and one it has
-    that is no longer listed is removed, whatever happened in between. A
-    running sandbox gets the change on its next start, or now with `restart`;
-    a stopped one has it when it next starts either way."""
+    `msb modify` (0.7.9+), which keeps it: no rebuild. A port msb lacks is
+    added (re-publishing a host endpoint with another guest port replaces
+    it, checked on 0.7.12); a port is unpublished only if it is in `removed`,
+    the specs just dropped from the entry, so one msbctl did not publish (an
+    operator's msb_conf `ports:`) is never touched.
+
+    msb saves the change for the next start (`--next-start`). A running
+    sandbox is then restarted by msbctl itself, stop and ensure_running(),
+    when `restart` says so (None asks, on a terminal): that start reads the
+    bound secrets and redoes the per-boot plumbing, which `msb modify
+    --restart` would skip."""
     state = state_of(box.name)
     if state == "absent":
         note("published when the sandbox is created")
         return
-    want = {(bind, host, proto): spec for spec, bind, host, _, proto in box.published_ports}
     have = msb_published_ports(box.name)
     if have is None:
         warn(f"could not read {box.name}'s ports from msb — `msbctl rebuild {box.name}` applies them")
         return
     argv = ["msb", "modify", box.name]
-    for key, spec in want.items():
-        if have.get(key) != spec:
+    for spec, bind, host, _, proto in box.published_ports:
+        if have.get((bind, host, proto)) != spec:
             argv += ["--port", spec]
-    for (bind, host, proto) in have:
-        if (bind, host, proto) not in want:
+    listed = {(bind, host, proto) for _, bind, host, _, proto in box.published_ports}
+    for spec in removed:
+        _, bind, host, _, proto = parse_port_spec(spec)
+        if (bind, host, proto) in have and (bind, host, proto) not in listed:
             argv += ["--port-rm", f"{bracketed(bind)}:{host}/{proto}"]
     if len(argv) == 3:
         note("msb already publishes exactly these")
         return
-    if state == "running":
-        argv.append("--restart" if restart else "--next-start")
-    run(argv)
+    _, env = box.secret_env()
     if state != "running":
+        run(argv, env=env)
         note("applied: published from the next start")
-    elif restart:
-        note(f"applied: {box.name} restarted")
-    else:
+        return
+    run(argv + ["--next-start"], env=env)
+    if restart is None:
+        restart = sys.stdin.isatty() and confirm(f"apply now — this restarts {box.name}?")
+    if not restart:
         note(f"saved for the next start of {box.name} (`msbctl stop {box.name}` and start, "
              "or `--restart`)")
+        return
+    run(["msb", "stop", box.name], check=False, quiet=True)
+    ensure_running(Sandbox(box.name, config))
+    note(f"applied: {box.name} restarted")
 
 
 def cmd_port(args, config):
     """List, add or remove a sandbox's published ports. They live in the
     registry entry only, and an existing sandbox gets the change through
     `msb modify` (apply_ports()): a running one on its next start, or now
-    with --restart."""
+    with --restart (asked on a terminal). --rebuild rebuilds instead, which
+    also applies every other pending create-time change."""
     box = Sandbox(args.name, config)
     ports = box.published_ports
     if not args.specs and not args.rm:
@@ -6385,11 +6404,20 @@ def cmd_port(args, config):
             drop.append(spec)
         else:
             warn(f"{spec} is not published")
-    add = []
+    add, replaced = [], []
     for raw in args.specs:
         spec, bind, host, guest, proto = parse_port_spec(raw)
         if spec in current or spec in add:
             continue
+        # One host endpoint, one mapping: a new guest port replaces the old.
+        for old in current + add:
+            _, o_bind, o_host, _, o_proto = parse_port_spec(old)
+            if (o_bind, o_host, o_proto) == (bind, host, proto):
+                note(f"replaces  {old}")
+                if old in add:
+                    add.remove(old)
+                elif old not in replaced:
+                    replaced.append(old)
         other = port_conflict(box.name, bind, host, proto)
         if other:
             warn(f"{other} publishes {host} too — only one of them can hold it at a time")
@@ -6397,17 +6425,16 @@ def cmd_port(args, config):
         note(f"recorded  {port_label(bind, host, guest, proto)}")
     for spec in drop:
         note(f"removed   {spec}")
-    new = [spec for spec in current if spec not in drop] + add
+    new = [spec for spec in current if spec not in drop and spec not in replaced] + add
     if new == current:
         note("nothing to change")
         return
     set_toml_key(registry_path(box), "ports", new or None)
     if args.rebuild:
-        note("--rebuild is no longer needed for a port: --restart applies it now")
-    restart = args.restart or args.rebuild
-    if not restart and state_of(box.name) == "running" and sys.stdin.isatty():
-        restart = confirm(f"apply now — this restarts {box.name}?")
-    apply_ports(Sandbox(box.name, config), restart)
+        cmd_rebuild(verb_args("rebuild", name=box.name), config)
+    else:
+        apply_ports(Sandbox(box.name, config), config, removed=drop,
+                    restart=True if args.restart else None)
     if add:
         note("the server inside has to listen on 0.0.0.0, not localhost")
 
@@ -8076,8 +8103,7 @@ def section_ports(box, config, ctx):
     keep = toggle_list("keep these ports", current, current) if current else []
     new = keep + pick_ports(box.name, keep)
     if new != current and set_toml_key(registry_path(box), "ports", new or None):
-        restart = state_of(box.name) == "running" and confirm(f"apply now — this restarts {box.name}?")
-        apply_ports(Sandbox(box.name, config), restart)
+        apply_ports(Sandbox(box.name, config), config, removed=[s for s in current if s not in new])
 
 
 def _summary_egress(box):
@@ -16811,7 +16837,8 @@ def build_parser():
                    help="stop publishing this one (repeatable)")
     p.add_argument("--restart", action="store_true",
                    help="apply it now, restarting the sandbox if it is running")
-    p.add_argument("--rebuild", action="store_true", help=argparse.SUPPRESS)  # the old spelling of --restart
+    p.add_argument("--rebuild", action="store_true",
+                   help="rebuild instead, applying every other pending create-time change too")
     p.set_defaults(func=cmd_port)
 
     p = sub.add_parser("cache", help="show or empty a sandbox's package-cache disks")

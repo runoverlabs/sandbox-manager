@@ -418,7 +418,7 @@ Add an [extra host folder](folders.md#extra-folders). `DEST` defaults to
 ### `msbctl port`
 
 ```text
-msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--restart]
+msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--restart|--rebuild]
 ```
 
 Publish a host port to a server inside the sandbox, so `http://localhost:PORT`
@@ -434,6 +434,7 @@ sandbox](folders.md#reaching-a-server-in-the-sandbox).
 | --- | --- |
 | `--rm PORT` | stop publishing this one; repeatable |
 | `--restart` | apply it now, restarting the sandbox if it is running |
+| `--rebuild` | rebuild instead, which applies every other pending create-time change too |
 | `--rebuild` | rebuild now, so it takes effect |
 
 ### `msbctl secret`

@@ -9,7 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Changed
-- `msbctl port` and `msbctl edit` → Published ports no longer need a rebuild: they change an existing sandbox with `msb modify`, which keeps its state. A stopped sandbox has the new ports when it next starts, and a running one on its next start, or at once with `msbctl port --restart` (asked on a terminal). `--rebuild` still works and now means `--restart`.
+- `msbctl port` and `msbctl edit` → Published ports no longer need a rebuild: they change an existing sandbox with `msb modify`, which keeps its state. A stopped sandbox has the new ports when it next starts, and a running one on its next start, or at once with `msbctl port --restart` (asked on a terminal), which is msbctl's own stop and start. `--rebuild` still rebuilds, for when other create-time changes are pending too. A new guest port for a host port already published replaces that mapping, and a port msbctl didn't publish (an `msb_conf` one) is never removed.
 
 ## [0.10.0] - 2026-10-30
 
