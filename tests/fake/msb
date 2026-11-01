@@ -83,6 +83,8 @@ def create(argv, state):
         "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
     state.setdefault("_secrets", {})[name] = dict(secret_binding(argv[i + 1])
                                                   for i, a in enumerate(argv) if a == "--secret")
+    state.setdefault("_ports", {})[name] = [port_row(argv[i + 1]) for i, a in enumerate(argv)
+                                            if a == "--port"]
 
 
 def secret_var(spec):
@@ -112,6 +114,37 @@ def modify(argv, state):
             bound[var] = hosts
         elif a == "--secret-rm":
             bound.pop(argv[i + 1], None)
+
+
+def port_row(spec, rm=False):
+    """msb's --port (or, with `rm`, --port-rm) syntax as inspect's row."""
+    body, _, proto = spec.partition("/")
+    bind = "127.0.0.1"
+    if body.startswith("["):
+        bind, _, body = body[1:].partition("]:")
+    elif body.count(":") == (1 if rm else 2):
+        bind, body = body.split(":", 1)
+    host, _, guest = body.partition(":")
+    return {"host_bind": bind, "host_port": int(host), "guest_port": int(guest or 0),
+            "protocol": proto or "tcp"}
+
+
+def modify(argv, state):
+    """--port / --port-rm change the recorded ports; anything else is a no-op."""
+    name = argv[1]
+    if name not in state:
+        sys.exit(f"fake msb: no sandbox {name}")
+    ports = state.setdefault("_ports", {}).setdefault(name, [])
+    key = lambda row: (row["host_bind"], row["host_port"], row["protocol"])
+    for i, a in enumerate(argv):
+        if a == "--port-rm":
+            gone = key(port_row(argv[i + 1], rm=True))
+            if not any(key(r) == gone for r in ports):
+                sys.exit(f"fake msb: no published port at {argv[i + 1]}")
+            ports[:] = [r for r in ports if key(r) != gone]
+        elif a in ("--port", "-p"):
+            row = port_row(argv[i + 1])
+            ports[:] = [r for r in ports if key(r) != key(row)] + [row]
 
 
 def ls(argv, state):
@@ -182,7 +215,8 @@ def main():
         sock = os.path.join(os.environ["MSB_STATE_DIR"], "agent", f"{argv[1]}.sock")
         bound = state.get("_secrets", {}).get(argv[1], {})
         print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]},
-                                     "network": {"secrets": {"secrets": [
+                                     "network": {"ports": state.get("_ports", {}).get(argv[1], []), 
+                                                 "secrets": {"secrets": [
                                          {"env_var": v, "allowed_hosts": [
                                              {"wildcard" if h.startswith("*") else "exact": h}
                                              for h in hosts]}
