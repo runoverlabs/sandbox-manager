@@ -81,8 +81,20 @@ def create(argv, state):
         state.setdefault("_labels", {})[name] = labels
     state.setdefault("_created", {})[name] = os.environ.get(
         "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
+    state.setdefault("_secrets", {})[name] = dict(secret_binding(argv[i + 1])
+                                                  for i, a in enumerate(argv) if a == "--secret")
     state.setdefault("_ports", {})[name] = [port_row(argv[i + 1]) for i, a in enumerate(argv)
                                             if a == "--port"]
+
+
+def secret_var(spec):
+    """The variable an `ENV[:OPTIONS]@HOST` spec binds."""
+    return spec.split("@", 1)[0].split(":", 1)[0]
+
+
+def secret_binding(spec):
+    """(variable, [hosts]) for an `ENV[:OPTIONS]@HOST[,HOST]` spec."""
+    return secret_var(spec), spec.rpartition("@")[2].split(",")
 
 
 def port_row(spec, rm=False):
@@ -99,11 +111,16 @@ def port_row(spec, rm=False):
 
 
 def modify(argv, state):
-    """--port / --port-rm change the recorded ports; anything else is a no-op."""
+    """--port / --port-rm change the recorded ports, --secret / --secret-rm
+    the recorded bindings; anything else is a no-op. Like msb, a binding NEW
+    to a running sandbox needs --restart or --next-start; a new value for one
+    it has is live."""
     name = argv[1]
     if name not in state:
         sys.exit(f"fake msb: no sandbox {name}")
     ports = state.setdefault("_ports", {}).setdefault(name, [])
+    bound = state.setdefault("_secrets", {}).setdefault(name, {})
+    timing = "--restart" in argv or "--next-start" in argv
     key = lambda row: (row["host_bind"], row["host_port"], row["protocol"])
     for i, a in enumerate(argv):
         if a == "--port-rm":
@@ -114,6 +131,13 @@ def modify(argv, state):
         elif a in ("--port", "-p"):
             row = port_row(argv[i + 1])
             ports[:] = [r for r in ports if key(r) != key(row)] + [row]
+        elif a == "--secret":
+            var, hosts = secret_binding(argv[i + 1])
+            if var not in bound and state[name] == "running" and not timing:
+                sys.exit(f"fake msb: cannot modify {name!r} without a restart: secret {var} is new")
+            bound[var] = hosts
+        elif a == "--secret-rm":
+            bound.pop(argv[i + 1], None)
 
 
 def ls(argv, state):
@@ -182,8 +206,14 @@ def main():
         modify(argv, state)
     elif verb == ["inspect"]:
         sock = os.path.join(os.environ["MSB_STATE_DIR"], "agent", f"{argv[1]}.sock")
+        bound = state.get("_secrets", {}).get(argv[1], {})
         print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]},
-                                     "network": {"ports": state.get("_ports", {}).get(argv[1], [])}}}))
+                                     "network": {"ports": state.get("_ports", {}).get(argv[1], []), 
+                                                 "secrets": {"secrets": [
+                                         {"env_var": v, "allowed_hosts": [
+                                             {"wildcard" if h.startswith("*") else "exact": h}
+                                             for h in hosts]}
+                                         for v, hosts in bound.items()]}}}}))
     elif argv[:2] == ["volume", "ls"]:
         vols = state.get("_volumes", {})
         print(json.dumps([{"name": n, **v} for n, v in vols.items()]))

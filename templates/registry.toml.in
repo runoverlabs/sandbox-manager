@@ -61,8 +61,9 @@ git_push = "{{GIT_PUSH}}"
 # git_checkstat = false
 
 # Which Claude token this sandbox logs in with, by the name it was stored under
-# (`msbctl setup` → Claude login). Empty follows [defaults] claude_token. The
-# value is read on every start, so a change needs a restart, not a rebuild.
+# (`msbctl setup` → Claude login). Empty follows [defaults] claude_token. A
+# change reaches a running sandbox live (`msbctl edit` → Claude token): no
+# rebuild, and no restart either.
 claude_token = "{{CLAUDE_TOKEN}}"
 
 # Which of this machine's model endpoints ([llm.<name>] in config.toml,
