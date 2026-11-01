@@ -83,6 +83,8 @@ def create(argv, state):
         "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
     state.setdefault("_secrets", {})[name] = dict(secret_binding(argv[i + 1])
                                                   for i, a in enumerate(argv) if a == "--secret")
+    state.setdefault("_scopes", {})[name] = {secret_var(argv[i + 1]): header_fields(argv[i + 1])
+                                             for i, a in enumerate(argv) if a == "--secret"}
 
 
 def secret_var(spec):
@@ -93,6 +95,12 @@ def secret_var(spec):
 def secret_binding(spec):
     """(variable, [hosts]) for an `ENV[:OPTIONS]@HOST[,HOST]` spec."""
     return secret_var(spec), spec.rpartition("@")[2].split(",")
+
+
+def header_fields(spec):
+    """The `headers=[...]` option of a spec, as msb stores it ([] for all)."""
+    found = re.search(r"headers=\[([^\]]*)\]", spec.split("@", 1)[0])
+    return [h for h in found.group(1).split(",") if h] if found else []
 
 
 def modify(argv, state):
@@ -110,6 +118,9 @@ def modify(argv, state):
             if var not in bound and state[name] == "running" and not timing:
                 sys.exit(f"fake msb: cannot modify {name!r} without a restart: secret {var} is new")
             bound[var] = hosts
+            # Like msb: options restate the rule, a bare VAR@HOSTS keeps it.
+            if ":" in argv[i + 1].split("@", 1)[0]:
+                state.setdefault("_scopes", {}).setdefault(name, {})[var] = header_fields(argv[i + 1])
         elif a == "--secret-rm":
             bound.pop(argv[i + 1], None)
 
@@ -183,7 +194,10 @@ def main():
         bound = state.get("_secrets", {}).get(argv[1], {})
         print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]},
                                      "network": {"secrets": {"secrets": [
-                                         {"env_var": v, "allowed_hosts": [
+                                         {"env_var": v,
+                                          "substitution": {"headers": True, "header_fields":
+                                                           state.get("_scopes", {}).get(argv[1], {}).get(v, [])},
+                                          "allowed_hosts": [
                                              {"wildcard" if h.startswith("*") else "exact": h}
                                              for h in hosts]}
                                          for v, hosts in bound.items()]}}}}))

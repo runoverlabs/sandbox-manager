@@ -69,8 +69,9 @@ extra_rules = []
 # Tokens the sandbox can USE but never SEE, in msb's `ENV[:OPTIONS]@HOST[,HOST]`
 # syntax. The guest gets a placeholder; the real value is substituted on the way
 # out, only to those hosts, in headers (Basic auth included). Add `:query` or
-# `:body` to the variable to allow those locations too, or `:headers=[name]` to
-# allow only that header (`msbctl secret add`'s presets name `authorization`). Values are NOT here: they
+# `:body` to the variable to allow those locations too, or `:headers=[name]`
+# to allow only that header (`msbctl secret add`'s presets name
+# `authorization`). Values are NOT here: they
 # live in ~/.config/msb/secrets/<name>.env. Add with `msbctl secret add <name>`.
 {{SECRET_BINDS}}
 

@@ -682,7 +682,9 @@ codeberg = [
 # `$MSB_<VAR>`. Every preset below is read from `Authorization` (Basic for the
 # registry logins, Bearer or a bare token otherwise), so that is all they get:
 # a host that echoes some other header back cannot be made to return the real
-# value to the guest. Leave it out to substitute in every header.
+# value to the guest. A preset without `headers` substitutes in every header.
+# Overriding a shipped preset in your config.toml MERGES with its table here,
+# so it keeps `headers` unless you say `headers = []`.
 #
 # `hosts` must ALSO be reachable: a secret does not open the network. Docker
 # Hub and ghcr.io are in the `containers` egress group; pypi upload is not.
