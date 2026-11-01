@@ -214,9 +214,16 @@ in `[kandev]` (`msbctl host managed configure --client kandev
 with `denied`, never given less than it asked for. This host's own
 `[defaults] nested_virt`, which is for your sandboxes, never applies to
 Kandev's, and neither does msb's own default: msbctl always tells msb which.
-`health` lists the `nested_virt` feature, so the plugin can tell whether a host
-knows the key at all. The host needs nested virtualization itself (not every VM
-passes it on, and ARM64 Linux has none), or msb refuses to start such a sandbox.
+`health` lists the `nested_virt` feature only where asking would be granted
+(allowed, and this host has `/dev/kvm`), so the plugin can tell before it asks;
+on a host without `/dev/kvm` a request is `unsupported` before anything is made.
+The host also needs nested virtualization (not every VM passes it on, and ARM64
+Linux has none), or msb refuses to start such a sandbox. Setting
+`allow_nested_virt` back to `false` can't take KVM away from a sandbox that has
+it, so `start` refuses such a sandbox (`denied`) from then on.
+
+`host kandev configure` doesn't set this key (its output is frozen at protocol
+1's); use `host managed configure --client kandev`.
 
 ## The workspace disk
 

@@ -1625,7 +1625,8 @@ class Sandbox:
         # [defaults] fills in. See NESTED_VIRT_NOTE. Checked at create
         # (create_flags()), not here: sandbox.toml is writable from the guest,
         # and a bad value must not stop `show` or `stop`. A client's sandbox
-        # never gets it (managed_provision() passes false).
+        # has it only as its provision asked and its table allowed
+        # (managed_provision()), recorded in its entry: never from here.
         if self.is_managed:
             # What the client asked for and was granted, from its entry alone.
             self.nested_virt_setting = self.entry.get("nested_virt", False)
@@ -8250,6 +8251,8 @@ NESTED_VIRT_NOTE = (
 
 def _summary_nested_virt(box):
     if box.is_managed:
+        if "nested_virt" not in box.entry:
+            return "off (provisioned before a client could ask for it)"
         return f"{_onoff(box.nested_virt_setting)} (as {owner_name(box.client)} asked)"
     if "nested_virt" not in box.entry and "nested_virt" not in box.project_cfg:
         origin = "the default"
@@ -12281,9 +12284,11 @@ KANDEV_WORKSPACE_MAX_GIB = 500
 # counts ports in proxy_port_pool that the operator's own sandboxes publish.
 # `managed_namespace`: this host also speaks protocol 2 (`msbctl managed`),
 # where a client can migrate without a flag day.
-# `nested_virt`: a provision may ask for `"nested_virt": true` (/dev/kvm in the
-# guest), granted only where the client's table sets allow_nested_virt.
-KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_namespace", "nested_virt")
+# `nested_virt` is added by kandev_health() only where THIS client may ask for
+# /dev/kvm in a provision (`"nested_virt": true`): its table sets
+# allow_nested_virt and this host has KVM. Absent, asking is refused (or, on a
+# host older than the key, ignored), so the plugin can tell before it asks.
+KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_namespace")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -13914,7 +13919,9 @@ def kandev_health(args, config, settings, client="kandev"):
     count, cpus, mem = managed_usage(table, client)
     tls = kandev_tls_status(settings)
     return {
-        "protocol": KANDEV_PROTOCOL, "features": list(KANDEV_FEATURES),
+        "protocol": KANDEV_PROTOCOL,
+        "features": list(KANDEV_FEATURES) + (["nested_virt"] if settings.get("allow_nested_virt")
+                                             and kvm_status() == "rw" else []),
         "msbctl_version": version_string(),
         "msb_version": local_msb_version() or "",
         "kvm": kvm_status() == "rw", "enabled": settings["enabled"],
@@ -14118,6 +14125,9 @@ def managed_provision(args, config, settings, dialect):
     if nested and not settings["allow_nested_virt"]:
         raise KandevError("denied", f"nested_virt: not allowed for {dialect.owner} on this host "
                           f"([{settings.get('table', 'kandev')}] allow_nested_virt)")
+    if nested and kvm_status() != "rw":
+        # Before anything is written or pulled: msb would only fail at create.
+        raise KandevError("unsupported", "nested_virt: this host has no usable /dev/kvm")
     egress = kandev_egress(req.get("egress_allow"), settings)
     private = kandev_private_names(req.get("private_names"), settings, req.get("egress_allow"))
     callback = request_callback(req, dialect, settings)
@@ -14152,7 +14162,7 @@ def managed_provision(args, config, settings, dialect):
             NAME=name, DATE=now.date().isoformat(),
             ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
             IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
-            WORKSPACE=f"{workspace}G", NESTED_VIRT="true" if nested else "false",
+            WORKSPACE=f"{workspace}G", NESTED_VIRT=toml_literal(nested),
             CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
             PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
             PROXY_PORTS=f"proxy_ports = {toml_literal(public)}",
@@ -14311,6 +14321,11 @@ def managed_start(args, config, settings, dialect):
         return record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
+    if entry.get("nested_virt") is True and not settings["allow_nested_virt"]:
+        # Granted at provision; revoked since. msb cannot take KVM away from a
+        # sandbox, so revoking it is refusing to start one that has it.
+        raise KandevError("denied", f"this sandbox has /dev/kvm, which {dialect.owner} is no longer "
+                          f"allowed ([{settings.get('table', 'kandev')}] allow_nested_virt)")
     given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
     bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):

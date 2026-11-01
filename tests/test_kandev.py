@@ -196,6 +196,7 @@ class Provision(KandevTest):
 
     def test_kvm_asked_for_and_allowed(self):
         self.configure(allow_nested_virt=True)
+        self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: "rw"))
         rec = self.provision(nested_virt=True)
         self.assertEqual(self.nested_flag(), ["--nested-virt=true"])
         box = self.m.Sandbox(rec["name"], self.m.load_config())
@@ -204,6 +205,33 @@ class Provision(KandevTest):
         # Allowed is not asked: a provision that does not ask gets none.
         self.provision("7a2d3c4f", operation_id="op-2", input_digest="sha256:2")
         self.assertEqual(self.nested_flag(), ["--nested-virt=false"])
+
+    def test_kvm_on_a_host_without_it_is_unsupported_before_anything_is_made(self):
+        self.configure(allow_nested_virt=True)
+        self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: "missing"))
+        self.error("unsupported", "provision", "6f1c2b9e", stdin=request(nested_virt=True))
+        self.assertEqual(self.msb_calls("create"), [])
+        self.assertEqual(self.msb_calls("pull"), [])
+        self.assertFalse(os.path.exists(self.m.registry_path_for("k-6f1c2b9e")))
+
+    def test_health_lists_the_feature_only_where_it_may_be_asked(self):
+        self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: "rw"))
+        self.assertNotIn("nested_virt", self.ok("health")["features"])
+        self.configure(allow_nested_virt=True)
+        self.assertIn("nested_virt", self.ok("health")["features"])
+        with mock.patch.object(self.m, "kvm_status", lambda: "missing"):
+            self.assertNotIn("nested_virt", self.ok("health")["features"])
+
+    def test_a_revoked_kvm_refuses_to_start(self):
+        self.configure(allow_nested_virt=True)
+        self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: "rw"))
+        self.provision(nested_virt=True)
+        self.stop("k-6f1c2b9e")
+        self.configure(allow_nested_virt=False)
+        right = json.dumps({"secrets": [{"name": "NPM_TOKEN", "value": PLANTED_NPM}]})
+        err = self.error("denied", "start", "6f1c2b9e", stdin=right + "\n")
+        self.assertIn("no longer allowed", err["message"])
+        self.assertEqual(self.msb_calls("start"), [])
 
     def test_create_argv_and_record(self):
         rec = self.provision()
