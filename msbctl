@@ -27,7 +27,7 @@
     msbctl secret add|rm|ls|set <name>   extra tokens the sandbox can use but not see
     msbctl secret migrate --to keyring|file   every stored value into the OS keyring, or back
     msbctl mount <name> SRC[:DEST][:ro|rw]   add an extra host folder (then rebuild)
-    msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (then rebuild)
+    msbctl port <name> [port…] [--rm port]   publish a host port to a server inside (--restart: now)
     msbctl exec <name> [flags] -- cmd…   shell and exec pass msb exec's flags on
     msbctl reclaim <name>         give the guest's page cache back to the host
     msbctl host serve|authorize|check|autostart   run this machine as a remote host
@@ -1618,6 +1618,14 @@ class Sandbox:
         # Size of a dedicated disk for /var/lib/containers, or empty for none.
         self.containers_disk = self._pick("containers_disk",
                                           defaults.get("containers_disk", ""))
+        # Whether the guest gets /dev/kvm. A pinned project key (it hands the
+        # guest the host's KVM), which the registry entry overrides and
+        # [defaults] fills in. See NESTED_VIRT_NOTE. Checked at create
+        # (create_flags()), not here: sandbox.toml is writable from the guest,
+        # and a bad value must not stop `show` or `stop`. A client's sandbox
+        # never gets it (managed_provision() passes false).
+        self.nested_virt_setting = self._pick("nested_virt", defaults.get("nested_virt", False))
+        self.nested_virt = self.nested_virt_setting is True and not self.is_managed
         self.claude_auth = defaults.get("claude_auth", "secret")
         # Registry only: token names exist on this machine, not in the project.
         self.claude_token_pinned = self.entry.get("claude_token", "")
@@ -2382,6 +2390,15 @@ class Sandbox:
                 flags += ["--tls-upstream-ca-cert-for",
                           f"{llm_url(spec)[1]}={os.path.expanduser(spec['ca_cert'])}"]
         flags += ["--root-disk", str(self.root_disk)]
+        # Always stated, true or false: left out, msb falls back to its own
+        # `sandbox_defaults.nested_virt`, a file msbctl neither writes nor shows.
+        # `=` is required: msb's flag takes an optional value.
+        if not isinstance(self.nested_virt_setting, bool):
+            where = (self._origin("nested_virt") if "nested_virt" in self.entry
+                     or "nested_virt" in self.project_cfg else CONFIG_FILE)
+            die(f"{self.name}: nested_virt {self.nested_virt_setting!r} is not true or false "
+                f"— fix it in {tilde(where)}")
+        flags += [f"--nested-virt={'true' if self.nested_virt else 'false'}"]
         # From sandbox.toml / the registry / [defaults], never from dev.yaml,
         # which is not passed to msb. Flags also win over an msb_conf
         # (verified on 0.7.6).
@@ -4200,6 +4217,7 @@ PINNED_KEYS = (
     # or a 4T root disk lands on the next rebuild — on a host that stands alone,
     # with nobody watching it.
     "cpus", "memory", "root_disk", "containers_disk", "caches", "workspace_disk",
+    "nested_virt",          # whether the guest gets the host's KVM
 )
 # NOT pinned, on purpose: `image`, [bootstrap] (but for `pi`, see
 # project_policy()) and [env] act only inside the guest, which is what the sandbox is for, and `conf` only names the file the
@@ -6308,10 +6326,86 @@ def cmd_mount(args, config):
         note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
 
 
+def msb_published_ports(name):
+    """{(bind, host port, protocol): canonical spec} that msb has for this
+    sandbox, or None if it cannot say (the reason warned)."""
+    proc = subprocess.run(["msb", "inspect", name, "--format", "json"],
+                          capture_output=True, text=True, stdin=subprocess.DEVNULL)
+    if proc.returncode:
+        warn(f"msb inspect {name} failed: {(proc.stderr or '').strip()[:200]}")
+        return None
+    try:
+        rows = json.loads(proc.stdout)["config"]["network"].get("ports") or []
+        out = {}
+        for row in rows:
+            bind = str(ipaddress.ip_address(row["host_bind"]))
+            host, guest = int(row["host_port"]), int(row["guest_port"])
+            proto = str(row.get("protocol", "tcp")).lower()
+            if proto not in ("tcp", "udp") or not (1 <= host <= 65535 and 1 <= guest <= 65535):
+                raise ValueError(f"a port msbctl cannot read: {row!r}")
+            out[(bind, host, proto)] = f"{bracketed(bind)}:{host}:{guest}" + ("/udp" if proto == "udp" else "")
+        return {key: parse_port_spec(spec)[0] for key, spec in out.items()}
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        warn(f"msb inspect {name}: {exc}")
+        return None
+
+
+def apply_ports(box, config, removed=(), restart=None):
+    """Make an existing sandbox publish what its registry entry lists, with
+    `msb modify` (0.7.9+), which keeps it: no rebuild. A port msb lacks is
+    added (re-publishing a host endpoint with another guest port replaces
+    it, checked on 0.7.12); a port is unpublished only if it is in `removed`,
+    the specs just dropped from the entry, so one msbctl did not publish (an
+    operator's msb_conf `ports:`) is never touched.
+
+    msb saves the change for the next start (`--next-start`). A running
+    sandbox is then restarted by msbctl itself, stop and ensure_running(),
+    when `restart` says so (None asks, on a terminal): that start reads the
+    bound secrets and redoes the per-boot plumbing, which `msb modify
+    --restart` would skip."""
+    state = state_of(box.name)
+    if state == "absent":
+        note("published when the sandbox is created")
+        return
+    have = msb_published_ports(box.name)
+    if have is None:
+        warn(f"could not read {box.name}'s ports from msb — `msbctl rebuild {box.name}` applies them")
+        return
+    argv = ["msb", "modify", box.name]
+    for spec, bind, host, _, proto in box.published_ports:
+        if have.get((bind, host, proto)) != spec:
+            argv += ["--port", spec]
+    listed = {(bind, host, proto) for _, bind, host, _, proto in box.published_ports}
+    for spec in removed:
+        _, bind, host, _, proto = parse_port_spec(spec)
+        if (bind, host, proto) in have and (bind, host, proto) not in listed:
+            argv += ["--port-rm", f"{bracketed(bind)}:{host}/{proto}"]
+    if len(argv) == 3:
+        note("msb already publishes exactly these")
+        return
+    _, env = box.secret_env()
+    if state != "running":
+        run(argv, env=env)
+        note("applied: published from the next start")
+        return
+    run(argv + ["--next-start"], env=env)
+    if restart is None:
+        restart = sys.stdin.isatty() and confirm(f"apply now — this restarts {box.name}?")
+    if not restart:
+        note(f"saved for the next start of {box.name} (`msbctl stop {box.name}` and start, "
+             "or `--restart`)")
+        return
+    run(["msb", "stop", box.name], check=False, quiet=True)
+    ensure_running(Sandbox(box.name, config))
+    note(f"applied: {box.name} restarted")
+
+
 def cmd_port(args, config):
     """List, add or remove a sandbox's published ports. They live in the
-    registry entry only, and are fixed at create time like the mounts, so a
-    change is recorded here; --rebuild applies it now."""
+    registry entry only, and an existing sandbox gets the change through
+    `msb modify` (apply_ports()): a running one on its next start, or now
+    with --restart (asked on a terminal). --rebuild rebuilds instead, which
+    also applies every other pending create-time change."""
     box = Sandbox(args.name, config)
     ports = box.published_ports
     if not args.specs and not args.rm:
@@ -6328,11 +6422,20 @@ def cmd_port(args, config):
             drop.append(spec)
         else:
             warn(f"{spec} is not published")
-    add = []
+    add, replaced = [], []
     for raw in args.specs:
         spec, bind, host, guest, proto = parse_port_spec(raw)
         if spec in current or spec in add:
             continue
+        # One host endpoint, one mapping: a new guest port replaces the old.
+        for old in current + add:
+            _, o_bind, o_host, _, o_proto = parse_port_spec(old)
+            if (o_bind, o_host, o_proto) == (bind, host, proto):
+                note(f"replaces  {old}")
+                if old in add:
+                    add.remove(old)
+                elif old not in replaced:
+                    replaced.append(old)
         other = port_conflict(box.name, bind, host, proto)
         if other:
             warn(f"{other} publishes {host} too — only one of them can hold it at a time")
@@ -6340,7 +6443,7 @@ def cmd_port(args, config):
         note(f"recorded  {port_label(bind, host, guest, proto)}")
     for spec in drop:
         note(f"removed   {spec}")
-    new = [spec for spec in current if spec not in drop] + add
+    new = [spec for spec in current if spec not in drop and spec not in replaced] + add
     if new == current:
         note("nothing to change")
         return
@@ -6348,7 +6451,8 @@ def cmd_port(args, config):
     if args.rebuild:
         cmd_rebuild(verb_args("rebuild", name=box.name), config)
     else:
-        note(f"takes effect when the sandbox is created: `msbctl rebuild {box.name}`")
+        apply_ports(Sandbox(box.name, config), config, removed=drop,
+                    restart=True if args.restart else None)
     if add:
         note("the server inside has to listen on 0.0.0.0, not localhost")
 
@@ -7298,6 +7402,7 @@ def section_defaults(config, ctx):
             f"size                    {d.get('cpus', '?')} cpu, {d.get('memory', '?')}, {d.get('root_disk', '?')} disk",
             f"project path in guest   {d.get('guest_path', GUEST_PROJECT)}",
             f"host editor git fix     {_onoff(d.get('git_checkstat', True))}",
+            f"KVM in sandboxes        {_onoff(d.get('nested_virt', False))}",
             "back"], 0)
         if action.startswith("projects"):
             note("`msbctl add myproject` creates it inside this folder.")
@@ -7325,6 +7430,15 @@ def section_defaults(config, ctx):
             on = choose_one("set it by default", ["on", "off"],
                             1 if d.get("git_checkstat", True) is False else 0) == "on"
             set_toml_key(CONFIG_FILE, "git_checkstat", on, table="defaults")
+        elif action.startswith("KVM"):
+            for line in NESTED_VIRT_NOTE:
+                note(line)
+            note("This is the default for sandboxes whose project does not say: a project's")
+            note("`nested_virt` (podman sets it) and `msbctl edit` → Nested virtualization win.")
+            on = choose_one("give sandboxes /dev/kvm by default", ["on", "off"],
+                            0 if d.get("nested_virt", False) is True else 1) == "on"
+            set_toml_key(CONFIG_FILE, "nested_virt", on, table="defaults")
+            note("applies at each sandbox's next create or rebuild")
         else:
             return
 
@@ -7991,6 +8105,16 @@ def section_features(box, config, ctx):
             changed.append(True)
     if any(changed):
         ctx["rebuild"].add("features, egress groups and packages")
+    # Only ever turned ON here, and only as podman is ADDED: KVM may be wanted
+    # for more than the feature that brought it, so unticking podman leaves it
+    # to its own section, and so does a later visit with podman still ticked
+    # (which must not undo an explicit off there).
+    if plan.get("nested_virt") and not box.nested_virt and "podman" not in cur["features"]:
+        set_toml_key(edit_target(box, "nested_virt"), "nested_virt", True)
+        note("podman turns on nested virtualization: the guest gets /dev/kvm")
+        ctx["rebuild"].add("nested virtualization")
+    elif box.nested_virt and "podman" in cur["features"] and "podman" not in plan["features"]:
+        note("nested virtualization stays on — 'Nested virtualization' turns it off")
     if "pi" in plan["agents"] and not box.wants_component("pi"):
         section_llm(Sandbox(box.name, config), config, ctx)
     if "podman" in plan["features"] and not (box.containers_disk or boot_cfg(box).get("containers_storage")):
@@ -8077,6 +8201,33 @@ def section_containers(box, config, ctx):
         ctx["rebuild"].add("container storage")
 
 
+NESTED_VIRT_NOTE = (
+    "The guest gets /dev/kvm, so it can run VMs of its own: podman with a krun or",
+    "kata runtime, an emulator, msb itself. It is the host's KVM, reached through",
+    "nested virtualization: a host without it (a VM that does not pass it on, an",
+    "ARM64 Linux host) cannot start the sandbox at all. Fixed at create time.",
+)
+
+
+def _summary_nested_virt(box):
+    if box.is_managed:
+        return "off (always, for a client's sandbox)"
+    if "nested_virt" not in box.entry and "nested_virt" not in box.project_cfg:
+        origin = "the default"
+    else:
+        origin = "this machine's entry" if box._origin("nested_virt") == registry_path(box) else "the project"
+    return f"{_onoff(box.nested_virt_setting)} ({origin})"
+
+
+def section_nested_virt(box, config, ctx):
+    say("Nested virtualization")
+    for line in NESTED_VIRT_NOTE:
+        note(line)
+    on = choose_one("/dev/kvm in this sandbox", ["on", "off"], 0 if box.nested_virt else 1) == "on"
+    if on != box.nested_virt_setting and set_toml_key(edit_target(box, "nested_virt"), "nested_virt", on):
+        ctx["rebuild"].add("nested virtualization")
+
+
 def _summary_folders(box):
     return f"{len(box.entry.get('mounts', []))} extra folder(s)"
 
@@ -8099,7 +8250,7 @@ def section_ports(box, config, ctx):
     keep = toggle_list("keep these ports", current, current) if current else []
     new = keep + pick_ports(box.name, keep)
     if new != current and set_toml_key(registry_path(box), "ports", new or None):
-        ctx["rebuild"].add("published ports")
+        apply_ports(Sandbox(box.name, config), config, removed=[s for s in current if s not in new])
 
 
 def _summary_egress(box):
@@ -8573,6 +8724,7 @@ EDIT_SECTIONS = [
     ("Resources", section_resources, _summary_resources),
     ("Package caches", section_caches, _summary_caches),
     ("Container storage", section_containers, _summary_containers),
+    ("Nested virtualization", section_nested_virt, _summary_nested_virt),
     ("Extra folders", section_folders, _summary_folders),
     ("Published ports", section_ports, _summary_ports),
     ("Egress rules", section_egress, _summary_egress),
@@ -8593,7 +8745,7 @@ EDIT_SECTIONS = [
 # not either: a different folder brings a policy nobody here has looked at,
 # which the next create shows and asks about.
 POLICY_SECTIONS = (section_features, section_resources, section_caches,
-                   section_containers, section_egress, section_github)
+                   section_containers, section_nested_virt, section_egress, section_github)
 
 
 class approving_edits:
@@ -9022,7 +9174,8 @@ def show_data(box, table=None):
         "location": box.location, "repo": box.repo,
         "ref": box.entry.get("ref", "") if box.is_repo else "",
         "image": box.image_or_none(), "cpus": box.cpus, "memory": str(box.memory),
-        "root_disk": str(box.root_disk), "guest_path": box.guest_project,
+        "root_disk": str(box.root_disk), "nested_virt": box.nested_virt,
+        "guest_path": box.guest_project,
         "egress_mode": box.egress_mode, "rule_groups": box.rule_groups,
         "extra_rules": box.extra_rules,
         "ports": [spec for spec, *_ in box.published_ports],
@@ -9102,6 +9255,7 @@ def cmd_show(args, config):
         note(f"msb_conf   {tilde(box.msb_conf)}")
     note(f"image      {box.image}")
     note(f"resources  {box.cpus} cpu, {box.memory} ceiling, {box.root_disk} disk")
+    note(f"kvm        {_summary_nested_virt(box)}")
     note(f"autostart  {'yes' if box.autostart else 'no'}")
     for row in llm_rows(box):
         note(f"pi model   {row['name']:<10} {row['problem'] or row['base_url']}  "
@@ -10167,8 +10321,10 @@ FEATURES = [
       "packages": ["rustc", "cargo", "rust-clippy", "rustfmt"]}),
     ("go",     "the Go module proxy, go (vet, gofmt included)",
      {"groups": ["go"], "languages": ["Go"], "packages": ["golang-go"]}),
-    ("podman", "containers inside the sandbox (podman)",
-     {"groups": ["containers"], "packages": ["podman", "nftables"]}),
+    # nested_virt: podman is where a guest that wants KVM usually comes from
+    # (krun/kata runtimes, a VM-backed test), so ticking it turns KVM on too.
+    ("podman", "containers inside the sandbox (podman), with KVM",
+     {"groups": ["containers"], "packages": ["podman", "nftables"], "nested_virt": True}),
     # Whatever installs Playwright (npm, pip) fetches its browsers separately,
     # from its own CDN, so this is its own feature rather than part of npm or
     # python. No language says "uses Playwright", so nothing preselects it.
@@ -10317,7 +10473,7 @@ def pick_features(groups, default_groups, ref=None, config=None, current=None, a
     the repo's forge (forge_groups())."""
     plan = {"groups": set(), "packages": [], "bun": False, "gitleaks": False, "agents": [], "features": [],
             "root_disk": "", "cpus": 0, "memory": "", "caches": {},
-            "containers_disk": "", "containers_storage": ""}
+            "containers_disk": "", "containers_storage": "", "nested_virt": False}
 
     if agents is None:
         agents = pick_agents(config or {}, current["agents"] if current else None)
@@ -10351,6 +10507,7 @@ def pick_features(groups, default_groups, ref=None, config=None, current=None, a
         plan["packages"] += spec.get("packages", [])
         plan["bun"] = plan["bun"] or spec.get("bun", False)
         plan["gitleaks"] = plan["gitleaks"] or spec.get("gitleaks", False)
+        plan["nested_virt"] = plan["nested_virt"] or spec.get("nested_virt", False)
         _enable_groups(key, spec, groups, plan)
 
     owned = {g for _, _, spec in FEATURES + AGENTS for g in spec["groups"]}
@@ -10843,6 +11000,8 @@ def cmd_add(args, config):
                             CONTAINERS_STORAGE=(f'containers_storage = "{containers_storage}"'
                                                 if containers_storage else
                                                 '# containers_storage = "fuse-overlayfs"'),
+                            NESTED_VIRT=("nested_virt = true" if plan["nested_virt"]
+                                         else "# nested_virt = true"),
                             ALLOW_PRIVATE_DNS="true" if needs_private_dns else "false",
                             SECRET_GITHUB="true" if want_github else "false"))
         note(f"wrote {tilde(sandbox_toml)}" +
@@ -10946,7 +11105,7 @@ def cmd_add_repo(args, config):
             note(f"extra rule   {shown(rule)}")
         for spec in cfg.get("secret_binds", []):
             note(f"secret       {shown(spec)}")
-        for key in ("cpus", "memory", "root_disk", "containers_disk", "workspace_disk"):
+        for key in ("cpus", "memory", "root_disk", "containers_disk", "workspace_disk", "nested_virt"):
             if key in cfg:
                 note(f"{key:<12} {shown(cfg[key])}")
         image = conf_image(os.path.join(tmp, ".msb", "dev.yaml"))
@@ -13944,6 +14103,8 @@ def managed_provision(args, config, settings, dialect):
     # As every msbctl sandbox: hostname rules and secret substitution both
     # need the interceptor. Ports bind 127.0.0.1 only; base_url is the way in.
     argv += ["--tls-intercept"]
+    # Never KVM in a client's sandbox, whatever msb's own sandbox_defaults say.
+    argv += ["--nested-virt=false"]
     if private:
         # msb has no per-name exemption: off for the VM, and KANDEV_PRIVATE_DENY
         # in the rules above stands in for it for every name but those.
@@ -16849,7 +17010,10 @@ def build_parser():
                    help="none: list them. A bare PORT is the same on both sides")
     p.add_argument("--rm", action="append", default=[], metavar="PORT",
                    help="stop publishing this one (repeatable)")
-    p.add_argument("--rebuild", action="store_true", help="rebuild now so it takes effect")
+    p.add_argument("--restart", action="store_true",
+                   help="apply it now, restarting the sandbox if it is running")
+    p.add_argument("--rebuild", action="store_true",
+                   help="rebuild instead, applying every other pending create-time change too")
     p.set_defaults(func=cmd_port)
 
     p = sub.add_parser("cache", help="show or empty a sandbox's package-cache disks")

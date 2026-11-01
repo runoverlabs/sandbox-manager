@@ -73,6 +73,7 @@ including a whole egress group, replaces the shipped value.
 | `identity` | identity name | `""` | the `[identities]` entry new sandboxes use |
 | `git_push` | `"gh"` or `"ssh"` | `"gh"` | how a new sandbox's git reaches GitHub: `"gh"` is https with the GitHub token, `"ssh"` the filtered agent. See [git push](credentials.md#git-push-gh-or-ssh) |
 | `git_checkstat` | boolean | `true` | set `core.checkStat = minimal` in each mounted project's repos on each `shell`/`exec`, so a [host editor](troubleshooting.md#gitindex-disappears-for-a-few-seconds-after-a-git-command) doesn't rewrite `.git/index` under the sandbox |
+| `nested_virt` | boolean | `false` | give a sandbox `/dev/kvm` ([nested virtualization](toolchains.md#kvm-inside-a-sandbox-nested-virtualization)) unless its project or registry entry says otherwise |
 | `workspace_disk` | size | `"20G"` | the clone's disk volume for a sandbox [without a folder](repo-sandboxes.md); fixed when created |
 
 ### `[identities.<name>]`
@@ -182,6 +183,7 @@ name, so it's safe to commit.
 | `cpus` | integer | `[defaults] cpus` | |
 | `memory`, `root_disk` | size | `[defaults]` | |
 | `containers_disk` | size | none | a disk for `/var/lib/containers`, kept across rebuilds |
+| `nested_virt` | boolean | `[defaults] nested_virt` | `/dev/kvm` in the guest ([nested virtualization](toolchains.md#kvm-inside-a-sandbox-nested-virtualization)); the `podman` feature sets it. Approved like the egress rules, fixed at create time |
 | `identity` | identity name | `[defaults] identity` | the `[identities]` entry this project commits as |
 | `[env]` | table of strings | | extra environment variables, merged over the machine-wide set |
 | `[caches]` | table of sizes | | one disk per package manager: `npm`, `bun`, `python`, `rust`, `go` |
@@ -258,7 +260,7 @@ Any key it sets overrides the project's file.
 | `ssh_keys` | list of fingerprints | key fingerprints this sandbox may use. Absent means all, `[]` means none |
 | `mounts` | list | extra folders, as `"HOST[:GUEST][:ro\|rw]"` |
 | `extra_rule_groups` | list of groups | egress groups only this machine defines (your `[rules]`), added to the project's `rule_groups`. `msbctl add` and `edit` put yours here. Needs a rebuild |
-| `ports` | list | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. Needs a rebuild |
+| `ports` | list | published ports, as `"PORT"`, `"HOST:GUEST"` or `"BIND:HOST:GUEST"`, optionally `/udp`. `msbctl port` applies a change without a rebuild |
 | `egress_mode` | `"enforce"` or `"observe"` | `"observe"` while measuring; only ever set here, never in the project |
 | `volumes` | string | the disk-volume prefix, set by `msbctl rename` to keep the old disks |
 | `policy_pin` | string | written by msbctl: the digest of the project policy last approved |
