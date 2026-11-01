@@ -67,9 +67,10 @@ rule_groups = ["github", "claude"]
 #             sandbox reaches is written to its runtime.log, for
 #             `msbctl observe <name>` to read back.
 #
-# Observe exists because msb will not tell you what it DENIED: it logs what it
-# allows and is silent about the rest, at every log level (re-checked on 0.7.7
-# at --debug and --trace). So there is no "warn but permit" to switch on, and
+# Observe exists because msb hardly tells you what it DENIED: it logs what it
+# allows, and of the rest only an HTTPS connection on an intercepted port, at
+# debug level (0.7.12), which an enforcing sandbox does not run at; off :443,
+# nothing. So there is no "warn but permit" to switch on, and
 # the only way to learn what a sandbox actually needs is to let it through and
 # write down where it went. The intended use is a round trip, not a setting:
 #
@@ -172,6 +173,20 @@ git_push = "gh"
 # Sandboxes cloned from a repo (`add --repo`) and Kandev's are never touched:
 # no host editor sees their checkouts.
 git_checkstat = true
+
+# Whether a sandbox gets /dev/kvm (nested virtualization), unless its project's
+# sandbox.toml or its registry entry says (`nested_virt`; the podman feature
+# sets it, `msbctl edit <name>` → Nested virtualization changes it). With it the
+# guest can run VMs of its own: podman with a krun or kata runtime, an
+# emulator, msb itself. Off, because it is the host's KVM the guest reaches.
+#
+# msb 0.7.12 made this a switch (`--nested-virt`), off by default; before,
+# msb had none and the host decided. msbctl always passes the flag, true or false, so msb's own
+# `sandbox_defaults.nested_virt` never decides. Fixed at create time: a change
+# applies at the next rebuild. A host without nested virtualization support
+# (a VM that does not pass it on, an ARM64 Linux host) fails to start a
+# sandbox that asks for it.
+nested_virt = false
 
 [identities]
 
@@ -677,13 +692,23 @@ codeberg = [
 # that is what makes registry logins work). The value is stored per sandbox in
 # ~/.config/msb/secrets/<name>.env, never here.
 #
+# `headers` narrows that to the named header fields (msb 0.7.8+), matched
+# case-insensitively: the placeholder anywhere else goes out as the literal
+# `$MSB_<VAR>`. Every preset below is read from `Authorization` (Basic for the
+# registry logins, Bearer or a bare token otherwise), so that is all they get:
+# a host that echoes some other header back cannot be made to return the real
+# value to the guest. A preset without `headers` substitutes in every header.
+# Overriding a shipped preset in your config.toml MERGES with its table here,
+# so it keeps `headers` unless you say `headers = []`.
+#
 # `hosts` must ALSO be reachable: a secret does not open the network. Docker
 # Hub and ghcr.io are in the `containers` egress group; pypi upload is not.
 #
 # msbctl adds `passthrough=` for the coding agent's own endpoints to every
 # binding, and you want that: msb kills any request carrying a placeholder in
 # its BODY, and an agent that has once seen `$MSB_<VAR>` carries it in every
-# request from then on — which arrives as ECONNRESET naming nothing. Passthrough
+# request from then on — which arrives as a 403 `secret_policy_denied` or, where
+# msb can no longer answer, as ECONNRESET naming nothing. Passthrough
 # only lets the placeholder text travel; the real value stays headers-only and
 # goes to `hosts` and nowhere else.
 #
@@ -692,29 +717,34 @@ codeberg = [
 [secret_presets.npm]
 env   = "NPM_TOKEN"
 hosts = ["registry.npmjs.org"]
+headers = ["authorization"]
 help  = "https://www.npmjs.com/settings/~/tokens  (a granular, read-only token if you only install)"
 usage = "echo '//registry.npmjs.org/:_authToken=${NPM_TOKEN}' >> ~/.npmrc"
 
 [secret_presets.dockerhub]
 env   = "DOCKERHUB_TOKEN"
 hosts = ["registry-1.docker.io", "auth.docker.io"]
+headers = ["authorization"]
 help  = "https://app.docker.com/settings/personal-access-tokens"
 usage = 'podman login docker.io -u YOURUSER -p "$DOCKERHUB_TOKEN"'
 
 [secret_presets.ghcr]
 env   = "GHCR_TOKEN"
 hosts = ["ghcr.io"]
+headers = ["authorization"]
 help  = "https://github.com/settings/tokens  (classic, read:packages / write:packages)"
 usage = 'podman login ghcr.io -u YOURUSER -p "$GHCR_TOKEN"'
 
 [secret_presets.pypi]
 env   = "PYPI_TOKEN"
 hosts = ["upload.pypi.org"]
+headers = ["authorization"]
 help  = "https://pypi.org/manage/account/token/"
 usage = 'twine upload -u __token__ -p "$PYPI_TOKEN" dist/*'
 
 [secret_presets.crates]
 env   = "CARGO_REGISTRY_TOKEN"
 hosts = ["crates.io"]
+headers = ["authorization"]
 help  = "https://crates.io/settings/tokens"
 usage = "cargo publish   (cargo reads CARGO_REGISTRY_TOKEN itself)"

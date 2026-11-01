@@ -69,7 +69,9 @@ extra_rules = []
 # Tokens the sandbox can USE but never SEE, in msb's `ENV[:OPTIONS]@HOST[,HOST]`
 # syntax. The guest gets a placeholder; the real value is substituted on the way
 # out, only to those hosts, in headers (Basic auth included). Add `:query` or
-# `:body` to the variable to allow those locations too. Values are NOT here: they
+# `:body` to the variable to allow those locations too, or `:headers=[name]`
+# to allow only that header (`msbctl secret add`'s presets name
+# `authorization`). Values are NOT here: they
 # live in ~/.config/msb/secrets/<name>.env. Add with `msbctl secret add <name>`.
 {{SECRET_BINDS}}
 
@@ -87,6 +89,14 @@ extra_rules = []
 # root is an overlayfs and podman's overlay driver cannot sit on it, so without
 # this it falls back to vfs (slow, ~3x the disk). Fixed at create time.
 {{CONTAINERS_DISK}}
+#
+# Nested virtualization: the guest gets /dev/kvm, so it can run VMs of its own
+# (podman with a krun or kata runtime, an emulator, msb itself). It is the
+# host's KVM, so this is approved like the egress rules. A host without nested
+# virtualization (a VM that does not pass it on, an ARM64 Linux host) cannot
+# start such a sandbox at all. Omit it to follow the machine's [defaults]
+# nested_virt (off as shipped); the podman feature sets it. Fixed at create time.
+{{NESTED_VIRT}}
 
 # ----------------------------------------------------------------- identity
 #
@@ -169,17 +179,17 @@ gitleaks = {{GITLEAKS}}
 
 # ------------------------------------------------------------------ secrets
 [secrets]
-# Bind this project's fine-grained PAT as --secret GH_TOKEN@github.com,api.github.com.
+# Bind this project's fine-grained PAT as
+# --secret GH_TOKEN:headers=[authorization]@github.com,api.github.com.
 # The value is read from ~/.config/msb/secrets/<name>.env at every start and
 # never enters the guest: msb puts a placeholder in the environment and
-# substitutes the real value host-side, into request HEADERS only, on egress to
-# those two hosts.
+# substitutes the real value host-side, into the Authorization header ONLY, on
+# egress to those two hosts.
 #
 # Consequence worth knowing: `curl -H "Authorization: Bearer $GH_TOKEN"` works.
 # So does `https://x:$GH_TOKEN@github.com/…`, which is NOT a counterexample —
-# curl converts userinfo into an Authorization header before sending. What is
-# genuinely outside the headers is a query string or a request body, and there
-# the placeholder is simply not substituted.
+# curl converts userinfo into an Authorization header before sending. Any other
+# header, a query string or a request body gets the placeholder unsubstituted.
 #
 # `git push` is unaffected either way when origin is an SSH remote — that goes
 # through the forwarded agent, not through this binding.

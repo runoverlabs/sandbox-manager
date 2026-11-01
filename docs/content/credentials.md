@@ -29,6 +29,13 @@ What this means in practice:
   `Authorization` header before sending.
 - A placeholder in a **query string** or a **request body** is not substituted,
   unless the binding opts in with `:query` or `:body`.
+- The GitHub token, and every preset, are substituted in the **`Authorization`
+  header only** (`headers=[authorization]`, which a preset sets with
+  `headers = ["authorization"]`). In any other header the placeholder goes
+  out as itself, so an allowed host that echoes request headers back can't be
+  used to read the real value. A hand-written binding substitutes in every
+  header unless it says `NAME:headers=[x-api-key]@host`; `msbctl secret add` →
+  custom offers "auth only".
 - Sending a token to a host it isn't bound to sends the placeholder text, which
   is useless to whoever receives it.
 
@@ -119,9 +126,11 @@ name (`work`, `personal`) and stores each under its own variable; "choose the
 default Claude token" sets `[defaults] claude_token` in `config.toml`, which
 every sandbox uses unless it picks its own with `msbctl edit` → "Claude token".
 That choice is `claude_token` in the sandbox's registry entry, never in the
-committed `sandbox.toml`. The value is read on every start, so switching is a
-restart, not a rebuild, and the guest sees the same `CLAUDE_CODE_OAUTH_TOKEN`
-placeholder whichever token is behind it. `msbctl show` names the one in use. A
+committed `sandbox.toml`. Switching needs no restart: a running sandbox gets the
+other token at once, and the guest sees the same `CLAUDE_CODE_OAUTH_TOKEN`
+placeholder whichever token is behind it. Replacing a stored token (`msbctl
+setup --claude-token NAME`) reaches every running sandbox that uses it the same
+way. `msbctl show` names the one in use. A
 token stored before names existed is the one called `main`.
 
 > **Note:** `claude_auth = "mount"` in your config shares the host's real
@@ -162,6 +171,10 @@ MY_TOKEN:query@api.example.com          # also substitute in the query string
 MY_TOKEN@one.example.com,two.example.com
 ```
 
+`msbctl secret add` binds it on an existing sandbox without a rebuild, options
+and all: a stopped sandbox has it at its next start, a running one after a
+restart, which msbctl offers.
+
 **Where the value comes from** depends on where the binding is written. A
 binding in the project's `.msb/sandbox.toml` takes its value from that
 sandbox's own `secrets/<name>.env` only, never from `global.env`: that file is
@@ -188,11 +201,12 @@ argument (where `ps` and your shell history would see it):
 
 ```console
 $ pass show github/webshop | msbctl secret set webshop GH_TOKEN --stdin
-$ op read op://dev/npm/token | msbctl secret set webshop NPM_TOKEN --stdin --restart
+$ op read op://dev/npm/token | msbctl secret set webshop NPM_TOKEN --stdin
 $ pass show claude/work | msbctl setup --claude-token work --stdin
 ```
 
-One trailing newline is dropped; an empty value, one with whitespace in it, or
+A running sandbox that already binds the variable uses the new value at once,
+with nothing restarted. One trailing newline is dropped; an empty value, one with whitespace in it, or
 one over 8 KiB is refused, and nothing is printed back. `secret set` only
 stores values for variables the sandbox already binds. `msbctl ls --json` and
 `msbctl show --json` say whether a token is stored, and never what it is.
@@ -203,8 +217,9 @@ msb blocks any outbound request carrying a placeholder in a place where
 substitution isn't allowed, such as a request body. Coding agents send their
 whole transcript in the request body on every turn. So once an agent has read
 `$MSB_GH_TOKEN` (from `env`, say), every later request would carry it and be
-killed, which Claude Code reports as `API Error: Connection dropped
-(ECONNRESET)`.
+killed: msb answers `403` with `secret_policy_denied` where it can, and
+otherwise drops the connection, which Claude Code reports as `API Error:
+Connection dropped (ECONNRESET)`.
 
 msbctl prevents this by adding `passthrough=` for the agent's own API hosts to
 every binding it emits: Anthropic's, and in a sandbox with pi, each of its

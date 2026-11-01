@@ -68,12 +68,20 @@ close egress.
 `msb --secret ENV[:OPTIONS]@HOST` puts a **placeholder** in the guest env and
 substitutes the real value host-side, into **request headers only** (HTTP
 Basic auth included) for the named hosts. Query strings and bodies are not
-substituted unless the binding opts in with `:query` / `:body`. Never put a
+substituted unless the binding opts in with `:query` / `:body`. `headers=[a,b]`
+(msb 0.7.8+) narrows headers to those fields; `GH_SPEC` and the presets
+(`preset_spec()`) say `headers=[authorization]`, so a host echoing a header
+back cannot leak the value. `CLAUDE_SPEC` does not yet: scope it only after a
+live Claude Code login through a scoped binding works, since a wrong scope
+logs every sandbox out. Rotation (`rotate_live()`) sends no options
+and so keeps whatever rule a sandbox was created with. Never put a
 credential in a URL, and never work around the restriction.
 
 **A placeholder in a request body is destroyed, and that breaks coding
 agents.** msb kills any request carrying a `$MSB_<VAR>` where substitution
-isn't permitted. The guest just sees TLS drop, which Claude Code reports as
+isn't permitted. The guest gets a `403` saying `secret_policy_denied` where msb
+can still answer (0.7.9+: the first HTTP/1 request on a connection), and
+otherwise just sees TLS drop, which Claude Code reports as
 `API Error: Connection dropped (ECONNRESET)` — and an agent only has to read
 `$MSB_GH_TOKEN` once for it to land in the transcript, which is resent every
 turn: a fresh session works, then degrades permanently. Allowing the host does
@@ -91,10 +99,13 @@ Two authority rules, both enforced in `secret_env()`:
 
 ## Applying a change
 
-Network rules, TLS interception, DNS rebind protection, mounts, published
-ports, owned disks and the image are **create-time**: `msbctl allow` / `mount`
-/ `port` record them and say a rebuild is needed. `msb modify` cannot change
-them. Full verified matrix: [references/msb-change-matrix.md](references/msb-change-matrix.md).
+Network rules, TLS interception, DNS rebind protection, mounts, owned disks
+and the image are **create-time**: `msbctl allow` / `mount` record them and say
+a rebuild is needed; `msb modify` cannot change them. Published ports are not
+(msb 0.7.9+): `port` and `edit` → Ports save them with `msb modify --port` /
+`--port-rm --next-start` (`apply_ports()`), then restart through msbctl's own
+stop + `ensure_running()`, never `modify --restart`, which skips the secrets'
+environment and the per-boot plumbing. Full verified matrix: [references/msb-change-matrix.md](references/msb-change-matrix.md).
 
 Anything that writes a pinned key (`PINNED_KEYS`: egress, bindings, `[secrets]`,
 resources, caches) must call `check_policy()` **before** writing — so a pending
@@ -105,9 +116,12 @@ in the guest can unmount it, so the pin is the actual control.
 
 ## Measuring instead of guessing
 
-msb **never logs a denial at any log level** (re-checked on 0.7.7 at
-`--debug`/`--trace`). It logs what it allows: at debug, `TLS intercept
-sni=<host> dst=<ip:port>` and a `dns::` line for a resolved name, in
+msb logs a denial only for HTTPS on an intercepted port, at debug (0.7.12:
+`TLS egress denied by default policy sni=<host> dst=<ip:port>`), and enforce
+mode does not run at debug: msb has no per-module filter and debug is ~6 KB of
+virtio noise per request. Off :443 a denial is never logged. msb logs what it
+allows: at debug, `TLS intercept sni=<host> dst=<ip:port>` and a `dns::` line
+for a resolved name, in
 `~/.microsandbox/sandboxes/<name>/logs/runtime.log`. **Nothing is logged for a
 plain TCP connect on a non-443 port** — off 443, a DNS lookup is the only
 evidence. That asymmetry is exactly why `egress_mode = "observe"` has to
@@ -115,6 +129,11 @@ unblock before it can measure: no rules at all, `--net-default-egress allow`,
 `--log-level debug`, `--no-dns-rebind-protection` (a rebind block is a block,
 and would leave no trace). `msbctl observe <name>` reads it back, flags what no
 rule covers, and prints the `msbctl allow` line.
+
+The guest, meanwhile, gets a JSON `403` (`network_policy_denied` /
+`secret_policy_denied`, with `domain`) for a refused HTTP(S) request (msb
+0.7.9+; checked on 0.7.12 over plain HTTP and HTTPS). That is what an agent
+reports, not anything in the log.
 
 `egress_mode` is written to **and read from** the registry entry only, never
 `sandbox.toml` — that file is committed and guest-writable, so honouring it

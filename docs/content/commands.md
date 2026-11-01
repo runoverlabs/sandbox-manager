@@ -418,18 +418,23 @@ Add an [extra host folder](folders.md#extra-folders). `DEST` defaults to
 ### `msbctl port`
 
 ```text
-msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--rebuild]
+msbctl port name|. [PORT|HOST:GUEST|BIND:HOST:GUEST[/udp]…] [--rm PORT] [--restart|--rebuild]
 ```
 
 Publish a host port to a server inside the sandbox, so `http://localhost:PORT`
 on this machine reaches it. A bare `PORT` is the same on both sides. With no
 ports given it lists them, each tcp port's host side a clickable hyperlink to
-its URL (on a terminal). Needs a rebuild. See [Reaching a server in the
+its URL (on a terminal). No rebuild: an existing sandbox is changed with
+`msb modify` and keeps its state. A stopped one has the change when it next
+starts; a running one on its next start, or now with `--restart` (on a
+terminal, msbctl asks). See [Reaching a server in the
 sandbox](folders.md#reaching-a-server-in-the-sandbox).
 
 | Option | Meaning |
 | --- | --- |
 | `--rm PORT` | stop publishing this one; repeatable |
+| `--restart` | apply it now, restarting the sandbox if it is running |
+| `--rebuild` | rebuild instead, which applies every other pending create-time change too |
 | `--rebuild` | rebuild now, so it takes effect |
 
 ### `msbctl secret`
@@ -449,13 +454,13 @@ Tokens the sandbox can use but never see.
 | `add` | bind a new variable: offers the presets, or takes your own binding |
 | `ls` | list the sandbox's extra bindings, and whether each has a value stored |
 | `rm VAR` | unbind one; substitution stops at once |
-| `set VAR` | store a new value for a variable the sandbox already binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt. A running sandbox uses it from its next start |
+| `set VAR` | store a new value for a variable the sandbox already binds (`GH_TOKEN`, or one of its `secret_binds`), from a hidden prompt. A running sandbox that binds it already uses it at once, with no restart; a stopped one from its next start |
 | `migrate` | move every stored value, for every sandbox, into the desktop keyring or back into the files, and set `[secrets] store` to match |
 
 | Option | Meaning |
 | --- | --- |
 | `--stdin` | `set`: read the value from standard input; one trailing newline is dropped |
-| `--restart` | `set`: restart a running sandbox, so the value is used now |
+| `--restart` | `set`: restart a running sandbox to apply it now. Needed only when the binding is new to it (its value was stored after it started); a new value for one it has is live without |
 | `--to keyring\|file` | `migrate`: where the values go |
 | `--json` | `migrate`: print what moved as one JSON document, never a value |
 
