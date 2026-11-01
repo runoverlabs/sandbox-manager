@@ -591,6 +591,7 @@ msbctl host managed configure [--client NAME] [--[no-]enabled] [--serve MODE]
                               [--allow-extra ENTRY …] [--private-name HOST …]
                               [--name-prefix PREFIX] [--env-prefix PREFIX]
                               [--guest-port PORT …] [--[no-]require-callback]
+                              [--[no-]allow-nested-virt]
                               [--body-secret-host HOST …] [--json]
 ```
 
@@ -621,6 +622,7 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `--name-prefix PREFIX`, `--env-prefix PREFIX` | `managed configure --client`: the client's sandbox-name prefix (like `c-`) and agentctl's variable prefix (like `CI_`) |
 | `--guest-port PORT` | `managed configure --client`: the guest ports a provision publishes when it names none, one per flag (1 to 4) |
 | `--require-callback`, `--no-require-callback` | `managed configure --client`: whether a provision must name a callback |
+| `--allow-nested-virt`, `--no-allow-nested-virt` | `managed configure --client`: whether its provisions may ask for `/dev/kvm` (`allow_nested_virt`) |
 | `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |

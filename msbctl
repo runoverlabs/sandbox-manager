@@ -14121,7 +14121,10 @@ def managed_provision(args, config, settings, dialect):
             raise KandevError("invalid_config", f"guest_ports: {problem}")
     # /dev/kvm only when the request asks AND the client's table allows it:
     # never from a host default, and never quietly less than was asked.
-    nested = req.get("nested_virt", False)
+    # null is absent, as for the other optional fields.
+    nested = req.get("nested_virt")
+    if nested is None:
+        nested = False
     if not isinstance(nested, bool):
         raise KandevError("invalid_config", "nested_virt must be true or false")
     if nested and not settings["allow_nested_virt"]:

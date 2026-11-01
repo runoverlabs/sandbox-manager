@@ -194,6 +194,10 @@ class Provision(KandevTest):
         self.assertEqual(self.msb_calls("create"), [])
         self.error("invalid_config", "provision", "6f1c2b9e", stdin=request(nested_virt="yes"))
 
+    def test_kvm_null_is_not_asked(self):
+        self.provision(nested_virt=None)
+        self.assertEqual(self.nested_flag(), ["--nested-virt=false"])
+
     def test_kvm_asked_for_and_allowed(self):
         self.configure(allow_nested_virt=True)
         self.enterContext(mock.patch.object(self.m, "kvm_status", lambda: "rw"))
