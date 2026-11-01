@@ -10710,9 +10710,10 @@ def add_where(args, config):
     remotes = configured_remotes(config)
     if not remotes or args.dir or not (sys.stdin.isatty() and sys.stdout.isatty()):
         return None
-    here = "this machine" + ("" if not local_problem() else f"   ({local_problem()})")
+    problem = local_problem()
+    here = "this machine" + ("" if not problem else f"   ({problem})")
     rows = {f"{n:<14} {remotes[n].get('ssh', '?')}": n for n in sorted(remotes)}
-    choice = choose_one("where should it run", [here] + list(rows), 0 if not local_problem() else 1)
+    choice = choose_one("where should it run", [here] + list(rows), 0 if not problem else 1)
     return rows.get(choice)
 
 
@@ -10766,8 +10767,9 @@ def cmd_add(args, config):
     if remote:
         add_on_remote(remote, args, config)
         return
-    if local_problem():
-        die(local_problem())
+    problem = local_problem()
+    if problem:
+        die(problem)
     if args.repo:
         cmd_add_repo(args, config)
         return
@@ -11275,13 +11277,12 @@ def capture_token(name):
 
 HOST_EXIT_REFUSED = 126
 
-# What `msb exec` accepts (msb 0.7.12, crates/cli/lib/commands/exec.rs). Every
+# What `msb exec` accepts (msb 0.7.7, crates/cli/lib/commands/exec.rs; 0.7.12's
+# `-d`/`--detach` is left out: a job msb owns outlives the session). Every
 # one acts inside the guest. Anything else is refused until it has been read:
 # a future msb flag must not pass unreviewed.
 MSB_EXEC_VALUE_FLAGS = ("-e", "--env", "-w", "--workdir", "-u", "--user", "--timeout", "--rlimit")
-# `-d`/`--detach` (0.7.8) leaves the command running as a job msb owns.
-MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream",
-                       "-d", "--detach")
+MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream")
 
 
 def _msb_flags_problem(flags):
@@ -14023,6 +14024,12 @@ def body_passthrough(spec, dialect):
 
 
 def managed_provision(args, config, settings, dialect):
+    # preflight() is not run for these verbs (they answer in JSON whatever
+    # happens), so the msb minimum is checked here, before anything is made.
+    version = local_msb_version()
+    if msb_too_old(version):
+        raise KandevError("unavailable", f"msb {version} on this host is older than {MSB_MIN}, "
+                          "the oldest msbctl supports")
     env = kandev_check_env(args.env)
     req = kandev_read_header()
     op, digest = req.get("operation_id"), req.get("input_digest")
@@ -15771,6 +15778,11 @@ def remote_setup(name, config):
     # The same msb as here: a sandbox's behaviour is msb's, and what works
     # here should work there. Without msb here, the latest release.
     want = local_msb_version()
+    if msb_too_old(want):
+        # Never copy an msb msbctl refuses: the host would get one it cannot use.
+        warn(f"msb {want} here is older than {MSB_MIN}, the oldest msbctl supports — "
+             f"{name} is offered {MSB_MIN}; upgrade this machine's too")
+        want = MSB_MIN
     match = MSB_VERSION.search(probe.get("msb") or "")
     there = match.group(0) if match else ""
     if not there or (want and there != want):
@@ -16816,8 +16828,9 @@ def preflight(args):
     # is the answer, and the menu works from a laptop with no msb at all.
     if args.func in (cmd_ls, cmd_status, cmd_add, cmd_menu) and configured_remotes():
         return
-    if local_problem():
-        die(local_problem())
+    problem = local_problem()
+    if problem:
+        die(problem)
 
 
 def local_problem():

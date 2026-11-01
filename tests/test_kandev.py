@@ -171,6 +171,12 @@ class HealthAndConfig(KandevTest):
 
 class Provision(KandevTest):
 
+    def test_an_msb_older_than_the_minimum_is_unavailable(self):
+        os.environ["FAKE_MSB_VERSION"] = "0.7.7"
+        err = self.error("unavailable", "provision", "6f1c2b9e", stdin=request())
+        self.assertIn("older than 0.7.12", err["message"])
+        self.assertEqual(self.msb_calls("create"), [])
+
     def test_create_argv_and_record(self):
         rec = self.provision()
         self.assertEqual((rec["name"], rec["state"], rec["generation"]), ("k-6f1c2b9e", "running", 1))
