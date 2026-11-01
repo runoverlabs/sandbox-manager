@@ -10,7 +10,7 @@ description: Requirements, the one-line installer, verifying a release, and inst
 | What | Why |
 | --- | --- |
 | Linux with `/dev/kvm` | microsandbox is a libkrun microVM runtime, so this runs on a host, never inside a container |
-| [`msb`](https://github.com/microsandbox/microsandbox) on `PATH` | the runtime itself. Developed against 0.7.6, re-checked on 0.7.7 |
+| [`msb`](https://github.com/microsandbox/microsandbox) on `PATH` | the runtime itself, **0.7.12 or newer**: msbctl requires the release it is developed against, and `msbctl doctor` fails an older one |
 | Python 3.11+ | `msbctl` uses only the standard library (`tomllib` needs 3.11). Nothing to pip install, ever |
 | `git` | project detection, cloning |
 | `fzf` *(optional)* | the full-screen menu and the picker; without it you get numbered prompts |

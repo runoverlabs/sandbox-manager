@@ -8,7 +8,9 @@
  "key": null,
  "msb": [
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "ls",
@@ -18,7 +20,9 @@
    "json"
   ],
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "rm",
@@ -26,7 +30,9 @@
    "k-e1"
   ],
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "rm",
