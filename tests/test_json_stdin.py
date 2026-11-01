@@ -2,8 +2,7 @@
 
 import json
 import os
-import unittest
-from unittest import mock
+import unittest.mock
 
 from tests.harness import MsbctlTest
 
@@ -249,7 +248,7 @@ class SecretOptionsTest(MsbctlTest):
     def test_secret_add_with_query_is_bound_with_modify(self):
         presets = len(self.m.load_config().get("secret_presets", {}))
         # custom, its name, its host, "also query"; the value from the hidden prompt.
-        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
+        with unittest.mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
             code, out, err = self.run_main("secret", "add", "web",
                                            stdin=f"{presets + 1}\nAPI_KEY\napi.example.org\n2\n")
         self.assertEqual(code, 0, err)
@@ -265,7 +264,7 @@ class SecretOptionsTest(MsbctlTest):
 
     def add_custom(self, var, host, where, restart):
         presets = len(self.m.load_config().get("secret_presets", {}))
-        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
+        with unittest.mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
             return self.run_main("secret", "add", "web",
                                  stdin=f"{presets + 1}\n{var}\n{host}\n{where}\n{restart}\n")
 

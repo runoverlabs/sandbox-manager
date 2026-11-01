@@ -217,7 +217,13 @@ do_claude() {
 	# prebuilt per-platform binary as an optionalDependency. It needs
 	# registry.npmjs.org and nothing else — in particular it does NOT need bun,
 	# whatever the upstream build toolchain happens to be.
-	npm install -g @anthropic-ai/claude-code || return 1
+	#
+	# Its postinstall is what puts that binary in place, and npm 12 blocks
+	# install scripts it isn't told to allow: without --allow-scripts the
+	# install "succeeds" and `claude` then fails with "claude native binary not
+	# installed". Older npm ignores the flag. Only this package's script is
+	# allowed; nothing else installed here needs its own.
+	npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code || return 1
 	claude --version
 }
 

@@ -48,5 +48,27 @@ class ProfileSectionTest(MsbctlTest):
         self.assertIn("`/work/.agents/skills/`", text)
 
 
+class NpmScriptsNoteTest(MsbctlTest):
+    """npm 12 blocks install scripts: said only where the npm feature is on."""
+
+    def section(self, groups, npm=None):
+        extra = f'[versions]\nnpm = "{npm}"\n' if npm is not None else ""
+        self.make_folder_sandbox("web", sandbox_toml=f"rule_groups = {groups!r}\n".replace("'", '"'),
+                                 entry_extra=extra)
+        return self.m.sandbox_profile_section(self.m.Sandbox("web", self.m.load_config()))
+
+    def test_with_the_npm_feature(self):
+        self.assertIn(self.m.NPM_SCRIPTS_PROFILE, self.section(["npm"]))
+
+    def test_not_without_it(self):
+        self.assertNotIn("install scripts", self.section(["github"]))
+
+    def test_not_under_an_npm_that_runs_them(self):
+        self.assertNotIn("install scripts", self.section(["npm"], npm="11.6.2"))
+
+    def test_nodes_own_npm_is_told(self):
+        self.assertIn(self.m.NPM_SCRIPTS_PROFILE, self.section(["npm"], npm=""))
+
+
 if __name__ == "__main__":
     main()
