@@ -6,8 +6,9 @@ description: "Where things live in the msb-manager checkout and what each file i
 # Repo Layout
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 - `msbctl` — single-file Python CLI (~1900 lines). `Sandbox` class (config resolution, `msb` flag emission), `cmd_*` handlers, `main()` argparse at the bottom, fzf menu with numbered-prompt fallback.
 - `msb-picker` — fzf picker used by the desktop entry (`msb-manager.desktop`).

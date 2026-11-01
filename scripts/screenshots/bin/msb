@@ -5,7 +5,10 @@ STATE = {"webshop": "running", "ml-notebooks": "running", "infra": "stopped"}
 USAGE = {"webshop": "MEM=1873/8192 LOAD=0.42 CPUS=4",
          "ml-notebooks": "MEM=5120/16384 LOAD=2.87 CPUS=8"}
 a = sys.argv[1:]
-if a[:1] == ["ls"]:
+if a[:1] == ["ls"] and "--format" in a:
+    print(json.dumps([{"name": n, "image": "base", "status": s.capitalize(),
+                       "created_at": "2026-10-01T12:00:00+00:00"} for n, s in STATE.items()]))
+elif a[:1] == ["ls"]:
     print("NAME          IMAGE   STATUS   CREATED")
     for n, s in STATE.items():
         print(f"{n}  base  {s}  2026-10-01")

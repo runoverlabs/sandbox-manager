@@ -9,7 +9,9 @@
  "key": "kandev",
  "msb": [
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "ls",
@@ -18,7 +20,9 @@
    "-q"
   ],
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "rm",

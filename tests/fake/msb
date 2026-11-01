@@ -10,12 +10,13 @@ refuses anything it does not know so that an unexpected call fails loudly.
     FAKE_MSB_READ_STDIN  if set, `exec` reads its stdin and logs its sha256 and
                        length as "stdin" (never the bytes: they may be a secret)
     FAKE_MSB_FAIL      a verb (`create`, `pull`, …) that fails with exit 1
-    FAKE_MSB_VERSION   what `--version` says (default 0.7.7)
-    FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.7's
+    FAKE_MSB_VERSION   what `--version` says (default 0.7.12)
+    FAKE_MSB_DOCTOR    if set, `--help` lists `doctor`, which answers as 0.7.12's
                        does: "ok", "warn" (exit 0 with a warning) or "fail"
 
-`ls` prints the text table msbctl's msb_table() parses (a header, then
-`name image state created`); keep scripts/screenshots/bin/msb on the same shape.
+`ls --format json` prints what msbctl's msb_table() reads (`name`, `status`
+as msb spells it, `Running`), plain `ls` msb's text table; keep
+scripts/screenshots/bin/msb on the same shape.
 """
 import hashlib
 import json
@@ -80,8 +81,8 @@ def create(argv, state):
         state.setdefault("_labels", {})[name] = labels
     state.setdefault("_created", {})[name] = os.environ.get(
         "FAKE_MSB_CREATED", "2026-10-17T12:00:00.123456789+00:00")
-    state.setdefault("_secrets", {})[name] = [secret_var(argv[i + 1]) for i, a in enumerate(argv)
-                                              if a == "--secret"]
+    state.setdefault("_secrets", {})[name] = dict(secret_binding(argv[i + 1])
+                                                  for i, a in enumerate(argv) if a == "--secret")
 
 
 def secret_var(spec):
@@ -89,17 +90,28 @@ def secret_var(spec):
     return spec.split("@", 1)[0].split(":", 1)[0]
 
 
+def secret_binding(spec):
+    """(variable, [hosts]) for an `ENV[:OPTIONS]@HOST[,HOST]` spec."""
+    return secret_var(spec), spec.rpartition("@")[2].split(",")
+
+
 def modify(argv, state):
-    """--secret / --secret-rm change the recorded bindings; anything else is a no-op."""
+    """--secret / --secret-rm change the recorded bindings; anything else is a
+    no-op. Like msb, a binding NEW to a running sandbox needs --restart or
+    --next-start; a new value for one it has is live."""
     name = argv[1]
     if name not in state:
         sys.exit(f"fake msb: no sandbox {name}")
-    bound = state.setdefault("_secrets", {}).setdefault(name, [])
+    bound = state.setdefault("_secrets", {}).setdefault(name, {})
+    timing = "--restart" in argv or "--next-start" in argv
     for i, a in enumerate(argv):
-        if a == "--secret" and secret_var(argv[i + 1]) not in bound:
-            bound.append(secret_var(argv[i + 1]))
-        elif a == "--secret-rm" and argv[i + 1] in bound:
-            bound.remove(argv[i + 1])
+        if a == "--secret":
+            var, hosts = secret_binding(argv[i + 1])
+            if var not in bound and state[name] == "running" and not timing:
+                sys.exit(f"fake msb: cannot modify {name!r} without a restart: secret {var} is new")
+            bound[var] = hosts
+        elif a == "--secret-rm":
+            bound.pop(argv[i + 1], None)
 
 
 def ls(argv, state):
@@ -129,7 +141,7 @@ def main():
     state = load()
     verb = argv[:1]
     if argv == ["--version"]:
-        print(f"msb {os.environ.get('FAKE_MSB_VERSION', '0.7.7')}")
+        print(f"msb {os.environ.get('FAKE_MSB_VERSION', '0.7.12')}")
     elif argv == ["--help"]:
         print("Usage: msb <COMMAND>\n\nCommands:\n  create  Create a sandbox\n  ls      List sandboxes")
         if os.environ.get("FAKE_MSB_DOCTOR"):
@@ -168,10 +180,13 @@ def main():
         modify(argv, state)
     elif verb == ["inspect"]:
         sock = os.path.join(os.environ["MSB_STATE_DIR"], "agent", f"{argv[1]}.sock")
-        bound = state.get("_secrets", {}).get(argv[1], [])
+        bound = state.get("_secrets", {}).get(argv[1], {})
         print(json.dumps({"config": {"vsock": {"routes": [{"port": 5001, "host_socket": sock}]},
                                      "network": {"secrets": {"secrets": [
-                                         {"env_var": v} for v in bound]}}}}))
+                                         {"env_var": v, "allowed_hosts": [
+                                             {"wildcard" if h.startswith("*") else "exact": h}
+                                             for h in hosts]}
+                                         for v, hosts in bound.items()]}}}}))
     elif argv[:2] == ["volume", "ls"]:
         vols = state.get("_volumes", {})
         print(json.dumps([{"name": n, **v} for n, v in vols.items()]))

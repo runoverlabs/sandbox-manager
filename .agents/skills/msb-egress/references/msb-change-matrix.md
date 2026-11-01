@@ -11,7 +11,7 @@ a rebuild cycle you could have planned for.
 | memory | yes | after restart | `resize`, `edit` → Resources |
 | root disk | yes, **grow only** | live | `resize`, `pick_disks()` |
 | env | yes | after restart | `modify -e` |
-| secrets | yes | a new value for a bound one LIVE (`VAR@HOSTS`, no options: the stored rule and passthrough are kept; 0.7.12), add on next start, removal live | `secret set/add/rm`, `bind_secret_live()`, `rotate_live()` |
+| secrets | yes | a new value for a bound one LIVE (`VAR@HOSTS`, no options: the stored rule and passthrough are kept; 0.7.12), add on next start, removal live | `secret set/add/rm`, `bind_secret_live()`, `rotate_running()` |
 | network rules | **no** | rebuild | `allow`, `edit` → Egress |
 | TLS interception | **no** | rebuild | emitted at create with the rules |
 | DNS rebind protection | **no** | rebuild | `allow_private_dns` |
@@ -25,8 +25,10 @@ use it and everything else cannot. **CLI flags override `--conf`.**
 
 ## Passing secrets to `modify`
 
-Always pass `box.secret_env()` when applying `modify`: on 0.7.6 the call fails
-if any bound secret's host-side variable is unset. Re-enabling interception
+Always pass `box.secret_env()` when applying `modify`: a binding added or
+rotated takes its value from msb's environment. (0.7.6 also failed the call
+when any bound variable was unset; 0.7.12 does not, checked with a label
+change.) Re-enabling interception
 after it was lost also goes through `modify --secret`.
 
 ## Disks

@@ -73,8 +73,12 @@ class SecretSetTest(MsbctlTest):
                                      stdin=PLANTED)
         self.assertEqual(code, 0, err)
         modify = self.msb_calls("modify")[0]["argv"]
-        self.assertIn("--restart", modify)
+        # Saved for the next start, then restarted by msbctl itself, which
+        # binds the values and redoes the per-boot plumbing.
+        self.assertIn("--next-start", modify)
+        self.assertNotIn("--restart", modify)
         self.assertTrue(modify[modify.index("--secret") + 1].startswith("NPM_TOKEN"))
+        self.assertEqual(len(self.msb_calls("stop")), 1)
         self.assert_not_in_argv(PLANTED)
 
     def test_unbound_and_reserved_variables_die(self):
@@ -162,7 +166,7 @@ class LiveRotationTest(MsbctlTest):
         self.assertEqual(code, 0, err)
 
     def modifies(self):
-        return [c for c in self.msb_calls("modify")]
+        return self.msb_calls("modify")
 
     def test_secret_set_rotates_without_a_restart(self):
         code, out, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", stdin=self.NEW)
@@ -193,6 +197,37 @@ class LiveRotationTest(MsbctlTest):
         self.assertEqual(self.msb_calls("stop"), [])
         self.assert_not_in_argv(self.NEW)
         self.assert_not_in_output(self.NEW, out, err)
+
+    def test_restart_asked_for_is_a_real_restart(self):
+        code, _, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", "--restart",
+                                     stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.modifies(), [])
+        self.assertEqual(len(self.msb_calls("stop")), 1)
+        self.assertEqual(self.msb_calls("start")[-1]["env"]["NPM_TOKEN"], self.NEW)
+
+    def test_hosts_come_from_msb_not_from_the_config(self):
+        # Edited since create: the live update keeps the binding msb has.
+        self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["NPM_TOKEN@npm.example.org"]\n'
+                                                     "[bootstrap]\nclaude = true\n")
+        self.store_secret(self.secrets_file("web"), "NPM_TOKEN", PLANTED)
+        code, _, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.modifies()[-1]["argv"][3], "NPM_TOKEN@registry.npmjs.org")
+
+    def test_a_refused_update_is_a_warning_not_a_failure(self):
+        os.environ["FAKE_MSB_FAIL"] = "modify"
+        code, out, err = self.run_main("secret", "set", "web", "NPM_TOKEN", "--stdin", stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        self.assertIn("did not take the new NPM_TOKEN live", err)
+        self.assertEqual(self.m.read_env_file(self.secrets_file("web"))["NPM_TOKEN"], self.NEW)
+
+    def test_a_new_default_token_reaches_the_sandboxes_following_the_default(self):
+        code, _, err = self.run_main("setup", "--claude-token", "work", "--stdin", "--default",
+                                     stdin=self.NEW)
+        self.assertEqual(code, 0, err)
+        [call] = self.modifies()
+        self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], self.NEW)
 
     def test_another_token_name_leaves_it_alone(self):
         code, _, err = self.run_main("setup", "--claude-token", "work", "--stdin", stdin=self.NEW)
@@ -228,13 +263,36 @@ class SecretOptionsTest(MsbctlTest):
         self.assertEqual(call["env"]["API_KEY"], PLANTED)
         self.assert_not_in_argv(PLANTED)
 
+    def add_custom(self, var, host, where, restart):
+        presets = len(self.m.load_config().get("secret_presets", {}))
+        with mock.patch.object(self.m, "read_secret_hidden", lambda prompt: PLANTED):
+            return self.run_main("secret", "add", "web",
+                                 stdin=f"{presets + 1}\n{var}\n{host}\n{where}\n{restart}\n")
+
+    def test_adding_hosts_to_a_variable_msb_binds_rebinds_it(self):
+        code, _, err = self.add_custom("API_KEY", "a.example.org", 1, "n")
+        self.assertEqual(code, 0, err)
+        code, _, err = self.add_custom("API_KEY", "b.example.org", 2, "y")
+        self.assertEqual(code, 0, err)
+        call = self.msb_calls("modify")[-1]["argv"]
+        specs = [call[i + 1] for i, a in enumerate(call) if a == "--secret"]
+        # Every binding of the variable, so msb merges them: not a bare rotation.
+        self.assertEqual([s.rpartition("@")[2] for s in specs], ["a.example.org", "b.example.org"])
+        self.assertTrue(specs[1].startswith("API_KEY:query,passthrough=["))
+        self.assertIn("--next-start", call)
+        # "y" to the restart, read from the pipe as before: msbctl restarts it.
+        self.assertEqual(len(self.msb_calls("stop")), 1)
+
     def test_a_stopped_sandbox_takes_it_without_a_flag(self):
         self.set_state(web="stopped")
+        # Declared, as `secret add` writes it: nothing is bound without a value.
+        self.make_folder_sandbox("web", sandbox_toml='secret_binds = ["API_KEY:body@api.example.org"]\n')
         self.store_secret(self.secrets_file("web"), "API_KEY", PLANTED)
         box = self.m.Sandbox("web", self.m.load_config())
         self.m.bind_secret_live(box, self.m.load_config(), "API_KEY:body@api.example.org", None)
         [call] = self.msb_calls("modify")
-        self.assertTrue(call["argv"][3].startswith("API_KEY:body,passthrough=["))
+        spec = call["argv"][call["argv"].index("--secret") + 1]
+        self.assertTrue(spec.startswith("API_KEY:body,passthrough=["), spec)
         self.assertNotIn("--restart", call["argv"])
         self.assertNotIn("--next-start", call["argv"])
 

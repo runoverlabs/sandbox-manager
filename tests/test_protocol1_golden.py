@@ -156,7 +156,7 @@ class Protocol1Golden(MsbctlTest):
                     mock.patch.object(m, "utc_now", lambda: self.now), \
                     mock.patch.object(m.os, "urandom", self.urandom), \
                     mock.patch.object(m, "version_string", lambda: "0.0.0-golden"), \
-                    mock.patch.object(m, "local_msb_version", lambda: "0.7.7"), \
+                    mock.patch.object(m, "local_msb_version", lambda: "0.7.12"), \
                     mock.patch.object(m, "kandev_host_facts", lambda: dict(HOST_FACTS)), \
                     mock.patch.object(m, "host_platform", lambda: "linux-amd64"), \
                     mock.patch.object(m, "kvm_status", lambda: "rw"), \
