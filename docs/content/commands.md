@@ -624,6 +624,8 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `--require-callback`, `--no-require-callback` | `managed configure --client`: whether a provision must name a callback |
 | `--allow-nested-virt`, `--no-allow-nested-virt` | `managed configure --client`: whether its provisions may ask for `/dev/kvm` (`allow_nested_virt`) |
 | `--tls`, `--no-tls` | `managed configure --client`: whether its key installs the proxy's certificate (`tls`; one client at most, Kandev's while none is given it) |
+| `--llm NAME` | `managed configure --client`: the whole `llms` list, one `[llm.NAME]` endpoint per flag, that its provisions may pick; `''` alone empties it |
+| `--allow-upstream-ca`, `--no-allow-upstream-ca` | `managed configure --client`: whether its provisions may send a CA for one of their own hosts (`allow_upstream_ca`, on unless set false) |
 | `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |
@@ -692,7 +694,8 @@ Kandev's stays required and unchecked. `guest_ports` may name 1 to 4 guest ports
 agentctl's environment and nonce use the client's `env_prefix`, and its binary
 goes to `/opt/NAME/agentctl`. A secret may name the only `headers` it is
 filled in, and `start` of a running sandbox with its secrets hands msb the
-new values live. `tls install` is the key's of the one client whose table sets
+new values live. A provision may pick operator endpoints its table grants
+(`llms`) and send a CA for one of its own hosts (`upstream_ca`). `tls install` is the key's of the one client whose table sets
 `tls = true` ([the proxy's certificate](managed.md#the-proxys-certificate)).
 `restart-proxy` and `self-update` are not here: they act for the whole host.
 
