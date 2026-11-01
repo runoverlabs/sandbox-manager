@@ -69,3 +69,11 @@ callback_ip   = {{CALLBACK_IP}}
 # created with DNS rebind protection off, and these names' rules first, ahead
 # of a deny of every non-public destination.
 {{PRIVATE}}
+
+# What the operator holds, not the client: the [llm.<name>] endpoints this
+# provision picked from the client's `llms` grant (their rule, port, CA and
+# private name came from those tables), the bindings of the keys this host
+# stores for them (values read from global.env at every start, never here),
+# and the hosts the request sent a CA for (kept in the state dir until the
+# sandbox is removed).
+{{HOST_HELD}}

@@ -36,6 +36,29 @@ listens on `base_url`'s own port and there is no `/health` URL:
 [check a host](kandev.md#checking-a-host) with `msbctl managed health` over ssh
 and a real lease.
 
+## Who decides what
+
+Three parties, and a line between each. The operator (you, on this host) sets
+the ceilings and owns what is shared or held here. The client sets up its own
+sandboxes inside them. What runs in a guest is trusted with nothing: every
+rule below is enforced by msb, outside it, whoever chose it. The client is
+trusted, but its key lives on another machine, so each limit is what a stolen
+key could not get past.
+
+| What | Operator (host) | Client (its key) | Guest |
+| --- | --- | --- | --- |
+| Capacity | `max_sandboxes`, `max_cpus`, `max_memory`; `[managed]` totals | sizes each sandbox within them | – |
+| Egress | the ceiling: `rule_groups`, `allow_extra`, `private_names` (`["*"]` hands over all of it) | `egress_allow`, `private_names`, `callback`, within the ceiling | only what the sandbox allows |
+| The client's own secrets | – | values, hosts, and the only `headers` they go in; a new value live | holds a placeholder; the value goes into headers to those hosts alone |
+| Placeholders in bodies | `body_secret_hosts` | – | sent only there, never anywhere else |
+| Model endpoints | `[llm.<name>]`: host, port, CA, private name and key, all stored here; `llms` grants them | picks granted ones (`llms`) | reaches them; never sees the key |
+| Trusting a CA | `allow_upstream_ca` (on); never for an endpoint whose key it holds | sends one for its own hosts (`upstream_ca`) | – |
+| `/dev/kvm` | `allow_nested_virt` | asks for it (`nested_virt`) | gets it only then |
+| Image, env, ports, lease | – | its choice (`guest_ports` default from its table) | – |
+| The proxy's certificate | gives it to one client (`tls`) | that client installs it (`tls install`) | – |
+| The proxy, msbctl itself | `restart-proxy`, `self-update` (and Kandev's key) | – | – |
+| Host paths, host credentials, other sandboxes | never handed out | never reachable | never reachable |
+
 ## Setting a client up
 
 1. Set the host up for Kandev as on the [Kandev hosts](kandev.md#setting-a-host-up)
@@ -91,6 +114,8 @@ groups, and is off until `enabled = true`.
 | `body_secret_hosts` | `[]` | hosts a secret's placeholder may travel to in a request body; see [below](#secrets-in-request-bodies) |
 | `allow_nested_virt` | `false` | whether its provisions may ask for `/dev/kvm` (`"nested_virt": true`), as for [Kandev](kandev.md#kvm-in-a-sandbox). Never from this host's `[defaults]` |
 | `tls` | `false` | whether its key may install the proxy's certificate; see [below](#the-proxys-certificate). One client at most, and never set in Kandev's table |
+| `llms` | `[]` | `[llm.<name>]` endpoints of this host its provisions may pick; see [below](#model-endpoints) |
+| `allow_upstream_ca` | `true` | whether its provisions may send a CA to trust for one of their own hosts; see [below](#a-servers-own-ca) |
 
 Kandev's own table is `[kandev]`, or `[clients.kandev]`, but not both. Its
 `name_prefix`, `env_prefix`, `guest_ports`, `require_callback` and
@@ -182,6 +207,48 @@ compared without case. The scope is fixed at provision: `start` sends the
 values only. `health` lists the `secret_headers` feature on a host that takes
 it.
 
+## Model endpoints
+
+An agent like pi needs a model endpoint, and its key. Rather than each client
+carrying one, the operator defines it once, as for their own sandboxes: an
+[`[llm.<name>]` table](models.md) with its URL, port, `ca_cert`, `private_dns`
+and the key stored here (`LLM_KEY_<NAME>` in `global.env`). `llms = ["qwen"]`
+grants it to a client (`msbctl host managed configure --client NAME --llm qwen`),
+and a provision that names it (`"llms": ["qwen"]`) gets everything it takes:
+
+- the egress rule to its host and port, and TLS interception on that port
+- its `ca_cert` trusted for that host alone, and its name allowed to resolve
+  privately with `private_dns`
+- its key bound to that host alone, read from this host at provision and at
+  every `start`, so it never travels through the client. A start of a running
+  sandbox with its secrets sends the key as stored now, so a key you replace
+  reaches it live
+- the endpoint as a passthrough host of every binding: it receives the agent's
+  whole transcript, placeholders and all
+
+`health` lists each granted endpoint under `client_settings.llms`: its name,
+`base_url`, models and the like, and `key`, the placeholder to put in pi's
+`models.json` (`$LLM_KEY_QWEN`; empty when no key is stored). Never the key or
+a path. Naming one that is not granted is `denied`; once a grant is revoked, a
+sandbox that uses it is refused `start`.
+
+## A server's own CA
+
+Every sandbox's HTTPS goes through msb's interceptor, which checks the server's
+certificate against the public roots. A server with a private certificate
+fails that. A provision may send the CA to trust for one of its own hosts:
+`"upstream_ca": [{"host": "git.example.org", "ca_pem": "-----BEGIN CERTIFICATE-----…"}]`,
+up to 8, each trusted for that host alone, and kept on this host until the
+sandbox is removed. The host must be one its `egress_allow` (or `callback`)
+names, and never an endpoint whose key the operator holds here: a CA there
+could take that key. `allow_upstream_ca = false` refuses all of them.
+
+A secret allowed on a port besides 443 (`"egress_allow": ["llm.example.org:8443"]`
+for a secret bound to `llm.example.org`) has that port intercepted too, or the
+secret would never be substituted there. Interception is per port, not per
+host: any other host reached on that port is intercepted as well, and one with
+a private certificate then needs its CA here.
+
 ## Protocol 2
 
 `msbctl managed <verb>` is protocol 1's [verbs](kandev.md#the-verbs) with these
@@ -189,9 +256,10 @@ differences:
 
 - `health` adds `protocols` (`[2]`, or `[1, 2]` for the Kandev key), `client`,
   `client_settings` (its `name_prefix`, `env_prefix`, `guest_ports`,
-  `require_callback`, `body_secret_hosts`, `allow_nested_virt`, and `tls`: whether
-  this key installs the certificate), the features `secret_headers` and
-  `live_secrets`, and `host_capacity` when
+  `require_callback`, `body_secret_hosts`, `allow_nested_virt`, `tls`: whether
+  this key installs the certificate, `allow_upstream_ca`, and `llms`, the
+  [model endpoints](#model-endpoints) granted), the features `secret_headers`,
+  `live_secrets`, `llms`, `upstream_ca` and `secret_ports`, and `host_capacity` when
   `[managed]` sets totals. Its capacity, egress and proxy ports are the
   client's own. A client with no table answers `enabled: false`.
 - `provision` takes an optional `callback` `{host, port}` (`kandev_api` is the

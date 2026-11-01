@@ -520,6 +520,14 @@ private_names = []
 #   # (`msbctl managed tls install`). Default false. One client at most:
 #   # Kandev's until another table sets it (never set in Kandev's own).
 #   tls = true
+#   # [llm.<name>] endpoints of this host its provisions may pick ("llms":
+#   # ["qwen"]): their rule, port, CA, private name and key (from global.env)
+#   # all come from here; the client never holds the key. Default none.
+#   llms = ["qwen"]
+#   # Whether a provision may send a CA to trust for one of its own hosts
+#   # ("upstream_ca"). Default true: it decides only what its own sandbox
+#   # trusts, and never for an endpoint whose key this host holds.
+#   allow_upstream_ca = false
 
 # ---------------------------------------------------------------------------
 # Egress rule groups

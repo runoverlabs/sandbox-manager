@@ -6,11 +6,14 @@ import hashlib
 import io
 import json
 import os
+import shutil
+import tempfile
 import tomllib
-from unittest import main, mock
+from unittest import main, mock, skipUnless
 
 from tests.harness import MsbctlTest
 from tests.test_kandev import IMAGE, PLANTED_NPM, KandevTest, request
+from tests.test_kandev_tls import HAVE_OPENSSL, make_pki
 
 PLANTED_CI = "planted-ci-secret"
 PLANTED_CI_NONCE = "planted-ci-nonce"
@@ -97,8 +100,8 @@ WRONG_TYPES = {"int": "7", "str": '"x"', "list of lists": '[["base"]]', "dict": 
                "bool": "true", "float": "1.5", "nested table": None}
 UNKNOWN_KEYS = ("colour", "Enabled", "max-sandboxes")
 # Client keys for which that type is the right one: not a wrong value there.
-RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("allow_nested_virt", "bool"), ("tls", "bool"),
-               ("max_sandboxes", "int"),
+RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("allow_nested_virt", "bool"),
+               ("tls", "bool"), ("allow_upstream_ca", "bool"), ("max_sandboxes", "int"),
                ("max_cpus", "int")}
 
 
@@ -529,7 +532,7 @@ class Health(ManagedTest):
         self.assertEqual(doc["client_settings"], {
             "name_prefix": "c-", "env_prefix": "CI_", "guest_ports": [8765, 9000],
             "require_callback": False, "body_secret_hosts": ["llm.example.org"],
-        "allow_nested_virt": False, "tls": False})
+        "allow_nested_virt": False, "tls": False, "allow_upstream_ca": True, "llms": []})
         self.assertIn("managed_namespace", doc["features"])
         self.assertIn("secret_headers", doc["features"])
         self.assertIn("live_secrets", doc["features"])
@@ -1778,6 +1781,198 @@ class LiveSecrets(ManagedTest):
                                name="NPM_TOKEN", hosts=["registry.npmjs.org"])
         self.assertEqual(code, 0, doc)
         self.assertEqual(self.msb_calls("modify"), [])
+
+
+PLANTED_QWEN = "planted-operator-qwen-key"
+LAN_LLM = "llm.lan.example.org"
+
+
+def create_flags(argv, flag):
+    """Every value `flag` takes in one msb argv."""
+    return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+
+class HostHeldEndpoints(ManagedTest):
+    """[clients.NAME] llms: the operator's [llm.<name>] endpoints, picked by a
+    provision, with their rule, port, CA, private name and key all host-side."""
+
+    env_keys = ("NPM_TOKEN", "LLM_KEY", "LLM_KEY_QWEN")
+
+    def setUp(self):
+        where = tempfile.mkdtemp(prefix="msbctl-ca-")
+        self.addCleanup(shutil.rmtree, where, True)
+        self.ca = os.path.join(where, "lan-ca.pem")
+        with open(self.ca, "w", encoding="utf-8") as fh:
+            fh.write("not read by these tests\n")
+        self.ci_table = CI + 'llms = ["qwen"]\n' + (
+            f'\n[llm.qwen]\nbase_url = "https://{LAN_LLM}:8443/v1"\nmodels = ["qwen3"]\n'
+            f'private_dns = true\nca_cert = "{self.ca}"\n')
+        super().setUp()
+        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_QWEN", PLANTED_QWEN)
+
+    def provision(self, **over):
+        return self.ci_provision(llms=["qwen"], **over)
+
+    def test_health_says_how_to_reach_it_and_nothing_more(self):
+        doc = self.ci_ok("managed", "health")
+        self.assertEqual(doc["client_settings"]["llms"], [
+            {"name": "qwen", "base_url": f"https://{LAN_LLM}:8443/v1", "key": "$LLM_KEY_QWEN",
+             "models": ["qwen3"]}])
+        self.assertIn("llms", doc["features"])
+        self.assertNotIn(self.ca, json.dumps(doc))
+        self.assertNotIn(PLANTED_QWEN, json.dumps(doc))
+
+    def test_provision_gets_everything_from_the_operators_table(self):
+        rec = self.provision()
+        call = self.msb_calls("create")[0]
+        argv = call["argv"]
+        self.assertIn(f"allow@{LAN_LLM}:tcp:8443", create_flags(argv, "--net-rule"))
+        self.assertEqual(create_flags(argv, "--tls-intercept-port"), ["443", "8443"])
+        self.assertEqual(create_flags(argv, "--tls-upstream-ca-cert-for"), [f"{LAN_LLM}={self.ca}"])
+        self.assertIn("--no-dns-rebind-protection", argv)
+        secrets = create_flags(argv, "--secret")
+        # The endpoint gets the transcript, so every binding lets placeholders through to it.
+        self.assertEqual(secrets, [
+            f"LLM_KEY:passthrough=[llm.example.org,{LAN_LLM}]@llm.example.org",
+            f"LLM_KEY_QWEN:passthrough=[llm.example.org,{LAN_LLM}]@{LAN_LLM}"])
+        self.assertEqual(call["env"]["LLM_KEY_QWEN"], PLANTED_QWEN)
+        self.assert_not_in_argv(PLANTED_QWEN)
+        entry = self.m.read_toml(self.entry_path(rec["name"]))
+        self.assertEqual((entry["llms"], entry["llm_binds"]), (["qwen"], [f"LLM_KEY_QWEN@{LAN_LLM}"]))
+        self.assertEqual(entry["secret_binds"], ["LLM_KEY@llm.example.org"])
+        with open(self.entry_path(rec["name"]), encoding="utf-8") as fh:
+            self.assertNotIn(PLANTED_QWEN, fh.read())
+
+    def test_without_llms_nothing_of_it(self):
+        self.ci_provision()
+        argv = self.msb_calls("create")[0]["argv"]
+        self.assertFalse(any(LAN_LLM in a for a in argv))
+        self.assertEqual(create_flags(argv, "--tls-intercept-port"), [])
+
+    def test_only_what_is_granted(self):
+        self.ci_error("denied", "managed", "provision", "e1", stdin=ci_request(llms=["other"]))
+        self.ci_error("invalid_config", "managed", "provision", "e1", stdin=ci_request(llms="qwen"))
+        # A client's own secret can never take an endpoint key's name.
+        self.ci_error("invalid_config", "managed", "provision", "e1", stdin=ci_request(secrets=[
+            {"name": "LLM_KEY_QWEN", "value": "x", "hosts": ["llm.example.org"]}]))
+        self.assertEqual(self.msb_calls("create"), [])
+
+    def test_a_grant_of_no_such_endpoint_is_the_tables_problem(self):
+        self.ci_table = CI + 'llms = ["nope"]\n'
+        self.configure()
+        self.assertIn("llms", self.ci_error("invalid_config", "managed", "provision", "e1",
+                                            stdin=ci_request())["message"])
+
+    def test_a_broken_endpoint_names_no_path_to_the_client(self):
+        os.remove(self.ca)
+        message = self.ci_error("invalid_config", "managed", "provision", "e1",
+                                stdin=ci_request(llms=["qwen"]))["message"]
+        self.assertIn("llm.qwen", message)
+        self.assertNotIn(self.ca, message)
+
+    def test_start_reads_the_key_on_the_host(self):
+        self.provision()
+        self.ci_ok("stop", "c-e1", "--json")
+        secrets = json.dumps({"secrets": [{"name": "LLM_KEY", "value": PLANTED_CI,
+                                           "hosts": ["llm.example.org"]}]}) + "\n"
+        self.ci_ok("managed", "start", "e1", stdin=secrets)
+        self.assertEqual(self.msb_calls("start")[-1]["env"]["LLM_KEY_QWEN"], PLANTED_QWEN)
+        # A key the operator removed: refused, never a start with the placeholder.
+        self.ci_ok("stop", "c-e1", "--json")
+        self.m.set_env_file_value(self.m.GLOBAL_ENV, "LLM_KEY_QWEN", "")
+        self.ci_error("unavailable", "managed", "start", "e1", stdin=secrets)
+        # A grant revoked: refused.
+        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_QWEN", PLANTED_QWEN)
+        self.ci_table = self.ci_table.replace('llms = ["qwen"]\n', "")
+        self.configure()
+        self.assertIn("qwen", self.ci_error("denied", "managed", "start", "e1", stdin=secrets)["message"])
+
+    def test_rotation_brings_the_operators_current_key(self):
+        self.provision()
+        self.store_secret(self.m.GLOBAL_ENV, "LLM_KEY_QWEN", PLANTED_QWEN + "-new")
+        self.ci_ok("managed", "start", "e1", stdin=json.dumps({"secrets": [
+            {"name": "LLM_KEY", "value": PLANTED_CI, "hosts": ["llm.example.org"]}]}) + "\n")
+        [call] = self.msb_calls("modify")
+        self.assertEqual(call["argv"], ["modify", "c-e1", "--secret", "LLM_KEY@llm.example.org",
+                                        "--secret", f"LLM_KEY_QWEN@{LAN_LLM}"])
+        self.assertEqual(call["env"]["LLM_KEY_QWEN"], PLANTED_QWEN + "-new")
+
+    def test_configure(self):
+        self.ci_table = CI + f'\n[llm.qwen]\nbase_url = "https://{LAN_LLM}:8443/v1"\n'
+        self.configure()
+        code, out, err = self.run_main("host", "managed", "configure", "--client", "ci", "--llm", "qwen",
+                                       "--no-allow-upstream-ca", "--json")
+        self.assertEqual(code, 0, err)
+        doc = json.loads(out)["settings"]
+        self.assertEqual((doc["llms"], doc["allow_upstream_ca"]), (["qwen"], False))
+
+
+@skipUnless(HAVE_OPENSSL, "needs the openssl command to make a test CA")
+class UpstreamCa(ManagedTest):
+    """A provision's own CA for one of its own hosts."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.pki_dir = tempfile.mkdtemp(prefix="msbctl-pki-")
+        with open(make_pki(cls.pki_dir)["ca.pem"], encoding="utf-8") as fh:
+            cls.ca_pem = fh.read()
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.pki_dir, ignore_errors=True)
+
+    def ca(self, host="llm.example.org", pem=None):
+        return [{"host": host, "ca_pem": self.ca_pem if pem is None else pem}]
+
+    def test_trusted_for_that_host_alone_and_removed_with_the_sandbox(self):
+        self.ci_provision(upstream_ca=self.ca("LLM.example.org"))
+        path = os.path.join(self.m.managed_ca_dir("c-e1"), "llm.example.org.pem")
+        argv = self.msb_calls("create")[0]["argv"]
+        self.assertEqual(create_flags(argv, "--tls-upstream-ca-cert-for"), [f"llm.example.org={path}"])
+        with open(path, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), self.ca_pem)
+        self.assertEqual(self.m.read_toml(self.entry_path("c-e1"))["upstream_ca"], ["llm.example.org"])
+        self.ci_ok("purge", "c-e1", "-y", "--json")
+        self.assertFalse(os.path.exists(self.m.managed_ca_dir("c-e1")))
+
+    def test_refused(self):
+        key = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n"
+        for label, ca, code in (
+                ("not in egress_allow", self.ca("other.example.net"), "invalid_config"),
+                ("a pattern", self.ca("*.example.org"), "invalid_config"),
+                ("not a certificate", self.ca(pem="hello"), "invalid_config"),
+                ("a key along", self.ca(pem=self.ca_pem + key), "invalid_config"),
+                ("garbage", self.ca(pem="-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n"),
+                 "invalid_config"),
+                ("twice", self.ca() + self.ca(), "invalid_config")):
+            with self.subTest(label):
+                self.ci_error(code, "managed", "provision", "e1", stdin=ci_request(upstream_ca=ca))
+        self.assertEqual(self.msb_calls("create"), [])
+
+    def test_never_an_operator_endpoint(self):
+        self.ci_table = CI + '\n[llm.qwen]\nbase_url = "https://llm.example.org/v1"\n'
+        self.configure()
+        self.ci_error("denied", "managed", "provision", "e1", stdin=ci_request(upstream_ca=self.ca()))
+
+    def test_the_operator_may_refuse_it(self):
+        self.ci_table = CI + "allow_upstream_ca = false\n"
+        self.configure()
+        self.ci_error("denied", "managed", "provision", "e1", stdin=ci_request(upstream_ca=self.ca()))
+        self.assertFalse(self.ci_ok("managed", "health")["client_settings"]["allow_upstream_ca"])
+
+
+class SecretPorts(ManagedTest):
+    """A secret allowed on a port besides 443 is substituted there."""
+
+    def test_its_port_is_intercepted(self):
+        self.ci_provision(egress_allow=["llm.example.org:8443", "pypi.org:8080"])
+        argv = self.msb_calls("create")[0]["argv"]
+        # pypi.org:8080 carries no secret: left alone.
+        self.assertEqual(create_flags(argv, "--tls-intercept-port"), ["443", "8443"])
+
+    def test_none_without_one(self):
+        self.ci_provision(egress_allow=["pypi.org:8080"])
+        self.assertEqual(create_flags(self.msb_calls("create")[0]["argv"], "--tls-intercept-port"), [])
 
 
 if __name__ == "__main__":

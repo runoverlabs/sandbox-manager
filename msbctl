@@ -12324,7 +12324,11 @@ KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_na
 # substituted in. `live_secrets`: `start` of a RUNNING sandbox with its
 # secrets hands msb the new values live, nothing restarted (protocol 1's
 # answers it unchanged, as it always has).
-MANAGED_FEATURES = ("secret_headers", "live_secrets")
+# `llms`: a provision may pick operator endpoints its table grants
+# (client_settings lists them). `upstream_ca`: it may send a CA for one of its
+# own hosts (where allow_upstream_ca). `secret_ports`: a secret allowed on a
+# port besides 443 is substituted there.
+MANAGED_FEATURES = ("secret_headers", "live_secrets", "llms", "upstream_ca", "secret_ports")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -12439,7 +12443,7 @@ MANAGED_HOST_KEYS = ("serve", "proxy_listen", "base_url", "port_pool", "proxy_po
 MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
 CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
                "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
-               "body_secret_hosts", "allow_nested_virt", "tls")
+               "body_secret_hosts", "allow_nested_virt", "tls", "llms", "allow_upstream_ca")
 # What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
 KANDEV_FIXED = {"name_prefix": "k-", "env_prefix": "AGENTCTL_", "guest_ports": list(KANDEV_GUEST_PORTS),
                 "require_callback": True, "body_secret_hosts": list(AGENT_TRANSCRIPT_HOSTS)}
@@ -12681,6 +12685,25 @@ def client_settings(config, name, operator=None):
         bad("tls", "true or false")
     if name != "kandev":
         out["tls"] = tls
+    # The operator's [llm.<name>] endpoints this client's provisions may name:
+    # the operator decides the host, port, CA and key; the client only picks.
+    llms = raw.get("llms", [])
+    if not isinstance(llms, list) or any(not isinstance(n, str) for n in llms):
+        bad("llms", "a list of [llm.<name>] names")
+    endpoints = llm_endpoints(config)
+    for llm in llms:
+        if llm not in endpoints:
+            bad("llms", f"{llm}: there is no [llm.{llm}] on this host")
+        if llm_problem(llm, endpoints[llm]):
+            # The operator's own words name files on this host: not to a client's key.
+            bad("llms", f"[llm.{llm}] does not check out (`msbctl doctor` says why)" if key_client()
+                else f"[llm.{llm}] {llm_problem(llm, endpoints[llm])}")
+    out["llms"] = list(dict.fromkeys(llms))
+    # Whether a provision may send a CA to trust for one of its own hosts. On
+    # by default: it decides only what that client's own sandbox trusts.
+    out["allow_upstream_ca"] = raw.get("allow_upstream_ca", True)
+    if not isinstance(out["allow_upstream_ca"], bool):
+        bad("allow_upstream_ca", "true or false")
 
     if name == "kandev":
         for key, fixed in KANDEV_FIXED.items():
@@ -13250,6 +13273,122 @@ def secret_bind_spec(name, hosts, headers):
     """A client's binding as msb takes it: `NAME[:headers=[...]]@HOSTS`."""
     scope = f":headers=[{','.join(headers)}]" if headers else ""
     return f"{name}{scope}@{','.join(hosts)}"
+
+
+def host_covers(target, host):
+    """Whether an egress target's host (`name` or `*.suffix`) covers `host`."""
+    return target == host or (target.startswith("*.") and host.endswith(target[1:]))
+
+
+def secret_ports(egress, bindings, extra=()):
+    """The ports besides 443 a client's sandbox intercepts TLS on: each port
+    an egress rule allows one of its secrets' hosts on, and `extra` (its
+    operator endpoints'). msb substitutes a secret only into a connection it
+    intercepts, so without this a key for host:8443 never arrives. Never
+    every port the request names: an intercepted port is intercepted for
+    every host on it, and one with a private CA then needs upstream_ca."""
+    hosts = [h for _, hs, _ in bindings for h in hs]
+    ports = set(extra)
+    for rule in egress:
+        found = re.fullmatch(r"allow@([^:\[\]]+):tcp:(\d+)", rule)
+        if found and any(host_covers(found.group(1), h) or found.group(1) == h for h in hosts):
+            ports.add(int(found.group(2)))
+    return sorted(ports - {443})
+
+
+def managed_llms(raw, settings, config):
+    """The operator's endpoints a provision asked for (`llms`), each granted
+    by the client's table: [(name, spec, host, port)]. The client picks;
+    where they are, what they trust and their keys stay the operator's."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or any(not isinstance(n, str) for n in raw):
+        raise KandevError("invalid_config", "llms must be a list of endpoint names")
+    out = []
+    for name in dict.fromkeys(raw):
+        if name not in settings["llms"]:
+            raise KandevError("denied", f"llms: {name} is not granted "
+                              f"([{settings.get('table', 'kandev')}] llms)")
+        spec = llm_endpoints(config).get(name)
+        if not isinstance(spec, dict) or llm_problem(name, spec):
+            # Never the operator's own words: they may name a file on this host.
+            raise KandevError("unavailable", f"llms: the operator's endpoint {name} does not check out")
+        _, host, port = llm_url(spec)
+        out.append((name, spec, host, port))
+    return out
+
+
+def llm_host_values(names):
+    """{LLM_KEY_<NAME>: value} for those of these endpoints whose key this
+    host stores (global.env, or the keyring through it), read now."""
+    want = {llm_key_var(n) for n in names}
+    if not want:
+        return {}
+    return {k: v for k, v in read_env_file(GLOBAL_ENV, only=want).items() if v}
+
+
+def managed_llm_env(entry):
+    """The values of a client sandbox's operator-held keys, for one msb
+    process: every one bound at provision must still be stored."""
+    names = {llm_key_var(n): n for n in entry.get("llms", [])}
+    bound = [binding_var(spec) for spec in entry.get("llm_binds", [])]
+    values = llm_host_values([names[v] for v in bound if v in names])
+    missing = [names.get(v, v) for v in bound if v not in values]
+    if missing:
+        raise KandevError("unavailable", f"the operator's key for {', '.join(missing)} is not stored "
+                          "on this host any more")
+    return values
+
+
+UPSTREAM_CA_MAX = 8
+UPSTREAM_CA_MAX_BYTES = 65536
+
+
+def managed_ca_dir(name):
+    """Where a client sandbox's upstream_ca certificates are kept for msb,
+    host-side, until kandev_remove() removes the sandbox."""
+    return os.path.join(STATE_DIR, "kandev", "ca", name)
+
+
+def managed_upstream_ca(raw, settings, egress_allow, callback_host, config):
+    """{host: PEM} from a provision's `upstream_ca`: a CA the client trusts
+    for one of its own hosts (a server with a private certificate, which
+    msb's interceptor otherwise refuses). Only a host its egress_allow or
+    callback names, and never an operator endpoint's: a CA there could take
+    the operator's key."""
+    if raw is None:
+        return {}
+    table = settings.get("table", "kandev")
+    if not settings["allow_upstream_ca"]:
+        raise KandevError("denied", f"upstream_ca: not allowed for this client ([{table}] allow_upstream_ca)")
+    if not isinstance(raw, list) or len(raw) > UPSTREAM_CA_MAX:
+        raise KandevError("invalid_config", f"upstream_ca is a list of up to {UPSTREAM_CA_MAX} "
+                          "{host, ca_pem}")
+    reachable = {_split_rule_target(t.strip())[0].lower() for t in egress_allow or []
+                 if isinstance(t, str)} | ({callback_host} if callback_host else set())
+    held = {llm_url(spec)[1] for spec in llm_endpoints(config).values() if isinstance(spec, dict)}
+    out = {}
+    for item in raw:
+        host = item.get("host") if isinstance(item, dict) else None
+        pem = item.get("ca_pem") if isinstance(item, dict) else None
+        if not isinstance(host, str) or not HOSTNAME.fullmatch(host.lower()) or host.startswith("*."):
+            raise KandevError("invalid_config", "upstream_ca: each is {host, ca_pem}, host an exact hostname")
+        host = host.lower()
+        if host in out:
+            raise KandevError("invalid_config", f"upstream_ca: {host} is given twice")
+        if not any(host_covers(t, host) for t in reachable):
+            raise KandevError("invalid_config", f"upstream_ca: {host} is not in egress_allow")
+        if host in held:
+            raise KandevError("denied", f"upstream_ca: {host} is an endpoint the operator holds the key for")
+        if not isinstance(pem, str) or not pem or len(pem) > UPSTREAM_CA_MAX_BYTES \
+                or "PRIVATE KEY" in pem or "-----BEGIN CERTIFICATE-----" not in pem:
+            raise KandevError("invalid_config", f"upstream_ca: {host}: ca_pem is PEM certificates only")
+        try:
+            ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT).load_verify_locations(cadata=pem)
+        except (ssl.SSLError, ValueError):
+            raise KandevError("invalid_config", f"upstream_ca: {host}: ca_pem does not load") from None
+        out[host] = pem
+    return out
 
 
 def kandev_registry(raw, image):
@@ -14138,13 +14277,15 @@ def request_callback(req, dialect, settings):
     return callback
 
 
-def body_passthrough(spec, dialect):
-    """A secret binding with the client's body_secret_hosts as passthrough:
-    hosts its PLACEHOLDER may travel to in a request body (never the value).
-    None means none: msb then blocks any request that carries one."""
-    if not dialect.body_secret_hosts:
+def body_passthrough(spec, dialect, extra=()):
+    """A secret binding with the client's body_secret_hosts (and `extra`, the
+    operator endpoints it uses) as passthrough: hosts its PLACEHOLDER may
+    travel to in a request body (never the value). None means none: msb
+    then blocks any request that carries one."""
+    hosts = list(dict.fromkeys([*dialect.body_secret_hosts, *extra]))
+    if not hosts:
         return spec
-    return with_transcript_passthrough(spec, dialect.body_secret_hosts)
+    return with_transcript_passthrough(spec, hosts)
 
 
 def managed_provision(args, config, settings, dialect):
@@ -14241,6 +14382,18 @@ def managed_provision(args, config, settings, dialect):
     private = kandev_private_names(req.get("private_names"), settings, req.get("egress_allow"))
     callback = request_callback(req, dialect, settings)
     registry = kandev_registry(req.get("registry"), image)
+    # The operator's endpoints it picked: their rule, port, CA, private name
+    # and key come from the operator's [llm.<name>], none from the request.
+    llms = managed_llms(req.get("llms"), settings, config)
+    for _, _, host, port in llms:
+        rule = f"allow@{host}:tcp:{port}"
+        if rule not in egress:
+            egress.append(rule)
+    private += [host for _, spec, host, _ in llms if spec.get("private_dns") and host not in private]
+    held = llm_host_values([n for n, *_ in llms])
+    llm_binds = [f"{llm_key_var(n)}@{host}" for n, _, host, _ in llms if llm_key_var(n) in held]
+    upstream_ca = managed_upstream_ca(req.get("upstream_ca"), settings, req.get("egress_allow"),
+                                      callback[0] if callback else None, config)
 
     with kandev_lock():
         table = msb_table()
@@ -14278,7 +14431,10 @@ def managed_provision(args, config, settings, dialect):
             RULE_GROUPS=f"rule_groups = {toml_literal(settings['rule_groups'])}",
             EXTRA_RULES=f"extra_rules = {toml_literal(egress + ([callback[3]] if callback else []))}",
             BINDINGS=f"secret_binds = {toml_literal(binds)}",
-            PRIVATE=f"private_names = {toml_literal(private)}")
+            PRIVATE=f"private_names = {toml_literal(private)}",
+            HOST_HELD="\n".join((f"llms = {toml_literal([n for n, *_ in llms])}",
+                                 f"llm_binds = {toml_literal(llm_binds)}",
+                                 f"upstream_ca = {toml_literal(sorted(upstream_ca))}")))
         # The entry FIRST: a crash between here and the end leaves something
         # `reap` finds, never a VM nobody knows about. Kandev's entries keep
         # their own form (source = "kandev"), whichever protocol made them.
@@ -14292,6 +14448,17 @@ def managed_provision(args, config, settings, dialect):
         with open(registry_path_for(name), "w", encoding="utf-8") as fh:
             fh.write(text)
 
+    cas = []
+    if upstream_ca:
+        where = managed_ca_dir(name)
+        shutil.rmtree(where, ignore_errors=True)
+        os.makedirs(where, mode=0o700)
+        for host, pem in upstream_ca.items():
+            path = os.path.join(where, f"{host}.pem")
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(pem)
+            cas.append((host, path))
+    cas += [(host, os.path.expanduser(spec["ca_cert"])) for _, spec, host, _ in llms if spec.get("ca_cert")]
     box = Sandbox(name, config)
     rules = _kandev_try(box.net_rules)
     if private:
@@ -14306,6 +14473,14 @@ def managed_provision(args, config, settings, dialect):
     # As every msbctl sandbox: hostname rules and secret substitution both
     # need the interceptor. Ports bind 127.0.0.1 only; base_url is the way in.
     argv += ["--tls-intercept"]
+    # A secret on another port needs interception there too (secret_ports()).
+    # The flag REPLACES msb's default of 443, so 443 is always restated.
+    extra_ports = secret_ports(egress, bindings, [port for *_, port in llms])
+    for port in [443, *extra_ports] if extra_ports else []:
+        argv += ["--tls-intercept-port", str(port)]
+    # Each CA trusted for its one host, never VM-wide.
+    for host, path in cas:
+        argv += ["--tls-upstream-ca-cert-for", f"{host}={path}"]
     # Always stated: KVM exactly when this provision asked and was allowed it,
     # whatever [defaults] or msb's own sandbox_defaults say.
     argv += [f"--nested-virt={'true' if nested else 'false'}"]
@@ -14318,14 +14493,17 @@ def managed_provision(args, config, settings, dialect):
         argv += ["--port", spec]
     for key, value in env_pairs:
         argv += ["--env", f"{key}={value}"]
-    for spec in binds:
-        argv += ["--secret", body_passthrough(spec, dialect)]
-    if binds:
+    # An endpoint it uses receives the agent's whole transcript, so the
+    # placeholders in it too: each joins every binding's passthrough.
+    transcript = [host for _, _, host, _ in llms]
+    for spec in binds + llm_binds:
+        argv += ["--secret", body_passthrough(spec, dialect, transcript)]
+    if binds or llm_binds:
         argv += ["--secret-violation-action", "block-and-log"]
     for label in owner_labels(dialect.client, env):
         argv += ["--label", label]
     argv += ["--max-duration", f"{seconds}s", image]
-    proc = run(argv, env=values, check=False, quiet=True)
+    proc = run(argv, env={**values, **held}, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
     entry = read_toml(registry_path_for(name))
@@ -14426,6 +14604,12 @@ def managed_start(args, config, settings, dialect):
     name, entry = managed_need(dialect, args.env)
     record = functools.partial(kandev_record, client=dialect.record_has_client)
     req = kandev_read_header(allow_empty=True)
+    gone = [n for n in entry.get("llms", []) if n not in settings.get("llms", [])]
+    if gone:
+        # Granted at provision, revoked since: its rule and key stay with the
+        # VM, so revoking it is refusing to start or refresh one that uses it.
+        raise KandevError("denied", f"this sandbox uses {', '.join(gone)}, which {dialect.owner} is no "
+                          f"longer granted ([{settings.get('table', 'kandev')}] llms)")
     if state_of(name) == "running":
         if dialect.protocol == 2 and req.get("secrets"):
             managed_rotate(name, entry, req, dialect)
@@ -14443,7 +14627,7 @@ def managed_start(args, config, settings, dialect):
         # Never a half-bound start: a missing value would reach the guest's
         # requests as the literal placeholder.
         raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
-    proc = run(["msb", "start", name], env=given, check=False, quiet=True)
+    proc = run(["msb", "start", name], env={**given, **managed_llm_env(entry)}, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb start failed")
     kandev_pin_api(name, entry)
@@ -14458,12 +14642,16 @@ def managed_rotate(name, entry, req, dialect):
     rotated token needs no restart. Exactly the secrets it binds, as at
     start, sent as `VAR@HOSTS` with the hosts msb holds and NO options,
     which keeps each binding's header scope and passthrough as they are
-    (msb 0.7.9+). All in one `msb modify`, the values in its environment
-    only; a refusal is an error, never a success that kept the old ones."""
+    (msb 0.7.9+). The operator's endpoint keys are sent along, as stored
+    now, so a key the operator replaced arrives too. All in one `msb
+    modify`, the values in its environment only; a refusal is an error,
+    never a success that kept the old ones."""
     given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
     bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
     if sorted(given) != sorted(bound):
         raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
+    given = {**given, **managed_llm_env(entry)}
+    bound += [binding_var(spec) for spec in entry.get("llm_binds", [])]
     held = msb_secret_hosts(name) or {}
     argv = ["msb", "modify", name]
     for var in bound:
@@ -14542,6 +14730,7 @@ def kandev_remove(name, entry, labelled):
                               f"{'Kandev' if client == 'kandev' else client} label — left alone")
         if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode != 0:
             raise KandevError("unavailable", "msb rm failed — the entry is kept for a retry")
+    shutil.rmtree(managed_ca_dir(name), ignore_errors=True)
     os.remove(registry_path_for(name))
 
 
@@ -15042,12 +15231,28 @@ def managed_health(args, config, settings, dialect):
                             "require_callback": dialect.callback_required,
                             "body_secret_hosts": list(dialect.body_secret_hosts),
                             "allow_nested_virt": settings["allow_nested_virt"],
-                            "tls": tls_holder(config) == dialect.client}})
+                            "tls": tls_holder(config) == dialect.client,
+                            "allow_upstream_ca": settings["allow_upstream_ca"],
+                            "llms": [managed_llm_doc(n, llm_endpoints(config)[n])
+                                     for n in settings["llms"]]}})
     totals = {k: settings[f"host_{k}"] for k in ("max_sandboxes", "max_cpus", "max_memory_mib")}
     if any(v is not None for v in totals.values()):
         count, cpus, mem = managed_usage(msb_table())
         doc["host_capacity"] = {**{k: v for k, v in totals.items() if v is not None},
                                 "sandboxes": count, "cpus": cpus, "memory_mib": mem}
+    return doc
+
+
+def managed_llm_doc(name, spec):
+    """What a client needs to point pi (or any agent) at a granted endpoint,
+    and nothing it must not see: no key, no CA path. `key` is what its
+    models.json names (`$LLM_KEY_<NAME>`, the placeholder msb swaps the real
+    key in for), or "" when this host stores none."""
+    stored = llm_key_var(name) in stored_env(GLOBAL_ENV) if os.path.isfile(GLOBAL_ENV) else False
+    doc = {"name": name, "base_url": llm_url(spec)[0], "key": llm_key_ref(name) if stored else ""}
+    for key in ("provider", "api", "models", "default_model", "context_window", "max_tokens", "reasoning"):
+        if key in spec:
+            doc[key] = spec[key]
     return doc
 
 
@@ -15288,11 +15493,12 @@ MANAGED_CONFIGURE_CLIENT_KEYS = (("enabled", "enabled"), ("max_sandboxes", "max_
                                  ("name_prefix", "name_prefix"), ("env_prefix", "env_prefix"),
                                  ("guest_ports", "guest_ports"), ("require_callback", "require_callback"),
                                  ("body_secret_hosts", "body_secret_hosts"),
-                                 ("allow_nested_virt", "allow_nested_virt"), ("tls", "tls"))
+                                 ("allow_nested_virt", "allow_nested_virt"), ("tls", "tls"),
+                                 ("llms", "llms"), ("allow_upstream_ca", "allow_upstream_ca"))
 MANAGED_CONFIGURE_FLAGS = ("enabled", "serve", "proxy_listen", "base_url", "allow_extra", "private_names",
                            "max_sandboxes", "max_cpus", "max_memory", "name_prefix", "env_prefix",
                            "guest_ports", "require_callback", "body_secret_hosts", "allow_nested_virt",
-                           "tls")
+                           "tls", "llms", "allow_upstream_ca")
 
 
 def managed_configure(args):
@@ -15322,7 +15528,7 @@ def managed_configure(args):
         value = getattr(args, attr, None)
         if value is None:
             continue
-        if key in ("allow_extra", "private_names", "body_secret_hosts"):
+        if key in ("allow_extra", "private_names", "body_secret_hosts", "llms"):
             value = [e for e in value if e.strip()]
         changes.append((key, value))
     ensure_local_config()
@@ -17367,6 +17573,12 @@ def build_parser():
     p.add_argument("--tls", action=argparse.BooleanOptionalAction, default=None,
                    help="managed configure --client: let its key install the proxy's certificate "
                    "(`managed tls install`; one client at most, Kandev's while none is given it)")
+    p.add_argument("--llm", dest="llms", action="append", metavar="NAME",
+                   help="managed configure --client: the whole llms list, one [llm.NAME] endpoint per "
+                   "flag, that its provisions may pick; '' alone empties it")
+    p.add_argument("--allow-upstream-ca", action=argparse.BooleanOptionalAction, default=None,
+                   help="managed configure --client: whether its provisions may send a CA for one of "
+                   "their own hosts (on unless set false)")
     p.add_argument("--body-secret-host", dest="body_secret_hosts", action="append", metavar="HOST",
                    help="managed configure --client: the whole body_secret_hosts list, one host per "
                    "flag; '' alone empties it")
