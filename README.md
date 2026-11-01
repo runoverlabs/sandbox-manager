@@ -66,8 +66,8 @@ packages and the egress it needs.
 
 - Linux with `/dev/kvm` — microsandbox is a libkrun microVM runtime, so this
   runs on a host, never inside a container
-- [`msb`](https://github.com/microsandbox/microsandbox) on `PATH` (developed
-  against 0.7.6)
+- [`msb`](https://github.com/microsandbox/microsandbox) on `PATH` **0.7.12 or newer**
+  (the version msbctl is developed against, which is also the oldest it supports)
 - Python **3.11+** — stdlib only, no pip install, ever
 - `git`
 - `fzf` — optional. It upgrades the menu and provides the picker; without it
@@ -231,8 +231,10 @@ it, and only the negative half catches that.
 
 ## Status
 
-Tested on Fedora with KVM, against microsandbox 0.7.6 and 0.7.7. Other
-distros and newer `msb` versions are untested so far. `msb --help` is a more
+Tested on Fedora with KVM, against microsandbox 0.7.12, the oldest `msb`
+msbctl supports: microsandbox is pre-1.0 and changes quickly, so msbctl
+requires the release it was last developed against. Other distros and newer
+`msb` versions are untested so far. `msb --help` is a more
 reliable guide to that tool than its published documentation.
 
 Issues and PRs welcome, particularly from anyone running a different distro or

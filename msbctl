@@ -1021,22 +1021,22 @@ def git(project, *args):
 # ------------------------------------------------------------------- msb state
 
 def msb_table():
-    """`msb ls` as {name: state}.
-
-    Text parsing because 0.7.6 has no machine-readable listing. Kept in ONE
-    place so that a format change is one fix rather than a hunt: column 1 is
-    the name, column 3 the state.
-    """
+    """`msb ls` as {name: state}, the state lowercased (`running`, `stopped`):
+    what the text table shows, from its JSON, where it is msb's own status
+    name (`Running`)."""
     table = {}
     if not shutil.which("msb"):
         return table                # a laptop that only drives remotes
-    proc = subprocess.run(["msb", "ls"], capture_output=True, text=True)
+    proc = subprocess.run(["msb", "ls", "--format", "json"], capture_output=True, text=True)
     if proc.returncode != 0:
         return table
-    for line in proc.stdout.splitlines()[1:]:
-        cols = line.split()
-        if len(cols) >= 3:
-            table[cols[0]] = cols[2]
+    try:
+        rows = json.loads(proc.stdout or "[]")
+    except ValueError:
+        return table
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict) and row.get("name") and row.get("status"):
+            table[str(row["name"])] = str(row["status"]).lower()
     return table
 
 
@@ -11070,11 +11070,13 @@ def capture_token(name):
 
 HOST_EXIT_REFUSED = 126
 
-# What `msb exec` accepts (msb 0.7.7, crates/cli/lib/commands/exec.rs). Every
+# What `msb exec` accepts (msb 0.7.12, crates/cli/lib/commands/exec.rs). Every
 # one acts inside the guest. Anything else is refused until it has been read:
 # a future msb flag must not pass unreviewed.
 MSB_EXEC_VALUE_FLAGS = ("-e", "--env", "-w", "--workdir", "-u", "--user", "--timeout", "--rlimit")
-MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream")
+# `-d`/`--detach` (0.7.8) leaves the command running as a job msb owns.
+MSB_EXEC_BARE_FLAGS = ("-t", "--tty", "--no-tty", "--no-stdin", "-q", "--quiet", "--stream",
+                       "-d", "--detach")
 
 
 def _msb_flags_problem(flags):
@@ -11522,10 +11524,14 @@ def runtime_checks():
     version = local_msb_version() if msb else None
     if not msb:
         out.append(_doctor("msb", "fail", "msb is not on PATH", f"install it: curl -fsSL {MSB_INSTALLER} | sh"))
-    elif version not in MSB_TESTED:
+    elif msb_too_old(version):
+        out.append(_doctor("msb", "fail", f"msb {version} at {tilde(msb)} is older than {MSB_MIN}, "
+                           "the oldest msbctl supports",
+                           f"install msb {MSB_MIN} or newer: curl -fsSL {MSB_INSTALLER} | sh"))
+    elif version != MSB_MIN:
         out.append(_doctor("msb", "warn", f"msb {version or '(unknown version)'} at {tilde(msb)}, "
-                           f"and msbctl is tested on {', '.join(MSB_TESTED)}",
-                           f"it may well work; if something breaks, msb {MSB_TESTED[-1]} is "
+                           f"and msbctl is developed against {MSB_MIN}",
+                           f"it may well work; if something breaks, msb {MSB_MIN} is "
                            "the one to compare with"))
     else:
         out.append(_doctor("msb", "ok", f"msb {version} at {tilde(msb)}"))
@@ -11534,7 +11540,7 @@ def runtime_checks():
     return out
 
 
-# `msb doctor` (0.7.7) writes to stderr, one line per check: `  ✓ label value`,
+# `msb doctor` (0.7.7, the same on 0.7.12) writes to stderr, one line per check: `  ✓ label value`,
 # `  ✗ label value`, `warn: label: value`, then per problem `error: headline`
 # with `  → hint` lines (crates/cli/lib/commands/self_cmd.rs, run_doctor()).
 # It exits 1 when the host cannot run sandboxes. No machine-readable form, so
@@ -15427,14 +15433,29 @@ sed 's/^    get_latest_version$/    VERSION="v'"$2"'"/' "$t/install.sh" > "$t/pi
 sh "$t/pinned.sh"
 """
 MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
-# The msb releases msbctl's behaviour has been checked against (the comments
-# that say "verified on 0.7.6" are about these). Another one may well work, but
-# its flags, its log lines and `msb ls` output are unchecked: `doctor` warns.
-MSB_TESTED = ("0.7.6", "0.7.7")
+# The msb release msbctl is developed against, which is also the OLDEST it
+# supports: msb is pre-1.0 and changes quickly, so msbctl carries no
+# workaround for an older one. A command that needs this machine's msb refuses
+# an older one (local_problem()), and `doctor` fails it. A newer one may well
+# work, but its flags, its log lines and its JSON are unchecked: `doctor`
+# warns. Raise it whenever msbctl is developed against a newer release.
+MSB_MIN = "0.7.12"
+
+
+def msb_version_tuple(version):
+    """`0.7.12` as (0, 7, 12), for comparing; None for anything else."""
+    return tuple(int(x) for x in version.split(".")) if MSB_VERSION.fullmatch(version or "") else None
+
+
+def msb_too_old(version):
+    """Whether `version` is older than MSB_MIN. An unknown version is not:
+    doctor says that one."""
+    have = msb_version_tuple(version)
+    return have is not None and have < msb_version_tuple(MSB_MIN)
 
 
 def local_msb_version():
-    """This machine's msb version (`0.7.6`), or None without one."""
+    """This machine's msb version (`0.7.12`), or None without one."""
     if not shutil.which("msb"):
         return None
     try:
@@ -16598,6 +16619,10 @@ def local_problem():
         return "msb is not on PATH"
     if kvm_status() == "missing":
         return "no /dev/kvm — msbctl runs on the host, not inside a container"
+    version = local_msb_version()
+    if msb_too_old(version):
+        return (f"msb {version} is older than {MSB_MIN}, the oldest msbctl supports — "
+                f"install a newer one: curl -fsSL {MSB_INSTALLER} | sh")
     return None
 
 

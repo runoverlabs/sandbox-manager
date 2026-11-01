@@ -6,7 +6,8 @@ description: "What an agent inside a sandbox is told: profile/CLAUDE.md as the s
 # Profile
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
-every session. Repo-specific throughout; the facts here are verified against
-msb 0.7.6 and re-checked on 0.7.7.
+every session. Repo-specific throughout; the facts here were verified on
+msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+changed something, the text says so.
 
 - `profile/CLAUDE.md` — the SHIPPED central CLAUDE.md. `assemble_profile()` appends the operator's `~/.config/msb/CLAUDE.local.md` and writes the result to `~/.local/state/msb/profile/` (a real file, shared by every sandbox); that directory is what is mounted read-only and copied into each sandbox's `~/.claude` on every start. Nothing mounts or links a path inside the checkout or install tree. `ensure_profile()` then appends `sandbox_profile_section()` (`current_features()`, one line each, plus the git-push mode and the project's **guest** path with its `.agents/skills/` folder — this text lives in the agent's home, outside the mount, so any path a project's own docs point at has to be absolute here) to the guest's copy only, passed as an argument, never spliced into the script. Editing the copy in a sandbox does nothing.
