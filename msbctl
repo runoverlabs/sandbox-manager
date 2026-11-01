@@ -12319,6 +12319,12 @@ KANDEV_WORKSPACE_MAX_GIB = 500
 # allow_nested_virt and this host has KVM. Absent, asking is refused (or, on a
 # host older than the key, ignored), so the plugin can tell before it asks.
 KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_namespace")
+# What protocol 2's health adds (managed_health()); protocol 1 is frozen.
+# `secret_headers`: a provision's secret may name the only headers it is
+# substituted in. `live_secrets`: `start` of a RUNNING sandbox with its
+# secrets hands msb the new values live, nothing restarted (protocol 1's
+# answers it unchanged, as it always has).
+MANAGED_FEATURES = ("secret_headers", "live_secrets")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -12334,7 +12340,8 @@ KANDEV_REAP_UNIT = "msb-kandev-reap"
 KANDEV_PROXY_UNIT = "msb-kandev-proxy"
 KANDEV_SERVE_MODES = ("proxy", "tailscale", "none")
 # The proxy's certificate: leaf then its issuer in cert.pem, key.pem 0600.
-# Written only by `kandev tls install`; the plugin owns the CA and renewal.
+# Written only by `tls install` (Kandev's, or `managed tls install` of the client
+# tls_holder() names); the client owns the CA and renewal.
 KANDEV_TLS_DIR = os.path.join(CONFIG_DIR, "kandev", "tls")
 KANDEV_TLS_CERT = os.path.join(KANDEV_TLS_DIR, "cert.pem")
 KANDEV_TLS_KEY = os.path.join(KANDEV_TLS_DIR, "key.pem")
@@ -12432,7 +12439,7 @@ MANAGED_HOST_KEYS = ("serve", "proxy_listen", "base_url", "port_pool", "proxy_po
 MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
 CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
                "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
-               "body_secret_hosts", "allow_nested_virt")
+               "body_secret_hosts", "allow_nested_virt", "tls")
 # What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
 KANDEV_FIXED = {"name_prefix": "k-", "env_prefix": "AGENTCTL_", "guest_ports": list(KANDEV_GUEST_PORTS),
                 "require_callback": True, "body_secret_hosts": list(AGENT_TRANSCRIPT_HOSTS)}
@@ -12663,6 +12670,17 @@ def client_settings(config, name, operator=None):
     out["allow_nested_virt"] = raw.get("allow_nested_virt", False)
     if not isinstance(out["allow_nested_virt"], bool):
         bad("allow_nested_virt", "true or false")
+    # Whether this client's key may run `tls install`. One certificate, so one
+    # client at most (clients_settings() refuses two); Kandev's until another
+    # table claims it, so Kandev's own table never names it (tls_holder()).
+    if name == "kandev" and "tls" in raw:
+        bad("tls", "Kandev installs the certificate until another client's table sets tls = true: "
+            "set it there instead")
+    tls = raw.get("tls", False)
+    if not isinstance(tls, bool):
+        bad("tls", "true or false")
+    if name != "kandev":
+        out["tls"] = tls
 
     if name == "kandev":
         for key, fixed in KANDEV_FIXED.items():
@@ -12758,6 +12776,26 @@ def guest_ports_problem(ports):
     return None
 
 
+def tls_claims(config):
+    """The clients but Kandev whose table sets tls = true, read even when the
+    rest of their table does not check out (as client_prefix_wanted()): a
+    broken table keeps its claim, so the grant never falls back to Kandev
+    while it is fixed."""
+    return [n for n in configured_clients(config) if n != "kandev" and not client_name_problem(n)
+            and _table(config, "clients", n).get("tls") is True]
+
+
+def tls_holder(config):
+    """The one client whose key may run `tls install` (the operator always
+    may, at the host): Kandev's, as protocol 1 has it, until one other
+    client's table sets tls = true, which moves it there. Two claims: no
+    client's, until the operator picks one."""
+    claims = tls_claims(config)
+    if not claims:
+        return "kandev"
+    return claims[0] if len(claims) == 1 else None
+
+
 def configured_clients(config):
     """Every client name this host knows: kandev, and each [clients.<name>]."""
     names = ["kandev"]
@@ -12771,16 +12809,17 @@ def clients_settings(config, operator=None):
     """{name: settings, or the KandevError that client's table has}, for
     Kandev and every [clients.<name>]. Every problem is the problem of the
     client(s) it concerns, and stops no one else: a table whose name is not a
-    client name, an entry under [clients] that is not a table, and one name
-    prefix shared by two clients make each client involved invalid_config.
+    client name, an entry under [clients] that is not a table, one name
+    prefix shared by two clients and tls = true in two tables make each
+    client involved invalid_config.
     Kandev's k- is no one else's (client_settings() refuses it there, as that
     client's own problem), so a clash between other clients never stops
     Kandev. A [clients] that is not a table at all names no client: Kandev
     alone."""
-    def clash(message):
+    def clash(message, key="name_prefix"):
         # A client's key sees nothing of the others, their names and prefixes included.
         if key_client():
-            message = ("this client's name_prefix clashes with another client's: the operator's "
+            message = (f"this client's {key} clashes with another client's: the operator's "
                        "`msbctl doctor` names it")
         return KandevError("invalid_config", message)
 
@@ -12806,6 +12845,14 @@ def clients_settings(config, operator=None):
                 out[name] = clash(f"[clients.{name}] name_prefix {prefix!r} is also "
                                   f"[clients.{other}]'s: one client's names would be another's")
                 break
+    # One certificate: two claims and neither key installs it (tls_holder()).
+    claims = tls_claims(config)
+    if len(claims) > 1:
+        for name in claims:
+            if isinstance(out[name], dict):
+                out[name] = clash(f"[clients.{name}] tls: also set in "
+                                  f"{', '.join(f'[clients.{o}]' for o in claims if o != name)}; "
+                                  "one client at most installs the certificate", "tls")
     return out
 
 
@@ -13154,10 +13201,20 @@ def kandev_name_problem(name, env_prefix="AGENTCTL_"):
     return None
 
 
+# A secret's optional `headers`: the only header fields msb substitutes it in
+# (msb's `headers=`), as GH_SPEC is scoped. Without it, every header to the
+# secret's hosts, so an allowed host that reflects a header the guest chose
+# would hand the real value back. Names only, as msb's option list splits on
+# commas and brackets.
+SECRET_HEADER = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}")
+SECRET_HEADERS_MAX = 16
+
+
 def kandev_bound_values(raw, field="secrets", env_prefix="AGENTCTL_"):
-    """({name: value}, [(name, [hosts])]) from a request, checked. Two
-    structures on purpose: what is written to the entry is built from the
-    second alone, which never held a value."""
+    """({name: value}, [(name, [hosts], [headers])]) from a request, checked.
+    Two structures on purpose: what is written to the entry is built from
+    the second alone, which never held a value. [headers] is empty for
+    every header (see SECRET_HEADER)."""
     if raw is None:
         return {}, []
     if not isinstance(raw, list):
@@ -13178,9 +13235,21 @@ def kandev_bound_values(raw, field="secrets", env_prefix="AGENTCTL_"):
         if hosts is not None and (not isinstance(hosts, list) or not hosts or any(
                 not isinstance(h, str) or not HOSTNAME.fullmatch(h) for h in hosts)):
             raise KandevError("invalid_config", f"secret {name}: hosts is a list of hostnames")
+        headers = item.get("headers")
+        if headers is not None and (
+                not isinstance(headers, list) or not 0 < len(headers) <= SECRET_HEADERS_MAX
+                or any(not isinstance(h, str) or not SECRET_HEADER.fullmatch(h) for h in headers)):
+            raise KandevError("invalid_config", f"secret {name}: headers is a list of 1 to "
+                              f"{SECRET_HEADERS_MAX} header names (like \"authorization\")")
         values[name] = value
-        bindings.append((name, list(hosts or [])))
+        bindings.append((name, list(hosts or []), list(dict.fromkeys(h.lower() for h in headers or []))))
     return values, bindings
+
+
+def secret_bind_spec(name, hosts, headers):
+    """A client's binding as msb takes it: `NAME[:headers=[...]]@HOSTS`."""
+    scope = f":headers=[{','.join(headers)}]" if headers else ""
+    return f"{name}{scope}@{','.join(hosts)}"
 
 
 def kandev_registry(raw, image):
@@ -13568,10 +13637,17 @@ def kandev_restart_proxy(installed, wait=10.0):
             "if its unit runs an old path"}
 
 
-def kandev_serve_ok(settings, tls, client="kandev"):
+def kandev_serve_ok(settings, tls, client="kandev", holder="kandev"):
     """health's `serve`. `tls` is (document, problem) from kandev_tls_status().
     `client`: whose health it is; the proxy ports it reports are never
-    another client's."""
+    another client's. `holder`: the client whose key installs the certificate
+    (tls_holder()), named to no one else."""
+    if holder == client == "kandev":
+        install = "the plugin installs one with `kandev tls install`"
+    elif holder == client:
+        install = "this client installs one with `managed tls install`"
+    else:
+        install = "the client given tls = true in its table, or the operator, installs one"
     mode = settings["serve"]
     if mode == "none":
         return {"ok": True, "mode": "none"}
@@ -13580,7 +13656,7 @@ def kandev_serve_ok(settings, tls, client="kandev"):
         reasons = [why for bad, why in (
             (not settings["proxy_listen"], f"[{host_table(settings, 'proxy_listen')}] proxy_listen is not set"),
             (not settings["base_url"], f"[{host_table(settings, 'base_url')}] base_url is not set"),
-            (not tls[0]["installed"], "no certificate yet: the plugin installs one with `kandev tls install`"),
+            (not tls[0]["installed"], f"no certificate yet: {install}"),
             (tls[0]["installed"] and tls[1], tls[1]),
             (not running, "the proxy is not running (`msbctl host kandev install` sets it up)"),
         ) if bad]
@@ -13959,7 +14035,7 @@ def kandev_health(args, config, settings, client="kandev"):
         "capacity": {"max_sandboxes": settings["max_sandboxes"], "sandboxes": count,
                      "max_cpus": settings["max_cpus"], "cpus": cpus,
                      "max_memory_mib": settings["max_memory_mib"], "memory_mib": mem},
-        "serve": kandev_serve_ok(settings, tls, client),
+        "serve": kandev_serve_ok(settings, tls, client, tls_holder(config)),
         "tls": tls[0],
         # The operator's own policy, not a secret: the plugin's Test checks its
         # default egress against it, since one refused entry refuses a whole
@@ -14121,7 +14197,7 @@ def managed_provision(args, config, settings, dialect):
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
     values, bindings = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
-    if any(not hosts for _, hosts in bindings):
+    if any(not hosts for _, hosts, _ in bindings):
         raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
     guest_env = req.get("env") or []
     if not isinstance(guest_env, list):
@@ -14188,7 +14264,7 @@ def managed_provision(args, config, settings, dialect):
         if settings["serve"] == "proxy":
             public = [f"{p}:{g}" for p, g in zip(alloc_proxy_ports(settings, len(guest_ports)), guest_ports,
                                                  strict=True)]
-        binds = [f"{n}@{','.join(h)}" for n, h in bindings]
+        binds = [secret_bind_spec(*b) for b in bindings]
         now = utc_now()
         os.makedirs(REGISTRY_DIR, mode=0o700, exist_ok=True)
         common = dict(
@@ -14351,6 +14427,8 @@ def managed_start(args, config, settings, dialect):
     record = functools.partial(kandev_record, client=dialect.record_has_client)
     req = kandev_read_header(allow_empty=True)
     if state_of(name) == "running":
+        if dialect.protocol == 2 and req.get("secrets"):
+            managed_rotate(name, entry, req, dialect)
         return record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
@@ -14372,6 +14450,29 @@ def managed_start(args, config, settings, dialect):
     kandev_set(name, state="running", generation=int(entry.get("generation", 0)) + 1,
                agentctl_running=False)
     return record(name, read_toml(registry_path_for(name)))
+
+
+def managed_rotate(name, entry, req, dialect):
+    """Protocol 2's `start` of a running sandbox, with its secrets: the new
+    values reach it live, as rotate_running() does for the operator's, so a
+    rotated token needs no restart. Exactly the secrets it binds, as at
+    start, sent as `VAR@HOSTS` with the hosts msb holds and NO options,
+    which keeps each binding's header scope and passthrough as they are
+    (msb 0.7.9+). All in one `msb modify`, the values in its environment
+    only; a refusal is an error, never a success that kept the old ones."""
+    given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
+    bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
+    if sorted(given) != sorted(bound):
+        raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
+    held = msb_secret_hosts(name) or {}
+    argv = ["msb", "modify", name]
+    for var in bound:
+        if not held.get(var):
+            raise KandevError("unavailable", f"msb shows no hosts for {var}: stop and start the sandbox")
+        argv += ["--secret", f"{var}@{','.join(held[var])}"]
+    if run(argv, env=given, check=False, quiet=True).returncode != 0:
+        raise KandevError("unavailable", "msb did not take the new secret values; the sandbox keeps the "
+                          "old ones until it is stopped and started")
 
 
 def kandev_expiry(args, config, settings):
@@ -14512,7 +14613,8 @@ def kandev_tls(args, config, settings):
         raise KandevError("invalid_config", "key_pem is not an unencrypted PEM private key")
     host = urllib.parse.urlsplit(settings["base_url"]).hostname
     if not host:
-        raise KandevError("invalid_config", "set [kandev] base_url first: the certificate must name its host")
+        raise KandevError("invalid_config", f"set [{host_table(settings, 'base_url')}] base_url first: "
+                          "the certificate must name its host")
     problem, _ = kandev_chain_problem(cert_pem, host)
     if problem:
         raise KandevError("invalid_config", problem)
@@ -14933,12 +15035,14 @@ def managed_health(args, config, settings, dialect):
     doc = kandev_health(args, config, settings, dialect.client)
     doc.update({
         "protocol": 2, "protocols": [1, 2] if dialect.client == "kandev" else [2],
+        "features": doc["features"] + list(MANAGED_FEATURES),
         "client": dialect.client,
         "client_settings": {"name_prefix": dialect.name_prefix, "env_prefix": dialect.env_prefix,
                             "guest_ports": list(dialect.default_ports),
                             "require_callback": dialect.callback_required,
                             "body_secret_hosts": list(dialect.body_secret_hosts),
-                            "allow_nested_virt": settings["allow_nested_virt"]}})
+                            "allow_nested_virt": settings["allow_nested_virt"],
+                            "tls": tls_holder(config) == dialect.client}})
     totals = {k: settings[f"host_{k}"] for k in ("max_sandboxes", "max_cpus", "max_memory_mib")}
     if any(v is not None for v in totals.values()):
         count, cpus, mem = managed_usage(msb_table())
@@ -14947,12 +15051,21 @@ def managed_health(args, config, settings, dialect):
     return doc
 
 
+def managed_tls(args, config, settings, dialect):
+    """`managed tls install`: kandev_tls(), for the one client the operator
+    gave the certificate to (run_client_verb() checks which)."""
+    if args.env != "install":
+        raise KandevError("invalid_config", "managed tls: the only action is `install`")
+    return kandev_tls(args, config, settings)
+
+
 # Protocol 2, `msbctl managed <verb>`: Kandev's verbs, for any client. Not
-# tls, restart-proxy or self-update: those are the host's (one certificate,
-# one proxy, one msbctl), and stay with the Kandev key and the operator.
+# restart-proxy or self-update: those are the host's (one proxy, one msbctl),
+# and stay with the Kandev key and the operator. tls is the key's of the one
+# client tls_holder() names: renewing a certificate needs nothing else.
 MANAGED_VERBS = {
     "health": managed_health, "provision": managed_provision, "agentctl": managed_agentctl,
-    "start": managed_start, "expiry": managed_expiry, "lease": managed_lease,
+    "start": managed_start, "expiry": managed_expiry, "lease": managed_lease, "tls": managed_tls,
 }
 
 
@@ -14977,6 +15090,10 @@ def run_client_verb(args, config, client, dialect=None):
     if args.verb != "health" and not settings["enabled"]:
         raise KandevError("denied", f"{owner_name(client)} is not enabled on this host "
                           f"([{settings['table']}] enabled)")
+    # One certificate, one client's key (the operator, unrestricted, always).
+    if args.verb == "tls" and restricted() and tls_holder(config) != client:
+        raise KandevError("denied", f"{owner_name(client)} may not install this host's certificate: "
+                          "the operator gives that to one client (tls = true in its table)")
     if args.verb in KANDEV_ENV_VERBS and not args.env:
         verb = "kandev" if dialect.protocol == 1 else "managed"
         raise KandevError("invalid_config", f"{verb} {args.verb} needs an environment id")
@@ -15171,10 +15288,11 @@ MANAGED_CONFIGURE_CLIENT_KEYS = (("enabled", "enabled"), ("max_sandboxes", "max_
                                  ("name_prefix", "name_prefix"), ("env_prefix", "env_prefix"),
                                  ("guest_ports", "guest_ports"), ("require_callback", "require_callback"),
                                  ("body_secret_hosts", "body_secret_hosts"),
-                                 ("allow_nested_virt", "allow_nested_virt"))
+                                 ("allow_nested_virt", "allow_nested_virt"), ("tls", "tls"))
 MANAGED_CONFIGURE_FLAGS = ("enabled", "serve", "proxy_listen", "base_url", "allow_extra", "private_names",
                            "max_sandboxes", "max_cpus", "max_memory", "name_prefix", "env_prefix",
-                           "guest_ports", "require_callback", "body_secret_hosts", "allow_nested_virt")
+                           "guest_ports", "require_callback", "body_secret_hosts", "allow_nested_virt",
+                           "tls")
 
 
 def managed_configure(args):
@@ -17246,6 +17364,9 @@ def build_parser():
                    help="managed configure --client: refuse a provision with no callback")
     p.add_argument("--allow-nested-virt", action=argparse.BooleanOptionalAction, default=None,
                    help="managed configure --client: let its provisions ask for /dev/kvm")
+    p.add_argument("--tls", action=argparse.BooleanOptionalAction, default=None,
+                   help="managed configure --client: let its key install the proxy's certificate "
+                   "(`managed tls install`; one client at most, Kandev's while none is given it)")
     p.add_argument("--body-secret-host", dest="body_secret_hosts", action="append", metavar="HOST",
                    help="managed configure --client: the whole body_secret_hosts list, one host per "
                    "flag; '' alone empties it")
@@ -17266,12 +17387,12 @@ def build_parser():
     p = sub.add_parser("managed", help="this host's sandboxes for a client's key (protocol 2, JSON only)",
                        description="Verbs a client ([clients.NAME] in config.toml, or Kandev) runs over "
                        "ssh through `host serve --client NAME`. Each prints one JSON document; "
-                       "secrets, the agentctl binary and its nonce come on stdin. The client is the "
+                       "secrets, the agentctl binary, its nonce and a TLS key come on stdin. The client is the "
                        "key's: --client may only repeat it, and is needed only at the host itself. "
                        "Listing, inspecting, stopping and removing its sandboxes are `ls`, `show`, "
                        "`stop` and `purge` with --json.")
     p.add_argument("verb", choices=list(MANAGED_VERBS))
-    p.add_argument("env", nargs="?", metavar="ENV", help="the client's environment id")
+    p.add_argument("env", nargs="?", metavar="ENV", help="the client's environment id (tls: install)")
     p.add_argument("port", nargs="?", metavar="PORT", help="lease: the guest port")
     p.add_argument("--at", metavar="TIME", help="expiry: the new expires_at, RFC 3339")
     p.add_argument("--client", metavar="NAME", help="which client: at the host only, or the key's own")

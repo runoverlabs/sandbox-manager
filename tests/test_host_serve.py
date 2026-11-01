@@ -309,11 +309,13 @@ CLIENT_ALLOWED = [
     "msbctl managed expiry e1 --at 2026-10-17T15:00:00Z", "msbctl managed health --client ci",
     "msbctl ls --json", "msbctl show c-e1 --json", "msbctl stop c-e1 --json",
     "msbctl purge c-e1 -y --json", "msbctl doctor --json",
+    # Through to the verb, which answers `denied` unless [clients.ci] tls = true.
+    "msbctl managed tls install",
 ]
 CLIENT_REFUSED = [
     "msbctl kandev health", "msbctl kandev provision e1", "msbctl managed health --client kandev",
     "msbctl managed provision e1 --client other", "msbctl self-update --json",
-    "msbctl kandev restart-proxy", "msbctl kandev tls install", "msbctl managed tls install",
+    "msbctl kandev restart-proxy", "msbctl kandev tls install",
     "msbctl managed restart-proxy", "msbctl ls", "msbctl show web", "msbctl purge web --json",
     "msbctl host kandev configure --json", "msbctl host managed configure --json", "msbctl setup", "",
 ]

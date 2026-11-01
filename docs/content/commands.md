@@ -615,7 +615,7 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | --- | --- |
 | `--admin` | `authorize`: no forced command. Use a FIDO2 `sk-` key |
 | `--kandev` | `authorize`, `serve`: the [Kandev plugin's key](kandev.md#the-plugin-key). Its line runs `host serve --kandev`, which admits `msbctl kandev` verbs and `ls`, `show`, `stop`, `purge` and `self-update` with `--json`, seeing only Kandev's sandboxes. The everyday key runs no `kandev` verb |
-| `--client NAME` | `authorize`, `serve`: a client's key, for the client `[clients.NAME]` configures. Its line runs `host serve --client NAME`, which admits `msbctl managed` verbs for that client and `ls`, `show`, `stop`, `purge` and `doctor` with `--json`, seeing only its sandboxes; never `self-update`, `kandev tls` or `kandev restart-proxy`, which are the host's. The client is the forced command's: a `--client` naming another in the command is refused. `--client kandev` is `--kandev`, and writes the same line. `authorize` warns when `[clients.NAME]` is missing, does not check out or is not enabled (the key would answer `denied` or `invalid_config`), and writes the line all the same |
+| `--client NAME` | `authorize`, `serve`: a client's key, for the client `[clients.NAME]` configures. Its line runs `host serve --client NAME`, which admits `msbctl managed` verbs for that client and `ls`, `show`, `stop`, `purge` and `doctor` with `--json`, seeing only its sandboxes; never `self-update`, `kandev tls` or `kandev restart-proxy`, which are the host's (`managed tls install` only for the client whose table sets `tls = true`). The client is the forced command's: a `--client` naming another in the command is refused. `--client kandev` is `--kandev`, and writes the same line. `authorize` warns when `[clients.NAME]` is missing, does not check out or is not enabled (the key would answer `denied` or `invalid_config`), and writes the line all the same |
 | `--replace` | `authorize`: rewrite the key's existing line instead of refusing |
 | `--json` | `check`, `kandev configure`, `managed configure`: one JSON document |
 | `--max-sandboxes N`, `--max-cpus N`, `--max-memory SIZE` | `managed configure`: the client's caps, or without `--client` the host's totals over every client |
@@ -623,6 +623,7 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `--guest-port PORT` | `managed configure --client`: the guest ports a provision publishes when it names none, one per flag (1 to 4) |
 | `--require-callback`, `--no-require-callback` | `managed configure --client`: whether a provision must name a callback |
 | `--allow-nested-virt`, `--no-allow-nested-virt` | `managed configure --client`: whether its provisions may ask for `/dev/kvm` (`allow_nested_virt`) |
+| `--tls`, `--no-tls` | `managed configure --client`: whether its key installs the proxy's certificate (`tls`; one client at most, Kandev's while none is given it) |
 | `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |
@@ -689,8 +690,11 @@ address:port entry at its port) is refused without being looked up.
 Kandev's stays required and unchecked. `guest_ports` may name 1 to 4 guest ports to publish
 (Kandev's stay its four, so under the Kandev key any others are refused).
 agentctl's environment and nonce use the client's `env_prefix`, and its binary
-goes to `/opt/NAME/agentctl`. `tls install`, `restart-proxy` and `self-update`
-are not here: they act for the whole host.
+goes to `/opt/NAME/agentctl`. A secret may name the only `headers` it is
+filled in, and `start` of a running sandbox with its secrets hands msb the
+new values live. `tls install` is the key's of the one client whose table sets
+`tls = true` ([the proxy's certificate](managed.md#the-proxys-certificate)).
+`restart-proxy` and `self-update` are not here: they act for the whole host.
 
 | Option | Meaning |
 | --- | --- |
