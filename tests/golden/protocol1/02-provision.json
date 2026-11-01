@@ -73,6 +73,7 @@
    "--net-rule",
    "allow@192.0.2.10:tcp:443",
    "--tls-intercept",
+   "--nested-virt=false",
    "--mount-owned",
    "/workspace:kind=disk,size=20G",
    "--port",

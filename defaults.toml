@@ -173,6 +173,20 @@ git_push = "gh"
 # no host editor sees their checkouts.
 git_checkstat = true
 
+# Whether a sandbox gets /dev/kvm (nested virtualization), unless its project's
+# sandbox.toml or its registry entry says (`nested_virt`; the podman feature
+# sets it, `msbctl edit <name>` → Nested virtualization changes it). With it the
+# guest can run VMs of its own: podman with a krun or kata runtime, an
+# emulator, msb itself. Off, because it is the host's KVM the guest reaches.
+#
+# msb 0.7.12 made this a switch (`--nested-virt`), off by default; before,
+# msb had none and the host decided. msbctl always passes the flag, true or false, so msb's own
+# `sandbox_defaults.nested_virt` never decides. Fixed at create time: a change
+# applies at the next rebuild. A host without nested virtualization support
+# (a VM that does not pass it on, an ARM64 Linux host) fails to start a
+# sandbox that asks for it.
+nested_virt = false
+
 [identities]
 
 # Guest environment, emitted as `--env KEY=value` at create time. Every sandbox
