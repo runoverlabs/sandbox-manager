@@ -63,3 +63,27 @@ that podman's overlay driver can't sit on, so pick one of:
 
 With neither, podman falls back to `vfs`: slow, and about three times the disk.
 The wizard asks.
+
+The `podman` feature also turns on [nested virtualization](#kvm-inside-a-sandbox-nested-virtualization),
+so the guest has `/dev/kvm`, for example for a krun or kata runtime.
+
+## KVM inside a sandbox (nested virtualization)
+
+With `nested_virt = true` the guest gets `/dev/kvm` and can run VMs of its own:
+podman with a VM-backed runtime, an emulator, msb itself. It is the host's KVM,
+reached through nested virtualization, so it is off unless something asks:
+
+- a project's `.msb/sandbox.toml` says `nested_virt = true`. The `podman`
+  feature writes it, and it is approved like the egress rules;
+- or `msbctl edit <name>` → Nested virtualization sets it, for that sandbox;
+- or `[defaults] nested_virt = true` in `config.toml` (`msbctl setup` → New-sandbox
+  defaults) turns it on for every sandbox whose project doesn't say.
+
+It is fixed when the sandbox is created, so a change needs `msbctl rebuild`.
+msbctl always tells msb which, so msb's own `sandbox_defaults.nested_virt`
+never decides. A host that can't do nested virtualization (a VM that doesn't
+pass it on, an ARM64 Linux host) fails to start a sandbox that asks for it.
+
+msb 0.7.12 made this a switch, off by default; before, msb had none, and
+whether a guest saw `/dev/kvm` depended on the host. If a sandbox of yours
+relies on it, set `nested_virt = true` for it before upgrading msb and rebuild.
