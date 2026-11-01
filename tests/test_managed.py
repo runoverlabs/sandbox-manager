@@ -97,7 +97,8 @@ WRONG_TYPES = {"int": "7", "str": '"x"', "list of lists": '[["base"]]', "dict": 
                "bool": "true", "float": "1.5", "nested table": None}
 UNKNOWN_KEYS = ("colour", "Enabled", "max-sandboxes")
 # Client keys for which that type is the right one: not a wrong value there.
-RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("max_sandboxes", "int"),
+RIGHT_TYPES = {("enabled", "bool"), ("require_callback", "bool"), ("allow_nested_virt", "bool"),
+               ("max_sandboxes", "int"),
                ("max_cpus", "int")}
 
 
@@ -527,7 +528,8 @@ class Health(ManagedTest):
                          (2, [2], "ci", True))
         self.assertEqual(doc["client_settings"], {
             "name_prefix": "c-", "env_prefix": "CI_", "guest_ports": [8765, 9000],
-            "require_callback": False, "body_secret_hosts": ["llm.example.org"]})
+            "require_callback": False, "body_secret_hosts": ["llm.example.org"],
+        "allow_nested_virt": False})
         self.assertIn("managed_namespace", doc["features"])
         self.assertEqual(doc["capacity"]["max_sandboxes"], 3)
         self.assertEqual(doc["egress"]["allow_extra"], ["pypi.org", "*.example.org"])
@@ -1489,6 +1491,14 @@ class Configure(ManagedTest):
     def text(self):
         with open(self.m.CONFIG_FILE, encoding="utf-8") as fh:
             return fh.read()
+
+    def test_allow_nested_virt(self):
+        code, doc = self.configure_json("--client", "ci", "--enabled", "--allow-nested-virt")
+        self.assertEqual(code, 0, doc)
+        self.assertIn("allow_nested_virt = true", self.text())
+        code, doc = self.configure_json("--client", "ci", "--no-allow-nested-virt")
+        self.assertEqual(code, 0, doc)
+        self.assertIn("allow_nested_virt = false", self.text())
 
     def test_a_client_table(self):
         code, doc = self.configure_json("--client", "ci", "--enabled", "--env-prefix", "CI_",

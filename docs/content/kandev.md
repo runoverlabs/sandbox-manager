@@ -132,6 +132,7 @@ pool, and `health` counts the ones in `proxy_port_pool` as
 | `rule_groups` | `["github", "npm", "python", "claude"]` | egress every Kandev sandbox gets, after `base` |
 | `allow_extra` | `[]` | what a profile's extra egress may add: hostname patterns (`"pypi.org"`, `"*.example.com"`, any port), addresses (`"192.168.2.6"`, any port), `address:port` (`"192.168.2.6:8788"`, `"[fd00::1]:22"`) and CIDRs (`"192.168.2.0/24"`, any port, no wider than /8 or IPv6 /32). A hostname pattern never matches an address. Empty allows nothing extra; `["*"]` trusts Kandev's profiles |
 | `private_names` | `[]` | exact hostnames a profile may ask to have resolved to a private address (a LAN forge published as `192.168.x.x`). See [names on your LAN](#names-on-your-lan) |
+| `allow_nested_virt` | `false` | whether a provision may ask for `/dev/kvm` in its sandbox (`"nested_virt": true`). See [KVM in a sandbox](#kvm-in-a-sandbox) |
 
 Nothing in a request can raise these limits or remove a base rule. Profiles add
 egress only within `allow_extra`.
@@ -139,7 +140,8 @@ egress only within `allow_extra`.
 Kandev is one client of this host. [Another orchestrator](managed.md) can own
 sandboxes beside Kandev's, with a table of its own, `[clients.NAME]`, and its
 own key. Kandev's own keys, `enabled`, `max_sandboxes`, `max_cpus`,
-`max_memory`, `rule_groups`, `allow_extra` and `private_names`, may live in
+`max_memory`, `rule_groups`, `allow_extra`, `private_names` and
+`allow_nested_virt`, may live in
 `[clients.kandev]` instead of `[kandev]` (one or the other, not both). The
 host-wide keys, `serve`, `proxy_listen`, `base_url`, `port_pool` and
 `proxy_port_pool`, never go in `[clients.kandev]` (it refuses them): they stay
@@ -203,6 +205,26 @@ connect. Patterns and addresses are refused in the list. `health` reports it
 as `egress.private_names` and the feature as `private_names`, so the plugin can
 tell before a launch whether a profile asking for one would be refused here.
 
+## KVM in a sandbox
+
+A Kandev sandbox never has `/dev/kvm` unless its provision asks for it with
+`"nested_virt": true`, and the host allows that with `allow_nested_virt = true`
+in `[kandev]` (`msbctl host managed configure --client kandev
+--allow-nested-virt`). A request that asks where it isn't allowed is refused
+with `denied`, never given less than it asked for. This host's own
+`[defaults] nested_virt`, which is for your sandboxes, never applies to
+Kandev's, and neither does msb's own default: msbctl always tells msb which.
+`health` lists the `nested_virt` feature only where asking would be granted
+(allowed, and this host has `/dev/kvm`), so the plugin can tell before it asks;
+on a host without `/dev/kvm` a request is `unsupported` before anything is made.
+The host also needs nested virtualization (not every VM passes it on, and ARM64
+Linux has none), or msb refuses to start such a sandbox. Setting
+`allow_nested_virt` back to `false` can't take KVM away from a sandbox that has
+it, so `start` refuses such a sandbox (`denied`) from then on.
+
+`host kandev configure` doesn't set this key (its output is frozen at protocol
+1's); use `host managed configure --client kandev`.
+
 ## The workspace disk
 
 Kandev starts every session's agent in `/workspace`, and nothing else creates
@@ -253,7 +275,7 @@ stderr. `ENV` is Kandev's environment id, `[A-Za-z0-9_-]{1,128}`.
 | Verb | Stdin | Does |
 | --- | --- | --- |
 | `health` | – | protocol (1), `features` (what this host does within protocol 1, e.g. `workspace_disk`), `egress.allow_extra` (the loaded list, so the plugin can check its default egress against it), `egress.private_names`, `host` (the machine for the plugin's host list, not for placement: `os`, `kernel`, `cpus`, `memory_total_mib`, `memory_available_mib`, `load_1m`, `disk_total_gib`/`disk_free_gib` for the filesystem msb keeps sandboxes on, `uptime_seconds`; a field that can't be read is left out), versions, KVM, capacity used and free, whether `serve` works and why not (`mode`, `listen`, `running`, `version` (the running proxy's release), `reason`; with the `serve_ports` feature also `ports`, the public ports the proxy has open, `[]` when idle and absent from a proxy too old to say, and `pool_overlap`, how many ports in `proxy_port_pool` your own sandboxes publish, absent when none), and the installed certificate (`tls`: `subject`, `not_after`, `issuer_sha256`) |
-| `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `private_names`, `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
+| `provision ENV` | a JSON line: image (digest-pinned), resources, `workspace_gib` (required, 1–500), `expires_at`, `kandev_api`, `egress_allow`, `private_names`, `nested_virt` (optional, [KVM](#kvm-in-a-sandbox)), `env`, `secrets`, `registry` | creates the sandbox. The same operation and input again returns it; anything else under that ENV is `conflict` |
 | `agentctl ENV` | a JSON line (`sha256`, `size`, `nonce`, `runtime_port`, `args`, `env`), then the binary | verifies, installs and starts Kandev's agentctl, and waits for it to answer |
 | `start ENV` | a JSON line with exactly the secrets it binds | starts a stopped sandbox; bumps `generation` |
 | `expiry ENV --at TIME` | – | moves `expires_at`, never past the one it was created with |

@@ -512,6 +512,10 @@ private_names = []
 #   # placeholder's text, never the value, which only ever goes into headers
 #   # for the secret's own hosts. Default none. (Kandev's: Anthropic's hosts.)
 #   body_secret_hosts = ["llm.example.org"]
+#   # Whether a provision may ask for /dev/kvm ("nested_virt": true). Default
+#   # false; a request asking where it isn't allowed is refused. A client's
+#   # sandbox never follows [defaults] nested_virt, which is for yours.
+#   allow_nested_virt = true
 
 # ---------------------------------------------------------------------------
 # Egress rule groups
