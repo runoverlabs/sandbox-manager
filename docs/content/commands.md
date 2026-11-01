@@ -455,7 +455,7 @@ Tokens the sandbox can use but never see.
 | Option | Meaning |
 | --- | --- |
 | `--stdin` | `set`: read the value from standard input; one trailing newline is dropped |
-| `--restart` | `set`: when the binding is new to a running sandbox (its value was stored after it started), apply it now, which restarts it. Not needed for a new value |
+| `--restart` | `set`: restart a running sandbox to apply it now. Needed only when the binding is new to it (its value was stored after it started); a new value for one it has is live without |
 | `--to keyring\|file` | `migrate`: where the values go |
 | `--json` | `migrate`: print what moved as one JSON document, never a value |
 

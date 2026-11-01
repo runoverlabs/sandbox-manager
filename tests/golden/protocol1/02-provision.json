@@ -8,7 +8,9 @@
  "key": "kandev",
  "msb": [
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ],
   [
    "pull",
@@ -108,7 +110,9 @@
    "kandev.example.ts.net"
   ],
   [
-   "ls"
+   "ls",
+   "--format",
+   "json"
   ]
  ],
  "stdout": "{\n  \"record\": {\n    \"agentctl\": {\n      \"running\": false,\n      \"sha256\": \"\"\n    },\n    \"created_at\": \"2030-01-01T00:00:00Z\",\n    \"env\": \"e1\",\n    \"expires_at\": \"2030-01-02T00:00:00Z\",\n    \"generation\": 1,\n    \"image\": \"ghcr.io/acme/api-sbx@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n    \"input_digest\": \"sha256:1\",\n    \"max_expires_at\": \"2030-01-02T00:00:00Z\",\n    \"name\": \"k-e1\",\n    \"operation_id\": \"op-1\",\n    \"platform\": \"linux-amd64\",\n    \"ports\": {\n      \"41001\": 20001,\n      \"41002\": 20002,\n      \"41003\": 20003,\n      \"8765\": 20000\n    },\n    \"state\": \"running\"\n  }\n}\n"
