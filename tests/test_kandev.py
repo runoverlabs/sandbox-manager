@@ -177,6 +177,34 @@ class Provision(KandevTest):
         self.assertIn("older than 0.7.12", err["message"])
         self.assertEqual(self.msb_calls("create"), [])
 
+    def nested_flag(self):
+        return [a for a in self.msb_calls("create")[-1]["argv"] if a.startswith("--nested-virt")]
+
+    def test_kvm_is_off_unless_asked_whatever_the_host_defaults(self):
+        with open(self.m.CONFIG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[defaults]\nnested_virt = true\n")
+        rec = self.provision()
+        self.assertEqual(self.nested_flag(), ["--nested-virt=false"])
+        box = self.m.Sandbox(rec["name"], self.m.load_config())
+        self.assertIs(box.nested_virt, False)
+
+    def test_kvm_asked_for_is_denied_unless_allowed(self):
+        err = self.error("denied", "provision", "6f1c2b9e", stdin=request(nested_virt=True))
+        self.assertIn("allow_nested_virt", err["message"])
+        self.assertEqual(self.msb_calls("create"), [])
+        self.error("invalid_config", "provision", "6f1c2b9e", stdin=request(nested_virt="yes"))
+
+    def test_kvm_asked_for_and_allowed(self):
+        self.configure(allow_nested_virt=True)
+        rec = self.provision(nested_virt=True)
+        self.assertEqual(self.nested_flag(), ["--nested-virt=true"])
+        box = self.m.Sandbox(rec["name"], self.m.load_config())
+        self.assertIs(box.nested_virt, True)
+        self.assertIn("on (as", self.m._summary_nested_virt(box))
+        # Allowed is not asked: a provision that does not ask gets none.
+        self.provision("7a2d3c4f", operation_id="op-2", input_digest="sha256:2")
+        self.assertEqual(self.nested_flag(), ["--nested-virt=false"])
+
     def test_create_argv_and_record(self):
         rec = self.provision()
         self.assertEqual((rec["name"], rec["state"], rec["generation"]), ("k-6f1c2b9e", "running", 1))

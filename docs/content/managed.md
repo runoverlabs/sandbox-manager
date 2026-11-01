@@ -89,6 +89,7 @@ groups, and is off until `enabled = true`.
 | `guest_ports` | `[8765, 41001, 41002, 41003]` | the guest ports a provision publishes when it names none: 1 to 4 ports, 1024-65535 |
 | `require_callback` | `false` | whether a provision must name a callback; leave it off for a client that is never called back, so nothing is pinned in its guests' `/etc/hosts`. A callback is egress to one address and port, so `allow_extra` must admit it either way, and a name admitted only by a hostname pattern (or `*`) must resolve to a public address unless it is in `private_names`, while `*` admits any address given as one, private included ([below](#protocol-2)) |
 | `body_secret_hosts` | `[]` | hosts a secret's placeholder may travel to in a request body; see [below](#secrets-in-request-bodies) |
+| `allow_nested_virt` | `false` | whether its provisions may ask for `/dev/kvm` (`"nested_virt": true`), as for [Kandev](kandev.md#kvm-in-a-sandbox). Never from this host's `[defaults]` |
 
 Kandev's own table is `[kandev]`, or `[clients.kandev]`, but not both. Its
 `name_prefix`, `env_prefix`, `guest_ports`, `require_callback` and
@@ -163,7 +164,7 @@ differences:
 
 - `health` adds `protocols` (`[2]`, or `[1, 2]` for the Kandev key), `client`,
   `client_settings` (its `name_prefix`, `env_prefix`, `guest_ports`,
-  `require_callback` and `body_secret_hosts`), and `host_capacity` when
+  `require_callback`, `body_secret_hosts` and `allow_nested_virt`), and `host_capacity` when
   `[managed]` sets totals. Its capacity, egress and proxy ports are the
   client's own. A client with no table answers `enabled: false`.
 - `provision` takes an optional `callback` `{host, port}` (`kandev_api` is the
