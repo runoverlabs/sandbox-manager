@@ -19,7 +19,9 @@ start.
 ## The "This sandbox" section
 
 Each sandbox's copy also ends with a short "This sandbox" section, written by
-msbctl: one line per feature it has (podman, python, …), how git reaches
+msbctl: one line per feature it has (podman, python, …), with the npm feature
+a note that npm 12 runs no package's install scripts unless allowed (so a
+missing native binary isn't taken for a refused download), how git reaches
 GitHub, and where the project is mounted — including its `.agents/skills/`
 folder, because this file lives in the agent's home and a project that splits
 its instructions across skill files has to be pointed at them by absolute path.

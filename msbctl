@@ -3318,6 +3318,32 @@ def assemble_profile():
     return True
 
 
+# What an agent is told about npm when the sandbox has the npm feature. npm 12
+# (the shipped `npm` pin) runs no install script it isn't told to allow, and
+# says so only in a warning: the install succeeds and a package whose
+# postinstall builds or fetches its native binary fails later, when used. An
+# agent that doesn't know reads that as a broken package or a refused
+# download. `npm_blocks_scripts()` leaves it out under an older npm pin.
+NPM_SCRIPTS_PROFILE = (
+    "npm here runs no package's install scripts (`preinstall`, `install`, `postinstall`) "
+    "unless they are allowed, so `npm install` and `npm ci` succeed even where one was "
+    "needed. A package that builds or downloads a native binary in one (node-gyp modules "
+    "like `better-sqlite3` or `bcrypt`, a CLI that fetches its own binary) fails only when "
+    "used, with a missing `.node` file or a \"binary not installed\" error. That is npm, not "
+    "the network: the `npm warn install-scripts` lines name what was blocked. Allow those "
+    "packages with `--allow-scripts=<pkg>,<pkg>` for one install, or `allow-scripts=<pkg>,<pkg>` "
+    "in the project's `.npmrc`, which is a change to the project: say so rather than "
+    "making it quietly.")
+
+
+def npm_blocks_scripts(box):
+    """False only when this sandbox's npm pin is below 12, the first npm that
+    blocks install scripts. "" (node's own npm) counts as blocking: which npm
+    a node line bundles moves, and saying too much costs less than too little."""
+    major = str(box.versions().get("npm", "")).split(".")[0]
+    return not major.isdigit() or int(major) >= 12
+
+
 def sandbox_profile_section(box, harness="claude"):
     """A few lines appended to THIS sandbox's copy of CLAUDE.md naming its
     features, so the agent knows podman is there before it goes looking, how
@@ -3335,6 +3361,8 @@ def sandbox_profile_section(box, harness="claude"):
         lines += [f"`{box.name}` was set up with these features, each installed and its egress allowed:", ""]
         lines += [f"- **{key}**: {desc}" for key, desc, _ in FEATURES if key in feats]
         lines += [""]
+    if "npm" in feats and npm_blocks_scripts(box):
+        lines += [NPM_SCRIPTS_PROFILE, ""]
     # Only the bundles this harness has an adapter for: the text is per agent,
     # and naming a tool the agent was never given sends it looking for one that
     # is not registered, or to its built-in web tools and the egress wall.
