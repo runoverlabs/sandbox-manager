@@ -9662,8 +9662,10 @@ def refresh_versions(names, config, cache):
 # Each entry updates ONE component in a running guest. Everything they reach is
 # already in the `base` or `github` rule groups; none needs a new egress rule.
 UPDATERS = {
-    # The ACP adapter rides along with claude, as in bootstrap.sh.
-    "claude": ("npm install -g @anthropic-ai/claude-code@latest "
+    # The ACP adapter rides along with claude, as in bootstrap.sh, and so does
+    # --allow-scripts: npm 12 otherwise skips the postinstall that installs
+    # claude's native binary.
+    "claude": ("npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code@latest "
                "@agentclientprotocol/claude-agent-acp@latest >/dev/null "
                "&& claude --version"),
     # Then pi's own packages (a bundle's `pi_package`, and any the operator
