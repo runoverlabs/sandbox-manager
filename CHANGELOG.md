@@ -9,6 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
+- `msbctl duplicate name new-name dir` registers a second sandbox on another existing folder with the first one's host-side settings: its registry entry, secrets (keyring items included) and policy approval. The source sandbox, the folder and its `.msb/` are left alone; published ports, agent state and disk volumes are not copied. Also in `msbctl edit` → Name & folder.
 - A managed client's provision may pick model endpoints the operator defined (`[llm.<name>]`) and granted it (`[clients.NAME] llms`, `msbctl host managed configure --client NAME --llm NAME`): its rule, port, CA, private name and key all come from this host, the key read at every start and never sent to the client. `health` lists each granted endpoint and the placeholder pi's `models.json` should name.
 - A managed client's provision may send a CA to trust for one of its own hosts (`upstream_ca`), for a server with a private certificate; never for an endpoint whose key the operator holds. `[clients.NAME] allow_upstream_ca = false` refuses it.
 
