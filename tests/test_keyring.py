@@ -628,6 +628,29 @@ class KeyringTest(MsbctlTest):
         self.assertTrue(os.path.exists(path))
         self.assertEqual([i["attrs"]["file"] for i in self.keyring_items()], ["web"])
 
+    def test_duplicate_copies_the_keyring_items(self):
+        self.stored_then("unlocked")
+        target = os.path.join(self.tmp, "projects", "web-2")
+        os.makedirs(target)
+        code, _, err = self.run_main("duplicate", "web", "web-2", target)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.m.read_env_file(self.secrets_file("web-2")).get("NPM_TOKEN"), SECRET)
+        self.assertEqual(self.m.read_env_file(self.secrets_file("web")).get("NPM_TOKEN"), SECRET)
+        self.assertEqual(sorted(i["attrs"]["file"] for i in self.keyring_items()), ["web", "web-2"])
+
+    def test_duplicate_takes_back_its_copies_when_the_keyring_refuses(self):
+        path = self.stored_then("unlocked")
+        self.store_secret(path, "GH_TOKEN", "planted-gh-value")
+        target = os.path.join(self.tmp, "projects", "web-2")
+        os.makedirs(target)
+        with self.refuse("store", "GH_TOKEN"):
+            code, _, err = self.run_main("duplicate", "web", "web-2", target)
+        self.assertNotEqual(code, 0)
+        self.assertIn("nothing has been duplicated", err)
+        self.assertFalse(os.path.exists(self.entry_path("web-2")))
+        self.assertFalse(os.path.exists(self.secrets_file("web-2")))
+        self.assertEqual({i["attrs"]["file"] for i in self.keyring_items()}, {"web"})
+
     def test_purge_clears_the_keyring_items(self):
         path = self.npm_sandbox()
         self.set_store("keyring")

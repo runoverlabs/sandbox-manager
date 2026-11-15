@@ -57,6 +57,35 @@ repo, and offers the rebuild the new mount needs.
 
 Both are also in `msbctl edit` → "Name & folder".
 
+## Duplicating a sandbox onto another folder
+
+```console
+$ msbctl duplicate web web-2 ~/src/web-2
+$ msbctl start web-2
+```
+
+Use this for a second checkout or worktree of the same project that needs
+the same machine-local setup. msbctl copies only what lives on this
+machine, which is the registry entry, `secrets/<name>.env` and the policy
+approval. The folder's contents and its `.msb/` are left alone, and so is the
+original sandbox, even while it runs.
+
+- **Policy.** If the new folder's `.msb/sandbox.toml` pins the same values,
+  the copied approval covers it and the duplicate starts without asking. If
+  the values differ, the first start shows the diff, as for any changed
+  policy. If the folder has no `.msb/` at all, the duplicate gets only its
+  registry entry and the defaults.
+- **Disks.** The duplicate makes its own package caches and container
+  storage. Two sandboxes never share a disk volume.
+- **Not copied.** Published ports, because one host port can't go to two
+  sandboxes. Also not copied is the agents' state (Claude and pi), whose
+  conversations are about the other folder.
+- **GitHub token.** `repo` is re-detected from the new folder. If it differs,
+  the copied token was made for the other repo, and msbctl says so.
+
+It's also in `msbctl edit` → "Name & folder", which asks for a folder to
+duplicate onto before it asks about renaming.
+
 ## Autostart
 
 Mark a sandbox to start whenever the picker opens:

@@ -5266,6 +5266,121 @@ def cmd_move(args, config):
         note(f"until then it still sees the old folder: `msbctl rebuild {box.name}`")
 
 
+# `msbctl duplicate <name> <new> <dir>`: a second sandbox with the first one's
+# HOST side, on another folder — a second checkout or worktree of the same
+# project, usually. Copied: the registry entry (identity, keys, token, mounts,
+# git push, version pins, the policy pin), its secrets (keyring items too, as
+# they are keyed by the env file's name) and the approved policy, so a folder
+# whose .msb/ is the same starts without asking again and a different one shows
+# the diff. Not copied: the folder's contents and its .msb/ (the portable half
+# lives in the project, and a checkout of a repo that commits it brings its
+# own), the agents' state (conversations about the other folder), the disk
+# volumes (the duplicate makes its own: `volumes` is dropped, as two sandboxes
+# on one disk would corrupt it) and published ports (two sandboxes cannot hold
+# one host port). The source is never touched, running or not.
+
+def duplicate_sandbox(box, new, project):
+    """Register `new` on `project` with `box`'s host-side settings. `box` is left
+    as it is. Returns the list of what was left out, for the caller to say."""
+    old_env = os.path.join(SECRETS_DIR, f"{box.name}.env")
+    new_env = os.path.join(SECRETS_DIR, f"{new}.env")
+    copies = [(old_env, new_env), (approved_path(box.name), approved_path(new))]
+    clash = [dst for src, dst in copies if os.path.exists(src) and os.path.exists(dst)]
+    if clash:
+        die(f"left over from an earlier {new}: {', '.join(tilde(p) for p in clash)} — "
+            "move it out of the way first")
+
+    # Read every keyring value before anything is written, so a refusal leaves
+    # nothing behind. An item already gone is carried as its stale marker.
+    held = {}
+    for var in keyring_vars(old_env):
+        value = keyring_get(old_env, var)
+        kind, why = keyring_why(old_env, var) if value is None else (None, None)
+        if kind == "missing":
+            warn(f"{var}: {why}")
+        elif kind:
+            die(f"{box.name}'s secrets are in the keyring and could not be read ({why}) — "
+                "nothing has been duplicated")
+        else:
+            held[var] = value
+    copied = []
+    try:
+        for var, value in held.items():
+            if not keyring_put(new_env, var, value):
+                die(f"the keyring did not take {var} under {new} — nothing has been duplicated")
+            copied.append(var)
+    except BaseException:
+        with keyring_second_chance():
+            for done in copied:
+                if not keyring_clear(new_env, done):
+                    warn(f"the copy of {done} under {new} is still in the keyring: "
+                         + keyring_clear_hint(new_env, done))
+        raise
+
+    entry = registry_path_for(new)
+    os.makedirs(REGISTRY_DIR, exist_ok=True)
+    shutil.copy2(registry_path(box), entry)
+    set_toml_key(entry, "name", new)
+    set_toml_key(entry, "project", project)
+    set_toml_key(entry, "volumes", None)
+    left_out = []
+    if box.entry.get("ports"):
+        set_toml_key(entry, "ports", None)
+        left_out.append("published ports (one host port cannot go to two sandboxes)")
+    ref = checkout_repo(project)
+    set_toml_key(entry, "repo", ref.stored if ref else "")
+    _follow_rename_in_comments(entry, box.name, new)
+    for src, dst in copies:
+        if os.path.exists(src):
+            shutil.copy2(src, dst)
+    return left_out
+
+
+def duplicate_to(box, new_name, raw, config):
+    """Check, then duplicate `box` as `new_name` on the folder typed as `raw`
+    (as for `add`), saying what it did. Shared by the verb and the edit menu."""
+    if box.is_kandev:
+        die(f"{box.name} is {owner_name(box.client)}'s sandbox: only its own provision makes one")
+    if box.is_repo:
+        die(f"{box.name} has no folder on this machine — it is a clone of {box.repo} inside "
+            f"the sandbox; `msbctl add --repo {box.repo}` makes another")
+    problem = name_problem(new_name)
+    if problem:
+        die(problem)
+    project = resolve_project(raw, config)
+    if not os.path.isdir(project):
+        die(f"not a directory: {tilde(project)}")
+    if project == box.project:
+        die(f"{tilde(project)} is {box.name}'s own folder — duplicate it onto another one")
+    for other in registered():
+        other_raw = read_toml(registry_path_for(other)).get("project")
+        if other_raw and os.path.realpath(os.path.expanduser(other_raw)) == project:
+            die(f"{tilde(project)} is already the project of {other}")
+
+    say(f"Duplicating {box.name} as {new_name}")
+    left_out = duplicate_sandbox(box, new_name, project)
+    new = Sandbox(new_name, config)
+    note(f"registered: {tilde(registry_path_for(new_name))}")
+    note(f"project    {tilde(project)}")
+    if new.repo != box.repo:
+        note(f"repo       {new.repo or 'none'}  ({box.name} has {box.repo or 'none'})")
+        if new.on_github and stored_env(os.path.join(SECRETS_DIR, f"{new_name}.env")).get("GH_TOKEN"):
+            warn(f"its GitHub token was copied from {box.name}, made for {box.repo or 'another repo'} "
+                 f"— `msbctl edit {new_name}` → GitHub token to replace it")
+    if not os.path.isfile(project_path(new)):
+        warn(f"{tilde(project)} has no .msb/sandbox.toml: {new_name} gets only its registry "
+             f"entry and the defaults, none of {box.name}'s project settings (egress groups, "
+             f"features) — add a .msb/ there, or `msbctl edit {new_name}`")
+    for what in left_out:
+        note(f"not copied: {what}")
+    note(f"new disks, agent state and caches; {box.name} is unchanged")
+    note(f"`msbctl start {new_name}` creates it")
+
+
+def cmd_duplicate(args, config):
+    duplicate_to(Sandbox(args.name, config), args.new, args.dir, config)
+
+
 # `shell` and `exec` pass every flag msbctl does not use itself straight to
 # `msb exec` (split off in split_msb_flags(), before argparse sees them), so
 # `-u root`, `--timeout 5m`, `-e KEY=value` and whatever later msb versions add
@@ -8672,6 +8787,12 @@ def section_place(box, config, ctx):
     if chosen != current and set_toml_key(registry_path(box), "guest_path", chosen):
         ctx["rebuild"].add("project path in the sandbox")
         box = Sandbox(box.name, config)
+    if not box.is_repo:
+        # A copy of this one's host side on another folder (`msbctl duplicate`):
+        # this sandbox stays as it is, whatever is answered after.
+        raw = ask("duplicate onto another folder too? (folder, blank for no)")
+        if raw:
+            duplicate_to(box, ask("name of the duplicate"), raw, config)
     new = ask("sandbox name", box.name)
     if new == box.name:
         return
@@ -11471,7 +11592,8 @@ def restricted_problem(argv, client=None, kandev=False):
         return None if args.action == "check" else f"host {args.action} is for the host itself"
     # allow: a new egress rule. mount: a host path. port: a host port. keys:
     # which of the host's ssh keys a sandbox may sign with. move/entry/edit:
-    # rewrite the registry and the policy.
+    # rewrite the registry and the policy. duplicate: a host path, with a copy
+    # of another sandbox's secrets.
     # _agent-filter: the host's ssh-agent. The menu: all of the above.
     return f"`{getattr(args, 'cmd', None) or 'the menu'}` is not allowed with this key"
 
@@ -17398,6 +17520,14 @@ def build_parser():
     p.add_argument("dir", help="as for `add`: a bare name resolves under the workspaces")
     p.add_argument("--rebuild", action="store_true", help="rebuild now so it takes effect")
     p.set_defaults(func=cmd_move)
+
+    p = sub.add_parser("duplicate", help="register a copy of a sandbox's host-side settings "
+                                         "on another folder (the folder and .msb/ untouched)")
+    p.add_argument("name", help=DOT_HELP)
+    p.add_argument("new", metavar="new-name")
+    p.add_argument("dir", help="an existing folder, as for `add`: a bare name resolves under "
+                               "the workspaces")
+    p.set_defaults(func=cmd_duplicate)
 
     p = sub.add_parser("config", help="show the merged configuration and where each value is from")
     p.set_defaults(func=cmd_config)

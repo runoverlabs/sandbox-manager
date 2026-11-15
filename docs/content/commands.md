@@ -258,6 +258,24 @@ GitHub repo. The folder is mounted at create time, so this needs a rebuild.
 | --- | --- |
 | `--rebuild` | rebuild now, so it takes effect |
 
+### `msbctl duplicate`
+
+```text
+msbctl duplicate name|. new-name dir
+```
+
+Register a second sandbox on another folder, with the first one's host-side
+settings. It copies the registry entry (identity, SSH keys, tokens, extra
+folders, git push, version pins), the per-sandbox secrets, including keyring
+items, and the policy approval. It leaves the source sandbox, its VM, its
+disks and its folder as they are.
+`dir` must be an existing folder that no other sandbox uses, and it's read as
+it is for `add`. Nothing is written into it, not even `.msb/`: a checkout of a
+repo that commits `.msb/` brings its own. Not copied: published ports, the
+agents' state, and the disk volumes. The duplicate gets fresh caches and
+container storage. `repo` is re-detected from the new folder. See
+[Maintaining a sandbox](maintaining.md#duplicating-a-sandbox-onto-another-folder).
+
 ### `msbctl resize`
 
 ```text
