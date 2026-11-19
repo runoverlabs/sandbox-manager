@@ -399,4 +399,6 @@ The Kandev key does set egress and secret bindings, which the everyday key may
 never do. A Kandev profile is the policy for its own sandboxes, and the Kandev
 server is yours to run. What bounds it is `[kandev]`, the reserved variable
 names (`GH_TOKEN`, Claude's, `AGENTCTL_*`, `MSB_*` and the like), and the fact
-that its verbs only ever see Kandev's sandboxes.
+that its verbs only ever see Kandev's sandboxes. `ANTHROPIC_API_KEY` is not
+among those names: a request may bind its own, as any other secret, to the
+hosts it names.

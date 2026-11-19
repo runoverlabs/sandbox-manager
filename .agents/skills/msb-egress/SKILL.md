@@ -5,7 +5,7 @@ description: "Emitting, ordering, approving or debugging msb egress rules and se
 
 # Egress rules and secret bindings
 
-Everything here was verified on msb 0.7.6–0.7.7; msbctl now requires 0.7.12
+Everything here was verified on msb 0.7.6–0.7.7; msbctl now requires 0.7.16
 (`MSB_MIN`), and where 0.7.12 changed something the text says so. The
 property that makes this area expensive: **almost every failure here looks
 like something else.** A blocked host looks like an outage, a denied
@@ -133,7 +133,11 @@ rule covers, and prints the `msbctl allow` line.
 The guest, meanwhile, gets a JSON `403` (`network_policy_denied` /
 `secret_policy_denied`, with `domain`) for a refused HTTP(S) request (msb
 0.7.9+; checked on 0.7.12 over plain HTTP and HTTPS). That is what an agent
-reports, not anything in the log.
+reports, not anything in the log. Before 0.7.16 a client that kept an IP past
+its DNS TTL could get that `403` on reconnect to an ALLOWED host; 0.7.16
+re-resolves through the policy's DNS from the TLS SNI and re-checks, so on
+`MSB_MIN` a 403 after a reconnect is a real denial (a connection with no SNI
+still needs a live DNS binding).
 
 `egress_mode` is written to **and read from** the registry entry only, never
 `sandbox.toml` — that file is committed and guest-writable, so honouring it

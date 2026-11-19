@@ -7,7 +7,7 @@ description: "Tests and spikes: tests/harness.py MsbctlTest giving each test a t
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
 every session. Repo-specific throughout; the facts here were verified on
-msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+msb 0.7.6–0.7.7. msbctl now requires 0.7.16 (`MSB_MIN`); where 0.7.12
 changed something, the text says so.
 
 - `tests/` — stdlib `unittest`, run by `check.sh`: `tests/harness.py` (`MsbctlTest`) gives each test a throwaway HOME and a freshly loaded `msbctl`, with `preflight()` and the agent filter patched out and the network off; `tests/fake/msb` records argv and the env vars a test names, keeps state, and exits 2 on any call it does not know; `tests/fake/tailscale` records `serve` calls. Assert what reaches `msb`, and with `assert_not_in_argv()` that a planted secret does not.

@@ -11905,7 +11905,7 @@ def runtime_checks():
     return out
 
 
-# `msb doctor` (0.7.7, the same on 0.7.12) writes to stderr, one line per check: `  ✓ label value`,
+# `msb doctor` (0.7.7, the same on 0.7.12 and 0.7.16) writes to stderr, one line per check: `  ✓ label value`,
 # `  ✗ label value`, `warn: label: value`, then per problem `error: headline`
 # with `  → hint` lines (crates/cli/lib/commands/self_cmd.rs, run_doctor()).
 # It exits 1 when the host cannot run sandboxes. No machine-readable form, so
@@ -12499,8 +12499,10 @@ KANDEV_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnecti
 # Names a Kandev secret or env var may not take, beyond is_reserved_var().
 # Credentials Kandev itself delivers, agentctl's own settings, and anything
 # that would change how msb (or the dynamic loader) behaves: secret values are
-# put in the environment of the `msb` process.
-KANDEV_RESERVED_NAMES = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH",
+# put in the environment of the `msb` process. ANTHROPIC_API_KEY is
+# deliberately NOT here: a client may bind its own (to the hosts it names, like
+# any secret), and if Kandev also sets one in the guest, that is its choice.
+KANDEV_RESERVED_NAMES = {"GITHUB_TOKEN", "ANTHROPIC_AUTH_TOKEN", "PATH",
                          "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "TERM", "LANG"}
 KANDEV_RESERVED_PREFIXES = ("AGENTCTL_", "MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
@@ -16169,11 +16171,11 @@ MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
 # an older one (local_problem()), and `doctor` fails it. A newer one may well
 # work, but its flags, its log lines and its JSON are unchecked: `doctor`
 # warns. Raise it whenever msbctl is developed against a newer release.
-MSB_MIN = "0.7.12"
+MSB_MIN = "0.7.16"
 
 
 def msb_version_tuple(version):
-    """`0.7.12` as (0, 7, 12), for comparing; None for anything else."""
+    """`0.7.16` as (0, 7, 16), for comparing; None for anything else."""
     return tuple(int(x) for x in version.split(".")) if MSB_VERSION.fullmatch(version or "") else None
 
 
@@ -16185,7 +16187,7 @@ def msb_too_old(version):
 
 
 def local_msb_version():
-    """This machine's msb version (`0.7.12`), or None without one."""
+    """This machine's msb version (`0.7.16`), or None without one."""
     if not shutil.which("msb"):
         return None
     try:

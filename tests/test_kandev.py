@@ -174,7 +174,7 @@ class Provision(KandevTest):
     def test_an_msb_older_than_the_minimum_is_unavailable(self):
         os.environ["FAKE_MSB_VERSION"] = "0.7.7"
         err = self.error("unavailable", "provision", "6f1c2b9e", stdin=request())
-        self.assertIn("older than 0.7.12", err["message"])
+        self.assertIn("older than 0.7.16", err["message"])
         self.assertEqual(self.msb_calls("create"), [])
 
     def nested_flag(self):
