@@ -12499,8 +12499,10 @@ KANDEV_BAD_GATEWAY = b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnecti
 # Names a Kandev secret or env var may not take, beyond is_reserved_var().
 # Credentials Kandev itself delivers, agentctl's own settings, and anything
 # that would change how msb (or the dynamic loader) behaves: secret values are
-# put in the environment of the `msb` process.
-KANDEV_RESERVED_NAMES = {"GITHUB_TOKEN", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "PATH",
+# put in the environment of the `msb` process. ANTHROPIC_API_KEY is
+# deliberately NOT here: a client may bind its own (to the hosts it names, like
+# any secret), and if Kandev also sets one in the guest, that is its choice.
+KANDEV_RESERVED_NAMES = {"GITHUB_TOKEN", "ANTHROPIC_AUTH_TOKEN", "PATH",
                          "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "TERM", "LANG"}
 KANDEV_RESERVED_PREFIXES = ("AGENTCTL_", "MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
 ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")

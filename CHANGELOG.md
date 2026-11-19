@@ -15,6 +15,7 @@ release notes.
 
 ### Changed
 - msbctl requires msb 0.7.16 or newer, the release it is now developed against; an older msb is refused as before. Upgrade msb first (`msb self update`, or `curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh`). With it, a published port another process already holds makes the sandbox's start fail and names the port, where msb used to start it without that port.
+- A Kandev or managed client's provision may send `ANTHROPIC_API_KEY` as a secret or env var; it is no longer a reserved name.
 
 ### Fixed
 - A Kandev or managed client's secret allowed on a port besides 443 (`egress_allow` `host:8443`) is now substituted there: that port's TLS is intercepted, where the secret used to arrive as its placeholder.

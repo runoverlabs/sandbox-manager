@@ -859,6 +859,14 @@ class Provisioning(ManagedTest):
         self.ci_error("invalid_config", "managed", "provision", "e1",
                       stdin=ci_request(env=[{"name": "AGENTCTL_X", "value": "1"}]))
 
+    def test_anthropic_api_key_is_not_reserved(self):
+        # A client may send its own; a Kandev that also sets one is its business.
+        self.assertIsNone(self.m.kandev_name_problem("ANTHROPIC_API_KEY", "CI_"))
+        self.ci_provision(secrets=[{"name": "ANTHROPIC_API_KEY", "value": PLANTED_CI,
+                                    "hosts": ["llm.example.org"]}])
+        entry = self.m.read_toml(self.entry_path("c-e1"))
+        self.assertEqual(entry["secret_binds"], ["ANTHROPIC_API_KEY@llm.example.org"])
+
 
 class Agentctl(ManagedTest):
 
