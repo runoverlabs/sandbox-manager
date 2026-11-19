@@ -7,7 +7,7 @@ description: "Changelog discipline, CI and releases: the one-line CHANGELOG.md e
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
 every session. Repo-specific throughout; the facts here were verified on
-msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+msb 0.7.6–0.7.7. msbctl now requires 0.7.16 (`MSB_MIN`); where 0.7.12
 changed something, the text says so.
 
 - **Every behaviour change gets a ONE-LINE entry in `CHANGELOG.md`**, under `## [Unreleased]` in the matching `### Added` / `### Changed` / `### Fixed` / `### Removed` group. One line, user-facing, what changed and what a user must do about it (e.g. "needs a rebuild"). No file lists, no rationale, no commit hashes; the commit message and code comments carry those. Refactors, test-only and CI-only changes with no user-visible effect need no entry.

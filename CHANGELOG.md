@@ -13,6 +13,9 @@ release notes.
 - A managed client's provision may pick model endpoints the operator defined (`[llm.<name>]`) and granted it (`[clients.NAME] llms`, `msbctl host managed configure --client NAME --llm NAME`): its rule, port, CA, private name and key all come from this host, the key read at every start and never sent to the client. `health` lists each granted endpoint and the placeholder pi's `models.json` should name.
 - A managed client's provision may send a CA to trust for one of its own hosts (`upstream_ca`), for a server with a private certificate; never for an endpoint whose key the operator holds. `[clients.NAME] allow_upstream_ca = false` refuses it.
 
+### Changed
+- msbctl requires msb 0.7.16 or newer, the release it is now developed against; an older msb is refused as before. Upgrade msb first (`msb self update`, or `curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh`). With it, a published port another process already holds makes the sandbox's start fail and names the port, where msb used to start it without that port.
+
 ### Fixed
 - A Kandev or managed client's secret allowed on a port besides 443 (`egress_allow` `host:8443`) is now substituted there: that port's TLS is intercepted, where the secret used to arrive as its placeholder.
 

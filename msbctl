@@ -11905,7 +11905,7 @@ def runtime_checks():
     return out
 
 
-# `msb doctor` (0.7.7, the same on 0.7.12) writes to stderr, one line per check: `  ✓ label value`,
+# `msb doctor` (0.7.7, the same on 0.7.12 and 0.7.16) writes to stderr, one line per check: `  ✓ label value`,
 # `  ✗ label value`, `warn: label: value`, then per problem `error: headline`
 # with `  → hint` lines (crates/cli/lib/commands/self_cmd.rs, run_doctor()).
 # It exits 1 when the host cannot run sandboxes. No machine-readable form, so
@@ -16169,11 +16169,11 @@ MSB_VERSION = re.compile(r"\d+\.\d+\.\d+")
 # an older one (local_problem()), and `doctor` fails it. A newer one may well
 # work, but its flags, its log lines and its JSON are unchecked: `doctor`
 # warns. Raise it whenever msbctl is developed against a newer release.
-MSB_MIN = "0.7.12"
+MSB_MIN = "0.7.16"
 
 
 def msb_version_tuple(version):
-    """`0.7.12` as (0, 7, 12), for comparing; None for anything else."""
+    """`0.7.16` as (0, 7, 16), for comparing; None for anything else."""
     return tuple(int(x) for x in version.split(".")) if MSB_VERSION.fullmatch(version or "") else None
 
 
@@ -16185,7 +16185,7 @@ def msb_too_old(version):
 
 
 def local_msb_version():
-    """This machine's msb version (`0.7.12`), or None without one."""
+    """This machine's msb version (`0.7.16`), or None without one."""
     if not shutil.which("msb"):
         return None
     try:

@@ -14,8 +14,8 @@ CHECK = {"msbctl": "0.0.0", "restricted": True, "checks": []}
 
 
 def probe(**over):
-    # The fake msb here says 0.7.12: the same, so no test meets a mismatch by accident.
-    values = {"user": "msb", "path": "", "bare": "", "msb": "msb 0.7.12", "msbctl": "", "kvm": "rw",
+    # The fake msb here says 0.7.16: the same, so no test meets a mismatch by accident.
+    values = {"user": "msb", "path": "", "bare": "", "msb": "msb 0.7.16", "msbctl": "", "kvm": "rw",
               "curl": "/usr/bin/curl",
               "linger": "yes", "unit": "yes", "sudo": "no", **over}
     return "".join(f"{k}={v}\n" for k, v in values.items())
@@ -69,31 +69,31 @@ class RemoteSetupTest(RemoteBase):
         # msb at this machine's version, through that release's own installer.
         pinned = [c for c in cmds if "get_latest_version" in c]
         self.assertEqual(len(pinned), 1, cmds)
-        self.assertTrue(pinned[0].endswith(f"sh {self.m.MSB_RELEASES} 0.7.12"), pinned[0])
+        self.assertTrue(pinned[0].endswith(f"sh {self.m.MSB_RELEASES} 0.7.16"), pinned[0])
         self.assertTrue(any("get.sh" in c and "| sh" in c for c in cmds), cmds)
         self.assertFalse(any("host autostart" in c or "authorize" in c for c in cmds), cmds)
         self.assertTrue(any("doctor --json" in c for c in cmds))
 
     def test_a_different_msb_there_is_offered_this_one(self):
-        patch, calls = self.ssh(probe(msb="msb 0.7.13", msbctl=f"msbctl {self.mine}"))
+        patch, calls = self.ssh(probe(msb="msb 0.7.17", msbctl=f"msbctl {self.mine}"))
         with patch:
             # replace: no; key: not now.
             code, out, err = self.run_main("remote", "setup", "sbx-01", stdin="n\n\n")
         self.assertEqual(code, 0, err)
-        self.assertIn("msb 0.7.13 on sbx-01, 0.7.12 here", err)
-        self.assertIn("replace msb 0.7.13 on sbx-01 with 0.7.12?", out)
+        self.assertIn("msb 0.7.17 on sbx-01, 0.7.16 here", err)
+        self.assertIn("replace msb 0.7.17 on sbx-01 with 0.7.16?", out)
         self.assertFalse(any("get_latest_version" in c for c in self.commands(calls)))
-        patch, calls = self.ssh(probe(msb="msb 0.7.13", msbctl=f"msbctl {self.mine}"))
+        patch, calls = self.ssh(probe(msb="msb 0.7.17", msbctl=f"msbctl {self.mine}"))
         with patch:
             self.run_main("remote", "setup", "sbx-01", stdin="y\n\n")
-        self.assertTrue(any(c.endswith(f"sh {self.m.MSB_RELEASES} 0.7.12") for c in self.commands(calls)))
+        self.assertTrue(any(c.endswith(f"sh {self.m.MSB_RELEASES} 0.7.16") for c in self.commands(calls)))
 
     def test_an_older_msb_here_is_never_copied(self):
-        patch, calls = self.ssh(probe(msb="msb 0.7.12", msbctl=f"msbctl {self.mine}"))
+        patch, calls = self.ssh(probe(msb="msb 0.7.16", msbctl=f"msbctl {self.mine}"))
         with patch, mock.patch.object(self.m, "local_msb_version", lambda: "0.7.7"):
             code, out, err = self.run_main("remote", "setup", "sbx-01", stdin="\n")
         self.assertEqual(code, 0, err)
-        self.assertIn("older than 0.7.12", err)
+        self.assertIn("older than 0.7.16", err)
         # The host already has the minimum: nothing to replace, no downgrade offered.
         self.assertNotIn("replace msb", out)
         self.assertFalse(any("get_latest_version" in c for c in self.commands(calls)))

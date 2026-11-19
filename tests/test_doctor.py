@@ -47,7 +47,7 @@ class DoctorTest(MsbctlTest):
                    "swap", "authorized-keys", "registry"):
             self.assertIn(id, checks)
         self.assertEqual(checks["msb"]["status"], "ok")
-        self.assertIn("0.7.12", checks["msb"]["message"])
+        self.assertIn("0.7.16", checks["msb"]["message"])
         self.assertNotIn("msb-doctor", checks)      # this fake msb has none
 
     def test_no_kvm_fails(self):
@@ -91,7 +91,7 @@ class DoctorTest(MsbctlTest):
         code, checks, _, _ = self.doctor()
         self.assertEqual(code, 1)
         self.assertEqual(checks["msb"]["status"], "fail")
-        self.assertIn("older than 0.7.12", checks["msb"]["message"])
+        self.assertIn("older than 0.7.16", checks["msb"]["message"])
         self.assertIn("install.sh", checks["msb"]["fix"])
 
     def test_msb_table_reads_the_json_listing(self):
@@ -107,8 +107,8 @@ class DoctorTest(MsbctlTest):
 
     def test_every_other_command_refuses_an_older_msb(self):
         self.assertIsNone(self.m.local_problem())
-        os.environ["FAKE_MSB_VERSION"] = "0.7.11"
-        self.assertIn("older than 0.7.12", self.m.local_problem())
+        os.environ["FAKE_MSB_VERSION"] = "0.7.15"
+        self.assertIn("older than 0.7.16", self.m.local_problem())
         os.environ["FAKE_MSB_VERSION"] = "0.10.0"     # numbers, not strings: 10 > 7
         self.assertIsNone(self.m.local_problem())
 

@@ -7,7 +7,7 @@ description: "What ships and how it installs: install.sh --dev versus --package 
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
 every session. Repo-specific throughout; the facts here were verified on
-msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+msb 0.7.6–0.7.7. msbctl now requires 0.7.16 (`MSB_MIN`); where 0.7.12
 changed something, the text says so.
 
 - `install.sh` — two modes: `--dev` (a git checkout; symlinks the commands into it) and `--package` (copies the tree to `~/.local/share/msb-manager/versions/<v>/`, `current` link, commands link through it; keeps current + previous). Seeds `~/.config/msb/` from templates, never overwrites, `--uninstall` removes only what it owns. Never reads stdin (it runs under `curl | sh`) and has no backticks in its unquoted heredoc (they execute).

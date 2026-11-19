@@ -7,7 +7,7 @@ description: "pi and model endpoints: [bootstrap] pi and PI_PACKAGE, [llm.<name>
 
 Detail carved out of `AGENTS.md`, which keeps only what has to hold in
 every session. Repo-specific throughout; the facts here were verified on
-msb 0.7.6–0.7.7. msbctl now requires 0.7.12 (`MSB_MIN`); where 0.7.12
+msb 0.7.6–0.7.7. msbctl now requires 0.7.16 (`MSB_MIN`); where 0.7.12
 changed something, the text says so.
 
 `pi` (`[bootstrap] pi`, `PI_PACKAGE`) talks to `[llm.<name>]` tables in
