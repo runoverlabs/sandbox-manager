@@ -8,13 +8,15 @@ release notes.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-11-19
+
 ### Added
 - `msbctl duplicate name new-name dir` registers a second sandbox on another existing folder with the first one's host-side settings: its registry entry, secrets (keyring items included) and policy approval. The source sandbox, the folder and its `.msb/` are left alone; published ports, agent state and disk volumes are not copied. Also in `msbctl edit` → Name & folder.
 - A managed client's provision may pick model endpoints the operator defined (`[llm.<name>]`) and granted it (`[clients.NAME] llms`, `msbctl host managed configure --client NAME --llm NAME`): its rule, port, CA, private name and key all come from this host, the key read at every start and never sent to the client. `health` lists each granted endpoint and the placeholder pi's `models.json` should name.
 - A managed client's provision may send a CA to trust for one of its own hosts (`upstream_ca`), for a server with a private certificate; never for an endpoint whose key the operator holds. `[clients.NAME] allow_upstream_ca = false` refuses it.
 
 ### Changed
-- msbctl requires msb 0.7.16 or newer, the release it is now developed against; an older msb is refused as before. Upgrade msb first (`msb self update`, or `curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh`). With it, a published port another process already holds makes the sandbox's start fail and names the port, where msb used to start it without that port.
+- msbctl requires msb 0.7.16 or newer, the release it is now developed against; an older msb is refused as before. Upgrade msb first (`msb self update`, or `curl -fsSL https://github.com/microsandbox/microsandbox/releases/latest/download/install.sh | sh`). With it, a published port another process already holds makes the sandbox's start fail and names the port, where msb used to start it without that port. It also stops the false `403 network_policy_denied` a long-running process could get when reconnecting to an allowed host after its DNS entry expired; restart running sandboxes after upgrading msb.
 - A Kandev or managed client's provision may send `ANTHROPIC_API_KEY` as a secret or env var; it is no longer a reserved name.
 
 ### Fixed
