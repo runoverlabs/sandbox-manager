@@ -528,6 +528,12 @@ private_names = []
 #   # ("upstream_ca"). Default true: it decides only what its own sandbox
 #   # trusts, and never for an endpoint whose key this host holds.
 #   allow_upstream_ca = false
+#   # msb's --log-level for each sandbox it provisions from now on: error,
+#   # warn, info, debug or trace, written to that sandbox's runtime.log. Yours
+#   # to debug with; the client neither sets nor sees it. msb keeps it for the
+#   # sandbox's life, so a change reaches only later provisions. Default
+#   # unset: no flag, msb's own default.
+#   log_level = "debug"
 
 # ---------------------------------------------------------------------------
 # Egress rule groups

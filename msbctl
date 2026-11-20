@@ -4894,6 +4894,8 @@ def cmd_stop(args, config):
     if box.is_kandev:
         if box.entry.get("state") != "absent":
             kandev_set(box.name, state="stopped", agentctl_running=False)
+        # Stopped, so msb has written its last line for this run.
+        managed_save_intercepts(box.name, box.entry)
     else:
         stop_agent_filter(box)
     note(f"{box.name} stopped — installed packages and state are kept")
@@ -5853,7 +5855,7 @@ def cmd_allow(args, config):
 # seen only in DNS was looked up, probably connected to, and on a port this
 # cannot name. The report labels the two differently rather than pretending the
 # second is as good as the first.
-OBSERVED_TLS = re.compile(r"TLS (?:intercept|bypass) sni=(\S+) dst=(\S+)")
+OBSERVED_TLS = re.compile(r"TLS (intercept|bypass) sni=(\S+) dst=(\S+)")
 OBSERVED_DNS = re.compile(r"\bdomain=([A-Za-z0-9*._-]+)")
 LOG_STAMP = re.compile(r"^(\d{4}-\d\d-\d\d)T([\d:]{8})")
 
@@ -5872,6 +5874,29 @@ def runtime_logs(name):
             if os.path.isfile(os.path.join(folder, f))]
 
 
+def log_lines(fh, pos=0):
+    """(line, end) for each line of an open msb log (binary, at byte `pos`),
+    decoded as every reader here does (UTF-8, bad bytes replaced); `end` is
+    the byte just after it. The last line may lack its newline: msb may be
+    writing it."""
+    for raw in fh:
+        pos += len(raw)
+        yield raw.decode("utf-8", errors="replace"), pos
+
+
+def runtime_log_lines(name):
+    """Every line of the sandbox's runtime logs, oldest first. A file that
+    cannot be opened is skipped: msb rotates them away while a sandbox runs."""
+    for path in runtime_logs(name):
+        try:
+            fh = open(path, "rb")
+        except OSError:
+            continue
+        with fh:
+            for line, _ in log_lines(fh):
+                yield line
+
+
 def observed_hosts(name):
     """{(host, port): {hits, first, last}} — where this sandbox has been.
 
@@ -5886,23 +5911,17 @@ def observed_hosts(name):
         entry["hits"] += 1
         entry["last"] = when
 
-    for path in runtime_logs(name):
-        try:
-            fh = open(path, encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        with fh:
-            for line in fh:
-                stamp = LOG_STAMP.match(line)
-                when = f"{stamp.group(1)} {stamp.group(2)}" if stamp else "?"
-                tls = OBSERVED_TLS.search(line)
-                if tls:
-                    port = tls.group(2).rsplit(":", 1)[-1]
-                    record(tls.group(1), port if port.isdigit() else "", when)
-                elif "::dns::" in line:
-                    dns = OBSERVED_DNS.search(line)
-                    if dns:
-                        record(dns.group(1), "", when)
+    for line in runtime_log_lines(name):
+        stamp = LOG_STAMP.match(line)
+        when = f"{stamp.group(1)} {stamp.group(2)}" if stamp else "?"
+        tls = OBSERVED_TLS.search(line)
+        if tls:
+            port = tls.group(3).rsplit(":", 1)[-1]
+            record(tls.group(2), port if port.isdigit() else "", when)
+        elif "::dns::" in line:
+            dns = OBSERVED_DNS.search(line)
+            if dns:
+                record(dns.group(1), "", when)
     # A host reached over TLS also shows up in DNS. Keep the connection, which
     # names a port, and drop the bare lookup that says less about the same trip.
     with_port = {host for host, port in seen if port}
@@ -5926,24 +5945,18 @@ def secret_violations(name):
     there in enforce mode too, at msb's default verbosity.
     """
     hits = {}
-    for path in runtime_logs(name):
-        try:
-            fh = open(path, encoding="utf-8", errors="replace")
-        except OSError:
+    for line in runtime_log_lines(name):
+        if not SECRET_VIOLATION.search(line):
             continue
-        with fh:
-            for line in fh:
-                if not SECRET_VIOLATION.search(line):
-                    continue
-                field = dict(LOG_FIELD.findall(line))
-                stamp = LOG_STAMP.match(line)
-                key = (field.get("secret_env_var", "?"),
-                       field.get("host") or field.get("sni", "?"),
-                       field.get("location", "?"))
-                entry = hits.setdefault(key, {"hits": 0, "last": "?"})
-                entry["hits"] += 1
-                if stamp:
-                    entry["last"] = f"{stamp.group(1)} {stamp.group(2)}"
+        field = dict(LOG_FIELD.findall(line))
+        stamp = LOG_STAMP.match(line)
+        key = (field.get("secret_env_var", "?"),
+               field.get("host") or field.get("sni", "?"),
+               field.get("location", "?"))
+        entry = hits.setdefault(key, {"hits": 0, "last": "?"})
+        entry["hits"] += 1
+        if stamp:
+            entry["last"] = f"{stamp.group(1)} {stamp.group(2)}"
     return hits
 
 
@@ -12567,7 +12580,10 @@ MANAGED_HOST_KEYS = ("serve", "proxy_listen", "base_url", "port_pool", "proxy_po
 MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
 CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
                "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
-               "body_secret_hosts", "allow_nested_virt", "tls", "llms", "allow_upstream_ca")
+               "body_secret_hosts", "allow_nested_virt", "tls", "llms", "allow_upstream_ca",
+               "log_level")
+# msb's --log-level values (msb 0.7.16 `create --help`), quietest first.
+MSB_LOG_LEVELS = ("error", "warn", "info", "debug", "trace")
 # What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
 KANDEV_FIXED = {"name_prefix": "k-", "env_prefix": "AGENTCTL_", "guest_ports": list(KANDEV_GUEST_PORTS),
                 "require_callback": True, "body_secret_hosts": list(AGENT_TRANSCRIPT_HOSTS)}
@@ -12828,6 +12844,16 @@ def client_settings(config, name, operator=None):
     out["allow_upstream_ca"] = raw.get("allow_upstream_ca", True)
     if not isinstance(out["allow_upstream_ca"], bool):
         bad("allow_upstream_ca", "true or false")
+    # How much msb's runtime writes to each new sandbox's runtime.log: the
+    # operator's diagnostics, never the client's to choose or to see. msb
+    # keeps it in the sandbox's own config, so it holds across every start;
+    # a change reaches only sandboxes provisioned after it. Unset ("" too,
+    # which `host managed configure --log-level ''` writes): no flag, msb's
+    # own default.
+    level = raw.get("log_level", "")
+    if level != "" and level not in MSB_LOG_LEVELS:
+        bad("log_level", f"one of {', '.join(MSB_LOG_LEVELS)}")
+    out["log_level"] = level or None
 
     if name == "kandev":
         for key, fixed in KANDEV_FIXED.items():
@@ -13462,6 +13488,194 @@ def managed_llm_env(entry):
         raise KandevError("unavailable", f"the operator's key for {', '.join(missing)} is not stored "
                           "on this host any more")
     return values
+
+
+# ------------------------------------------------- a client's intercept log
+#
+# msb's runtime.log is the only record of where a sandbox went (see
+# OBSERVED_TLS), and it lives in the sandbox's own directory: `msb rm` takes
+# it away. So when msbctl stops a client's sandbox (`stop`), and just before
+# it removes one (`kandev_remove()`: purge, the reaper's expiry), it copies
+# the sandbox's intercept lines to its CLIENT's own log, one JSON object per
+# line, for the operator's tools to read instead of msb's directories. Only
+# for a sandbox provisioned at --log-level debug or trace (its entry's
+# log_level, intercept_logging()): msb writes no intercept line below that.
+# Deliberately not a live tail: msb keeps 10 MiB and three rotations, and
+# what it rotates away during a long run is not copied. Nor is what a
+# running sandbox logs between the copy and `msb rm`, or a VM removed
+# without msbctl (an orphan, `msb rm` by hand).
+#
+# What was copied is tracked per FILE, not by time: msb rotates by renaming,
+# so a file keeps its inode and its content. The marks, "inode:offset:head"
+# per file (head: a hash of its first bytes, so a reused inode is a new
+# file), are msbctl's own state in MANAGED_INTERCEPT_MARKS, never the
+# registry entry, which other verbs rewrite. A host clock that steps back,
+# or two lines in one microsecond, then loses nothing, and a copy reads only
+# what is new. Only complete lines are taken. A pass that sees msb rotate is
+# read again, so lines go out in msb's order. The log is written whole and
+# fsynced BEFORE the marks move, and marks that cannot be read count as none,
+# so a crash or a bad file repeats lines and never loses any or stops the
+# copying. Copies take MANAGED_INTERCEPT_LOCK (after kandev_lock() where the
+# caller holds that), never kandev_lock() itself: a stop does not wait on
+# the reaper.
+# A client decides how much its sandboxes connect, so the log is capped:
+# past MANAGED_INTERCEPT_MAX it becomes <client>.log.1 (one kept) and a new
+# one starts. Host-side only; no key of a client's reads it.
+MANAGED_INTERCEPT_DIR = os.path.join(STATE_DIR, "kandev", "intercepts")
+MANAGED_INTERCEPT_MARKS = os.path.join(STATE_DIR, "kandev", "intercept-marks")
+MANAGED_INTERCEPT_LOCK = os.path.join(STATE_DIR, "kandev", "intercepts.lock")
+MANAGED_INTERCEPT_MAX = 64 * 1024 * 1024
+INTERCEPT_HEAD = 256        # bytes of a file's start that identify it
+INTERCEPT_MARKS = 8         # msb keeps 4 files; a few more survive a rotation mid-copy
+INTERCEPT_LEVELS = ("debug", "trace")    # the levels msb logs an intercept at
+INTERCEPT_TRIES = 3
+
+
+def managed_intercept_log(client):
+    """The client's own log of its sandboxes' intercept lines."""
+    return os.path.join(MANAGED_INTERCEPT_DIR, f"{client}.log")
+
+
+def intercept_marks_path(name):
+    return os.path.join(MANAGED_INTERCEPT_MARKS, f"{name}.json")
+
+
+def intercept_logging(entry):
+    """Whether this client sandbox was made at a level msb logs intercepts at."""
+    return entry.get("log_level") in INTERCEPT_LEVELS
+
+
+def _intercept_head(start, offset):
+    """What identifies a file read up to `offset`: a hash of its first bytes."""
+    return hashlib.sha256(start[:min(offset, INTERCEPT_HEAD)]).hexdigest()[:16]
+
+
+def managed_save_intercepts(name, entry):
+    """Append the intercept lines `name` logged since the last copy to its
+    client's log, then move its marks. Nothing for a sandbox below debug, or
+    an entry naming no client this msbctl knows. Never stops what called it
+    (a stop, a purge, the reaper): a failure is said and the next copy
+    retries. Returns how many lines were saved."""
+    client = entry_client(entry)
+    if not client or not intercept_logging(entry):
+        return 0
+    try:
+        os.makedirs(MANAGED_INTERCEPT_DIR, mode=0o700, exist_ok=True)
+        with open(MANAGED_INTERCEPT_LOCK, "a", encoding="utf-8") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            return _save_intercepts(name, client, entry_env(entry))
+    except (OSError, KandevError) as exc:
+        # Under a client's key stderr reaches the client: no host path in it.
+        why = "" if restricted() else f" ({exc})"
+        warn(f"{name}: its intercept lines were not saved{why}; the next copy tries again")
+        return 0
+
+
+def _read_intercept_marks(name):
+    """{inode: (offset, head)} from the sandbox's marks file. One that cannot
+    be read as marks (a crash mid-write, a hand edit) counts as none: the
+    lines are copied again, which repeats them, rather than never again."""
+    try:
+        with open(intercept_marks_path(name), encoding="utf-8") as fh:
+            items = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except ValueError:
+        warn(f"{name}: its intercept marks did not read; its lines are copied again from the start")
+        return {}
+    marks = {}
+    for item in items if isinstance(items, list) else []:
+        parts = str(item).split(":")
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            marks[int(parts[0])] = (int(parts[1]), parts[2])
+    return marks
+
+
+def _intercept_pass(name, client, env, marks):
+    """One read of every runtime log from its mark: (rows, {inode: mark},
+    whether msb rotated meanwhile, so the pass is not in msb's order)."""
+    seen, rows, opened, rotated = {}, [], [], False
+    for log in runtime_logs(name):
+        try:
+            fh = open(log, "rb")
+        except OSError:
+            rotated = True      # rotated away since it was listed: read the rest
+            continue
+        with fh:
+            ino = os.fstat(fh.fileno()).st_ino
+            opened.append((log, ino))
+            if ino in seen:
+                rotated = True      # renamed under us
+                continue
+            offset, head = marks.get(ino, (0, ""))
+            start = fh.read(INTERCEPT_HEAD)
+            if not offset or _intercept_head(start, offset) != head:
+                offset = 0      # a file not seen before, or a reused inode
+            fh.seek(offset)
+            done = offset
+            for line, end in log_lines(fh, offset):
+                if not line.endswith("\n"):
+                    break       # msb is still writing it
+                done = end
+                hit = OBSERVED_TLS.search(line) if "TLS " in line else None
+                if hit:
+                    stamp = LOG_STAMP.match(line)
+                    rows.append(json.dumps({
+                        "time": line.split(None, 1)[0] if stamp else None, "client": client,
+                        "sandbox": name, "env": env, "event": hit.group(1), "sni": hit.group(2),
+                        "dst": hit.group(3), "line": line.rstrip("\r\n")}, sort_keys=True) + "\n")
+            seen[ino] = (done, _intercept_head(start, done))
+    now = []
+    for log in runtime_logs(name):
+        try:
+            now.append((log, os.stat(log).st_ino))
+        except OSError:
+            rotated = True
+    return rows, seen, rotated or now != opened
+
+
+def _write_all(fd, data):
+    """os.write until every byte is out: a short write is not an error."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _save_intercepts(name, client, env):
+    marks = _read_intercept_marks(name)
+    for _ in range(INTERCEPT_TRIES):
+        rows, seen, rotated = _intercept_pass(name, client, env, marks)
+        if not rotated:
+            break
+    # Files not seen keep their mark: one rotated away mid-pass (after the
+    # last try) is read next time from where it was left.
+    kept = {**seen, **{i: m for i, m in marks.items() if i not in seen}}
+    saved = [f"{i}:{o}:{h}" for i, (o, h) in list(kept.items())[:INTERCEPT_MARKS] if o]
+    if rows:
+        data = "".join(rows).encode()
+        target = managed_intercept_log(client)
+        with contextlib.suppress(FileNotFoundError):
+            size = os.path.getsize(target)
+            if size and size + len(data) > MANAGED_INTERCEPT_MAX:
+                os.replace(target, target + ".1")
+        fd = os.open(target, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            _write_all(fd, data)
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    if saved != [f"{i}:{o}:{h}" for i, (o, h) in marks.items()]:
+        os.makedirs(MANAGED_INTERCEPT_MARKS, mode=0o700, exist_ok=True)
+        path = intercept_marks_path(name)
+        tmp = f"{path}.{os.getpid()}.new"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            _write_all(fd, json.dumps(saved).encode())
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    return len(rows)
 
 
 UPSTREAM_CA_MAX = 8
@@ -14549,6 +14763,7 @@ def managed_provision(args, config, settings, dialect):
             ENV=toml_literal(env), OPERATION=toml_literal(op), DIGEST=toml_literal(digest),
             IMAGE=toml_literal(image), CPUS=cpus, MEMORY=f"{mem}M", DISK=f"{disk}G",
             WORKSPACE=f"{workspace}G", NESTED_VIRT=toml_literal(nested),
+            LOG_LEVEL=toml_literal(settings.get("log_level") or ""),
             CREATED=iso(now), EXPIRES=iso(expires), INCARNATION=os.urandom(8).hex(),
             PORTS=format_list("ports", ports, ""), SERVE=toml_literal(settings["serve"]),
             PROXY_PORTS=f"proxy_ports = {toml_literal(public)}",
@@ -14608,6 +14823,10 @@ def managed_provision(args, config, settings, dialect):
     # Always stated: KVM exactly when this provision asked and was allowed it,
     # whatever [defaults] or msb's own sandbox_defaults say.
     argv += [f"--nested-virt={'true' if nested else 'false'}"]
+    # The operator's choice from the client's table; absent, no flag at all,
+    # as protocol 1's provisions have always been made.
+    if settings.get("log_level"):
+        argv += ["--log-level", settings["log_level"]]
     if private:
         # msb has no per-name exemption: off for the VM, and KANDEV_PRIVATE_DENY
         # in the rules above stands in for it for every name but those.
@@ -14852,9 +15071,13 @@ def kandev_remove(name, entry, labelled):
             client = entry_client(entry)
             raise KandevError("conflict", f"{name} exists without the "
                               f"{'Kandev' if client == 'kandev' else client} label — left alone")
+        # Last chance: `msb rm` takes runtime.log with it.
+        managed_save_intercepts(name, entry)
         if run(["msb", "rm", "-f", name], check=False, quiet=True).returncode != 0:
             raise KandevError("unavailable", "msb rm failed — the entry is kept for a retry")
     shutil.rmtree(managed_ca_dir(name), ignore_errors=True)
+    with contextlib.suppress(FileNotFoundError):
+        os.remove(intercept_marks_path(name))
     os.remove(registry_path_for(name))
 
 
@@ -15618,11 +15841,12 @@ MANAGED_CONFIGURE_CLIENT_KEYS = (("enabled", "enabled"), ("max_sandboxes", "max_
                                  ("guest_ports", "guest_ports"), ("require_callback", "require_callback"),
                                  ("body_secret_hosts", "body_secret_hosts"),
                                  ("allow_nested_virt", "allow_nested_virt"), ("tls", "tls"),
-                                 ("llms", "llms"), ("allow_upstream_ca", "allow_upstream_ca"))
+                                 ("llms", "llms"), ("allow_upstream_ca", "allow_upstream_ca"),
+                                 ("log_level", "log_level"))
 MANAGED_CONFIGURE_FLAGS = ("enabled", "serve", "proxy_listen", "base_url", "allow_extra", "private_names",
                            "max_sandboxes", "max_cpus", "max_memory", "name_prefix", "env_prefix",
                            "guest_ports", "require_callback", "body_secret_hosts", "allow_nested_virt",
-                           "tls", "llms", "allow_upstream_ca")
+                           "tls", "llms", "allow_upstream_ca", "log_level")
 
 
 def managed_configure(args):
@@ -15654,6 +15878,8 @@ def managed_configure(args):
             continue
         if key in ("allow_extra", "private_names", "body_secret_hosts", "llms"):
             value = [e for e in value if e.strip()]
+        if key == "log_level" and not value.strip():
+            value = None        # '' unsets it: the key leaves the table
         changes.append((key, value))
     ensure_local_config()
     target = os.path.realpath(CONFIG_FILE)
@@ -17711,6 +17937,9 @@ def build_parser():
     p.add_argument("--allow-upstream-ca", action=argparse.BooleanOptionalAction, default=None,
                    help="managed configure --client: whether its provisions may send a CA for one of "
                    "their own hosts (on unless set false)")
+    p.add_argument("--log-level", metavar="LEVEL",
+                   help="managed configure --client: msb's --log-level for its new sandboxes "
+                   f"({', '.join(MSB_LOG_LEVELS)}); '' unsets it")
     p.add_argument("--body-secret-host", dest="body_secret_hosts", action="append", metavar="HOST",
                    help="managed configure --client: the whole body_secret_hosts list, one host per "
                    "flag; '' alone empties it")

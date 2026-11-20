@@ -54,6 +54,7 @@ key could not get past.
 | Model endpoints | `[llm.<name>]`: host, port, CA, private name and key, all stored here; `llms` grants them | picks granted ones (`llms`) | reaches them; never sees the key |
 | Trusting a CA | `allow_upstream_ca` (on); never for an endpoint whose key it holds | sends one for its own hosts (`upstream_ca`) | – |
 | `/dev/kvm` | `allow_nested_virt` | asks for it (`nested_virt`) | gets it only then |
+| msb's log level | `log_level` | – | – |
 | Image, env, ports, lease | – | its choice (`guest_ports` default from its table) | – |
 | The proxy's certificate | gives it to one client (`tls`) | that client installs it (`tls install`) | – |
 | The proxy, msbctl itself | `restart-proxy`, `self-update` (and Kandev's key) | – | – |
@@ -116,6 +117,7 @@ groups, and is off until `enabled = true`.
 | `tls` | `false` | whether its key may install the proxy's certificate; see [below](#the-proxys-certificate). One client at most, and never set in Kandev's table |
 | `llms` | `[]` | `[llm.<name>]` endpoints of this host its provisions may pick; see [below](#model-endpoints) |
 | `allow_upstream_ca` | `true` | whether its provisions may send a CA to trust for one of their own hosts; see [below](#a-servers-own-ca) |
+| `log_level` | unset | msb's `--log-level` for each sandbox it provisions: `error`, `warn`, `info`, `debug` or `trace`, written to that sandbox's `runtime.log` (at `debug` and `trace`, the intercept lines msbctl [keeps](#where-its-sandboxes-went)). msb keeps it for the sandbox's life, so a change reaches only sandboxes provisioned after it. Unset, no flag is passed and msb's own default holds. Kandev's table may set it too |
 
 Kandev's own table is `[kandev]`, or `[clients.kandev]`, but not both. Its
 `name_prefix`, `env_prefix`, `guest_ports`, `require_callback` and
@@ -248,6 +250,48 @@ for a secret bound to `llm.example.org`) has that port intercepted too, or the
 secret would never be substituted there. Interception is per port, not per
 host: any other host reached on that port is intercepted as well, and one with
 a private certificate then needs its CA here.
+
+## Where its sandboxes went
+
+msb records each HTTPS connection it intercepts in the sandbox's own
+`runtime.log` (`TLS intercept sni=<host> dst=<ip:port>`, or `TLS bypass` for
+one it passes through), but only at `--log-level debug` or `trace`. That file
+lives in msb's directory for the sandbox, which `msb rm` deletes, and msb keeps
+only its last 40 MiB.
+
+So for a sandbox provisioned while its client's `log_level` was `debug` or
+`trace` (its registry entry records it), msbctl appends its intercept lines to
+the client's own log, `~/.local/state/msb/kandev/intercepts/<client>.log` (under
+`MSB_STATE_DIR` if set; Kandev's is `kandev.log`), when it stops the sandbox
+(`stop`) and just before a purge or the reaper (at expiry) removes it. A
+sandbox provisioned at another level is never read. The log has one JSON object
+per line:
+
+```json
+{"client": "ci", "dst": "192.0.2.7:443", "env": "e1", "event": "intercept", "line": "2026-11-20T10:00:00.512345Z DEBUG … TLS intercept sni=pypi.org dst=192.0.2.7:443", "sandbox": "c-e1", "sni": "pypi.org", "time": "2026-11-20T10:00:00.512345Z"}
+```
+
+`line` is msb's own line, verbatim; `time` is its timestamp, or `null` for a
+line without one. Lines are in msb's order. Each copy takes only what msb wrote
+since the last, tracked by position in each of msb's files rather than by time
+(in `~/.local/state/msb/kandev/intercept-marks/`), so nothing is copied twice
+and a host clock that steps back loses nothing. The log is written before the
+positions are recorded, and positions that cannot be read count as none: a
+crash can repeat lines, never lose them.
+
+It is a copy at stop and removal, not a live record. Not copied:
+
+- what msb rotates away while the sandbox runs, past its last 40 MiB: stop it
+  now and then if it runs long at `debug` or `trace`;
+- what a running sandbox logs between the copy and its removal;
+- a VM removed without msbctl: an orphan the reaper finds, or `msb rm` by
+  hand.
+
+Past 64 MiB the log becomes `<client>.log.1`, replacing the one before, and a
+new one starts: read `.1` first, then the log. It is the operator's, mode 0600;
+no client's key reads it. A copy that fails (a full disk, say) stops nothing:
+it is said on stderr, and the next copy tries again. Under a client's key that
+message names no path on this host.
 
 ## Protocol 2
 
