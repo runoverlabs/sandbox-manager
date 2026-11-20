@@ -8,6 +8,8 @@ release notes.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-20
+
 ### Added
 - `[clients.NAME] log_level` (and Kandev's table) sets msb's `--log-level` for each sandbox that client provisions from then on, so its sandboxes can start at `debug`; `msbctl host managed configure --client NAME --log-level debug` sets it, `--log-level ''` unsets it.
 - For a client sandbox provisioned at `log_level` `debug` or `trace`, msbctl appends its intercept lines (msb's `TLS intercept`/`TLS bypass`) to the client's own log, `<state dir>/kandev/intercepts/<client>.log`, one JSON object per line in msb's order, when it stops the sandbox and just before a purge or the reaper removes it. Nothing is copied twice, and the log rolls over to `.1` at 64 MiB.
