@@ -32,6 +32,10 @@ workspace_disk = "{{WORKSPACE}}"
 # /dev/kvm in the guest: what the provision asked for, granted only where the
 # client's table sets allow_nested_virt. Never from this host's defaults.
 nested_virt    = {{NESTED_VIRT}}
+# msb's --log-level when it was made ([clients.<name>] log_level; "" for msb's
+# default). msb keeps it for the sandbox's life. At debug or trace msbctl copies
+# its intercept lines to the client's log (stop, purge, the reaper).
+log_level      = {{LOG_LEVEL}}
 created_at     = "{{CREATED}}"
 # Drawn at provision; with created_at, what a lease token is bound to (one
 # provision of this name, through stops and starts).

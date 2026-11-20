@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 
 MIB = 1024 * 1024
@@ -211,6 +212,9 @@ def main():
         if state.pop(name, None) is None:
             sys.exit(f"fake msb: no sandbox {name}")
         state.get("_labels", {}).pop(name, None)
+        # As msb does: the sandbox's directory, runtime.log with it, goes too.
+        if os.environ.get("MSB_HOME"):
+            shutil.rmtree(os.path.join(os.environ["MSB_HOME"], "sandboxes", name), ignore_errors=True)
     elif verb == ["exec"]:
         sys.stdout.write(os.environ.get("FAKE_MSB_EXEC_OUT", ""))
     elif verb == ["modify"]:

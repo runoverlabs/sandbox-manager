@@ -606,6 +606,30 @@ class Provisioning(ManagedTest):
         argv = self.msb_calls("create")[0]["argv"]
         self.assertEqual(argv[argv.index("--secret") + 1], "LLM_KEY@llm.example.org")
 
+    def test_log_level(self):
+        # Unset: no flag, msb's own default, as every provision before it.
+        self.ci_provision()
+        self.assertNotIn("--log-level", self.msb_calls("create")[0]["argv"])
+        self.ci_table = CI + 'log_level = "debug"\n'
+        self.configure()
+        self.ci_provision("e2", operation_id="op-c2")
+        argv = self.msb_calls("create")[-1]["argv"]
+        self.assertEqual(argv[argv.index("--log-level") + 1], "debug")
+        # The operator's diagnostics: nothing the client is told.
+        self.assertNotIn("log_level", self.ci_ok("managed", "health")["client_settings"])
+        # Kandev's table too, for protocol 1 and 2 alike.
+        self.configure(log_level='"trace"')
+        self.provision("k1", operation_id="op-k1")
+        argv = self.msb_calls("create")[-1]["argv"]
+        self.assertEqual(argv[argv.index("--log-level") + 1], "trace")
+
+    def test_log_level_not_one_of_msbs(self):
+        for value in ('"verbose"', '"DEBUG"', "3"):
+            with self.subTest(value=value):
+                self.ci_table = CI + f"log_level = {value}\n"
+                self.configure()
+                self.assertIn("log_level", self.ci_error("invalid_config", "managed", "health")["message"])
+
     def test_idempotent_and_conflicts(self):
         first = self.ci_provision()
         self.assertEqual(self.ci_provision(), first)
@@ -1516,6 +1540,21 @@ class Configure(ManagedTest):
         self.assertEqual(code, 0, doc)
         self.assertIn("allow_nested_virt = false", self.text())
 
+    def test_log_level(self):
+        code, doc = self.configure_json("--client", "ci", "--enabled", "--log-level", "debug")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual(doc["settings"]["log_level"], "debug")
+        self.assertIn('log_level = "debug"', self.text())
+        code, doc = self.configure_json("--client", "ci", "--log-level", "loud")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+        self.assertIn('log_level = "debug"', self.text())
+        code, doc = self.configure_json("--client", "ci", "--log-level", "")
+        self.assertEqual(code, 0, doc)
+        self.assertEqual((doc["changed"], doc["settings"]["log_level"]), (["log_level"], None))
+        self.assertNotIn("log_level", self.text())
+        code, doc = self.configure_json("--log-level", "debug")
+        self.assertEqual((code, doc["error"]["code"]), (3, "invalid_config"), doc)
+
     def test_a_client_table(self):
         code, doc = self.configure_json("--client", "ci", "--enabled", "--env-prefix", "CI_",
                                         "--guest-port", "8765", "--allow-extra", "*.example.org",
@@ -1798,6 +1837,266 @@ LAN_LLM = "llm.lan.example.org"
 def create_flags(argv, flag):
     """Every value `flag` takes in one msb argv."""
     return [argv[i + 1] for i, a in enumerate(argv) if a == flag]
+
+
+def runtime_line(stamp, text):
+    return f"{stamp}  DEBUG microsandbox_network::engine::tls::proxy: {text}\n"
+
+
+class InterceptLog(ManagedTest):
+    """Each client's durable copy of its sandboxes' intercept lines, made
+    when msbctl stops or removes one (runtime.log goes with `msb rm`) and on
+    every reaper pass, for a sandbox provisioned at debug or trace."""
+
+    ci_table = CI + 'log_level = "debug"\n'
+
+    def setUp(self):
+        super().setUp()
+        self.configure(log_level='"debug"')
+
+    def marks(self, name="c-e1"):
+        try:
+            with open(self.m.intercept_marks_path(name), encoding="utf-8") as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            return None
+
+    def write_runtime(self, name, text, rotated=None):
+        folder = os.path.join(os.environ["MSB_HOME"], "sandboxes", name, "logs")
+        os.makedirs(folder, exist_ok=True)
+        with open(os.path.join(folder, "runtime.log"), "a", encoding="utf-8") as fh:
+            fh.write(text)
+        if rotated is not None:
+            with open(os.path.join(folder, "runtime.log.1"), "w", encoding="utf-8") as fh:
+                fh.write(rotated)
+
+    def saved(self, client="ci"):
+        try:
+            with open(self.m.managed_intercept_log(client), encoding="utf-8") as fh:
+                return [json.loads(line) for line in fh]
+        except FileNotFoundError:
+            return []
+
+    def logs_dir(self, name="c-e1"):
+        return os.path.join(os.environ["MSB_HOME"], "sandboxes", name, "logs")
+
+    def test_stop_copies_only_whats_new(self):
+        self.ci_provision()
+        older = runtime_line("2026-11-20T09:59:59.000001Z", "TLS intercept sni=old.example.org dst=192.0.2.1:443")
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.5Z",
+                                                "TLS intercept sni=pypi.org dst=192.0.2.7:443")
+                           + runtime_line("2026-11-20T10:00:01.000000Z", "DNS query domain=pypi.org")
+                           + "no stamp: TLS intercept sni=x.example.org dst=192.0.2.9:443\n"
+                           + runtime_line("2026-11-20T10:00:02.000000Z",
+                                          "TLS bypass sni=llm.example.org dst=192.0.2.8:8443"),
+                           rotated=older)
+        self.ci_ok("stop", "c-e1", "--json")
+        rows = self.saved()
+        self.assertEqual([(r["event"], r["sni"], r["dst"]) for r in rows], [
+            ("intercept", "old.example.org", "192.0.2.1:443"), ("intercept", "pypi.org", "192.0.2.7:443"),
+            ("intercept", "x.example.org", "192.0.2.9:443"), ("bypass", "llm.example.org", "192.0.2.8:8443")])
+        self.assertEqual({(r["client"], r["sandbox"], r["env"]) for r in rows}, {("ci", "c-e1", "e1")})
+        # A line without msb's stamp is kept, with no time, never dropped.
+        self.assertEqual([r["time"] for r in rows], ["2026-11-20T09:59:59.000001Z", "2026-11-20T10:00:00.5Z",
+                                                     None, "2026-11-20T10:00:02.000000Z"])
+        self.assertTrue(rows[1]["line"].endswith("dst=192.0.2.7:443"))
+        self.assertEqual(os.stat(self.m.managed_intercept_log("ci")).st_mode & 0o777, 0o600)
+        # msb appends across starts: a second stop copies the new lines only.
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual(len(self.saved()), 4)
+        self.write_runtime("c-e1", runtime_line("2026-11-20T11:00:00.000000Z",
+                                                "TLS intercept sni=github.com dst=192.0.2.10:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()][4:], ["github.com"])
+
+    def test_by_position_not_by_clock(self):
+        # The host clock stepped back, and a line shares the last one's stamp:
+        # both are new lines, and both are kept.
+        self.ci_provision()
+        stamp = "2026-11-20T10:00:05.000000Z"
+        self.write_runtime("c-e1", runtime_line(stamp, "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        self.write_runtime("c-e1", runtime_line(stamp, "TLS intercept sni=b.example.org dst=192.0.2.1:443")
+                           + runtime_line("2026-11-20T09:59:40.000000Z",
+                                          "TLS intercept sni=c.example.org dst=192.0.2.1:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org", "b.example.org", "c.example.org"])
+
+    def test_a_rotation_by_rename_copies_nothing_twice(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        log = os.path.join(self.logs_dir(), "runtime.log")
+        with open(log, "a", encoding="utf-8") as fh:
+            fh.write(runtime_line("2026-11-20T10:00:01.000000Z", "TLS intercept sni=b.example.org dst=192.0.2.1:443"))
+        os.rename(log, log + ".1")                                  # as msb rotates
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:02.000000Z",
+                                                "TLS intercept sni=c.example.org dst=192.0.2.1:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org", "b.example.org", "c.example.org"])
+
+    def test_a_line_msb_is_still_writing_waits(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443")
+                           + "2026-11-20T10:00:01.000000Z  DEBUG …: TLS intercept sni=b.exa")
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org"])
+        self.write_runtime("c-e1", "mple.org dst=192.0.2.1:443\n")
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org", "b.example.org"])
+
+    def test_purge_and_reap_copy_before_msb_removes_the_log(self):
+        self.ci_provision()
+        self.ci_provision("e2", operation_id="op-c2")
+        self.provision("p1", operation_id="op-kp1")
+        for name, host in (("c-e1", "a.example.org"), ("c-e2", "b.example.org"), ("k-p1", "c.example.org")):
+            self.write_runtime(name, runtime_line("2026-11-20T10:00:00.000000Z",
+                                                  f"TLS intercept sni={host} dst=192.0.2.1:443"))
+        self.assertEqual(self.ci_ok("purge", "c-e1", "-y", "--json")["purged"], ["c-e1"])
+        self.assertFalse(os.path.isdir(os.path.join(os.environ["MSB_HOME"], "sandboxes", "c-e1")))
+        for name in ("c-e2", "k-p1"):
+            self.m.set_toml_key(self.entry_path(name), "expires_at", "2001-01-01T00:00:00Z")
+        self.assertEqual(sorted(self.reap()["destroyed"]), ["c-e2", "k-p1"])
+        # Per client: Kandev's sandbox goes to Kandev's log, never ci's.
+        self.assertEqual([(r["sandbox"], r["sni"]) for r in self.saved()],
+                         [("c-e1", "a.example.org"), ("c-e2", "b.example.org")])
+        self.assertEqual([(r["sandbox"], r["env"]) for r in self.saved("kandev")], [("k-p1", "p1")])
+
+    def test_capped_with_one_rotation(self):
+        self.ci_provision()
+        line = runtime_line("2026-11-20T10:00:00.000000Z", "TLS intercept sni=pypi.org dst=192.0.2.7:443")
+        self.write_runtime("c-e1", line)
+        self.ci_ok("stop", "c-e1", "--json")
+        size = os.path.getsize(self.m.managed_intercept_log("ci"))
+        self.write_runtime("c-e1", line.replace("10:00:00", "10:00:01"))
+        with mock.patch.object(self.m, "MANAGED_INTERCEPT_MAX", size + 1):
+            self.ci_ok("stop", "c-e1", "--json")
+        log = self.m.managed_intercept_log("ci")
+        with open(log + ".1", encoding="utf-8") as fh:
+            self.assertEqual(json.loads(fh.read())["time"], "2026-11-20T10:00:00.000000Z")
+        self.assertEqual([r["time"] for r in self.saved()], ["2026-11-20T10:00:01.000000Z"])
+
+    def test_an_unreadable_file_skips_only_itself(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        gone = os.path.join(self.logs_dir(), "runtime.log.1")     # rotated away after listing
+        listed = self.m.runtime_logs("c-e1")
+        with mock.patch.object(self.m, "runtime_logs", lambda name: [gone, *listed]):
+            self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org"])
+
+    def test_a_failed_copy_stops_nothing_and_names_no_host_path_to_a_client(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=pypi.org dst=192.0.2.7:443"))
+        os.makedirs(os.path.dirname(self.m.MANAGED_INTERCEPT_DIR), exist_ok=True)
+        with open(self.m.MANAGED_INTERCEPT_DIR, "w", encoding="utf-8"):
+            pass                                    # a file where the folder goes
+        said = []
+        with mock.patch.object(self.m, "warn", said.append):
+            self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual(len(said), 1)
+        self.assertNotIn(self.m.STATE_DIR, said[0])
+        self.assertIsNone(self.marks())
+        said.clear()
+        with mock.patch.object(self.m, "warn", said.append):     # the operator is told why
+            code, _ = self.msbctl_json("stop", "c-e1", "--json", plugin=False)
+        self.assertEqual(code, 0)
+        self.assertIn(self.m.MANAGED_INTERCEPT_DIR, said[0])
+        self.assertEqual(self.ci_ok("purge", "c-e1", "-y", "--json")["purged"], ["c-e1"])
+
+    def test_nothing_to_copy_writes_nothing(self):
+        self.ci_provision()
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertFalse(os.path.exists(self.m.managed_intercept_log("ci")))
+        self.assertIsNone(self.marks())
+
+    def test_below_debug_nothing_is_read(self):
+        self.ci_table = CI
+        self.configure()
+        self.ci_provision()
+        self.assertEqual(self.m.read_toml(self.entry_path("c-e1"))["log_level"], "")
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        self.reap()
+        self.ci_ok("stop", "c-e1", "--json")
+        self.ci_ok("managed", "start", "e1", stdin=json.dumps({"secrets": [
+            {"name": "LLM_KEY", "value": PLANTED_CI, "hosts": ["llm.example.org"]}]}) + "\n")
+        stops = len(self.msb_calls("stop"))
+        self.ci_ok("purge", "c-e1", "-y", "--json")
+        self.assertEqual((self.saved(), self.marks()), ([], None))
+        self.assertEqual(len(self.msb_calls("stop")), stops)     # removed as before: no stop first
+
+    def test_purge_copies_before_msb_removes_the_log(self):
+        self.ci_provision()
+        self.assertEqual(self.m.read_toml(self.entry_path("c-e1"))["log_level"], "debug")
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        self.reap()                                              # a running sandbox: not read
+        self.assertEqual((self.saved(), self.marks()), ([], None))
+        self.ci_ok("purge", "c-e1", "-y", "--json")
+        self.assertEqual(self.msb_calls("stop"), [])             # removed as before: no stop first
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org"])
+        self.assertIsNone(self.marks())                          # gone with the sandbox
+
+    def test_marks_that_do_not_read_copy_again_not_never(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        self.ci_ok("stop", "c-e1", "--json")
+        with open(self.m.intercept_marks_path("c-e1"), "w", encoding="utf-8") as fh:
+            fh.write('["12:3')                                   # a crash mid-write
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org", "a.example.org"])
+        self.assertIsNotNone(self.marks())                       # and repaired
+        self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual(len(self.saved()), 2)
+
+    def test_a_short_write_is_finished_not_lost(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", "".join(runtime_line(f"2026-11-20T10:00:0{i}.000000Z",
+                                                        f"TLS intercept sni=h{i}.example.org dst=192.0.2.1:443")
+                                           for i in range(5)))
+        real = os.write
+        with mock.patch.object(self.m.os, "write", lambda fd, data: real(fd, bytes(data[:7]))):
+            self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual([r["sni"] for r in self.saved()], [f"h{i}.example.org" for i in range(5)])
+
+    def test_an_entry_with_no_client_is_never_copied(self):
+        self.ci_provision()
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        entry = {**self.m.read_toml(self.entry_path("c-e1")), "client": "Not A Client"}
+        self.assertIsNone(self.m.entry_client(entry))
+        self.assertEqual(self.m.managed_save_intercepts("c-e1", entry), 0)
+        self.assertEqual(os.listdir(self.m.MANAGED_INTERCEPT_DIR) if os.path.isdir(
+            self.m.MANAGED_INTERCEPT_DIR) else [], [])
+
+    def test_a_rotation_during_a_pass_reads_it_again_in_order(self):
+        self.ci_provision()
+        log = os.path.join(self.logs_dir(), "runtime.log")
+        self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:00.000000Z",
+                                                "TLS intercept sni=a.example.org dst=192.0.2.1:443"))
+        real, calls = self.m.runtime_logs, []
+
+        def rotating(name):
+            calls.append(name)
+            if len(calls) == 2:     # the check after the first pass: msb rotated meanwhile
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(runtime_line("2026-11-20T10:00:01.000000Z",
+                                          "TLS intercept sni=b.example.org dst=192.0.2.1:443"))
+                os.rename(log, log + ".1")
+                self.write_runtime("c-e1", runtime_line("2026-11-20T10:00:02.000000Z",
+                                                        "TLS intercept sni=c.example.org dst=192.0.2.1:443"))
+            return real(name)
+
+        with mock.patch.object(self.m, "runtime_logs", rotating):
+            self.ci_ok("stop", "c-e1", "--json")
+        self.assertEqual(len(calls), 4)                          # read twice, checked twice
+        self.assertEqual([r["sni"] for r in self.saved()], ["a.example.org", "b.example.org", "c.example.org"])
 
 
 class HostHeldEndpoints(ManagedTest):

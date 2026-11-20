@@ -644,6 +644,7 @@ For running this machine as a [remote host](remote-hosts.md). Under
 | `--tls`, `--no-tls` | `managed configure --client`: whether its key installs the proxy's certificate (`tls`; one client at most, Kandev's while none is given it) |
 | `--llm NAME` | `managed configure --client`: the whole `llms` list, one `[llm.NAME]` endpoint per flag, that its provisions may pick; `''` alone empties it |
 | `--allow-upstream-ca`, `--no-allow-upstream-ca` | `managed configure --client`: whether its provisions may send a CA for one of their own hosts (`allow_upstream_ca`, on unless set false) |
+| `--log-level LEVEL` | `managed configure --client`: msb's `--log-level` for the sandboxes it provisions from now on (`log_level`: `error`, `warn`, `info`, `debug` or `trace`); `''` unsets it |
 | `--body-secret-host HOST` | `managed configure --client`: the whole `body_secret_hosts` list, one host per flag; `''` alone empties it |
 | `--enabled`, `--no-enabled` | `kandev configure`: `[kandev] enabled` |
 | `--serve MODE` | `kandev configure`: `proxy`, `tailscale` or `none` |
