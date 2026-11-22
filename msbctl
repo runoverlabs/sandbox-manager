@@ -83,6 +83,7 @@ import signal
 import socket
 import socketserver
 import ssl
+import stat
 import struct
 import subprocess
 import sys
@@ -12413,8 +12414,15 @@ KANDEV_GUEST_PORTS = (8765, 41001, 41002, 41003)
 KANDEV_ENV = re.compile(r"[A-Za-z0-9_-]{1,128}")
 # Short enough for msb's hostname (64 bytes) and its runtime socket paths.
 KANDEV_NAME_MAX = 40
+# Protocol 2 only (protocol 1 never raises them): host_secret_unavailable,
+# a host secret's source has no value to give (host_secret_values());
+# host_secret_changed, a sandbox's host secret is no longer declared as it
+# was at provision (managed_host_secrets_held()). Not `denied`, which a
+# client takes as final: this one it answers by purging and provisioning
+# again.
 KANDEV_ERROR_CODES = ("invalid_config", "denied", "unsupported", "not_found", "expired",
-                      "conflict", "unavailable", "rate_limited", "cleanup_pending")
+                      "conflict", "unavailable", "rate_limited", "cleanup_pending",
+                      "host_secret_unavailable", "host_secret_changed")
 KANDEV_EXIT_ERROR = 3
 KANDEV_HEADER_MAX = 64 * 1024
 KANDEV_AGENTCTL_MAX = 512 * 1024 * 1024
@@ -12463,7 +12471,12 @@ KANDEV_FEATURES = ("workspace_disk", "private_names", "serve_ports", "managed_na
 # (client_settings lists them). `upstream_ca`: it may send a CA for one of its
 # own hosts (where allow_upstream_ca). `secret_ports`: a secret allowed on a
 # port besides 443 is substituted there.
-MANAGED_FEATURES = ("secret_headers", "live_secrets", "llms", "upstream_ca", "secret_ports")
+# `host_secrets`: a secret may be `{"name", "host_ref"}`, no value: one this
+# host holds and declares ([clients.NAME.host_secrets.REF]), listed in
+# health's `host_secrets` with its hosts and headers and whether its source
+# has a value now (never the value or where it is).
+MANAGED_FEATURES = ("secret_headers", "live_secrets", "llms", "upstream_ca", "secret_ports",
+                    "host_secrets")
 # What a sandbox with `private_names` denies in place of msb's DNS rebind
 # protection, which it has to turn off: every destination group msb knows but
 # `public` (the gateway, cloud metadata, loopback, RFC 1918 + CGNAT + ULA,
@@ -12581,7 +12594,7 @@ MANAGED_HOST_TOTALS = ("max_sandboxes", "max_cpus", "max_memory")
 CLIENT_KEYS = ("enabled", "max_sandboxes", "max_cpus", "max_memory", "rule_groups", "allow_extra",
                "private_names", "name_prefix", "env_prefix", "guest_ports", "require_callback",
                "body_secret_hosts", "allow_nested_virt", "tls", "llms", "allow_upstream_ca",
-               "log_level")
+               "log_level", "host_secrets")
 # msb's --log-level values (msb 0.7.16 `create --help`), quietest first.
 MSB_LOG_LEVELS = ("error", "warn", "info", "debug", "trace")
 # What Kandev's plugin has always had, and must keep: protocol 1 is frozen.
@@ -12595,6 +12608,95 @@ CLIENT_PREFIX = re.compile(r"[a-z][a-z0-9]{0,6}-")
 CLIENT_ENV_PREFIX = re.compile(r"[A-Z][A-Z0-9]*_")
 CLIENT_ENV_PREFIX_REFUSED = ("MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_")
 CLIENT_MAX_PORTS = 4
+
+
+# [clients.NAME.host_secrets.REF]: a secret this HOST holds, bound into a
+# client's sandbox when its request names it (`"host_ref": REF`, no value),
+# so a client can use one without ever holding it (an employee's own Claude
+# subscription token, which its terms let no third party collect, store or
+# intermediate). Where it may be sent (`hosts`) and in which headers
+# (`headers`) are the host's, never the request's: a client that could widen
+# them would have it substituted toward its own server and read it back. So a
+# request that states other hosts or headers is refused, never narrowed or
+# widened. `env` is the placeholder's name in the guest; the host's own config
+# is the authority for it, so a name reserved for CLIENT secrets
+# (CLAUDE_CODE_OAUTH_TOKEN, ANTHROPIC_AUTH_TOKEN) is fine here. Refused are
+# only names that would change how the `msb` process (or the loader) runs,
+# since the value goes into its environment, and LLM_KEY_* (the operator's
+# endpoint keys share that environment). `source` is where it is read, at
+# every provision, start and rotation, and nowhere kept:
+#   file:/abs/path        a regular file of this user's, mode 0600 or tighter
+#                         (anything wider is refused, not fixed); one line
+#   keyring:SERVICE/USERNAME  the Secret Service item with the attributes
+#                         `service` SERVICE and `username` USERNAME: what
+#                         Python's keyring and Go's go-keyring store, or
+#                         `secret-tool store --label=... service S username U`
+#                         (its unlock prompt as for any keyring use)
+HOST_SECRET_REF = re.compile(r"[a-z][a-z0-9_-]{0,31}")
+HOST_SECRET_KEYS = ("env", "source", "hosts", "headers")
+HOST_SECRET_REFUSED_NAMES = {"PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "PWD", "TERM", "LANG"}
+HOST_SECRET_REFUSED_PREFIXES = ("MSB_", "MSBCTL_", "LD_", "SSH_", "XDG_", "LC_", LLM_KEY_PREFIX)
+HOST_SECRET_KEYRING = re.compile(r"keyring:([^/\s]{1,128})/([^/\s]{1,128})")
+HOST_SECRET_FILE_MAX = 16 * 1024
+
+
+def host_secret_source(text):
+    """("file", path, "") or ("keyring", service, username) from a `source`,
+    or None: always three, so every reader unpacks one shape."""
+    if not isinstance(text, str):
+        return None
+    if text.startswith("file:"):
+        path = os.path.expanduser(text[len("file:"):])
+        return ("file", os.path.normpath(path), "") if os.path.isabs(path) and "\0" not in path else None
+    found = HOST_SECRET_KEYRING.fullmatch(text)
+    return ("keyring", found.group(1), found.group(2)) if found else None
+
+
+def host_secrets_setting(table, raw, env_prefix):
+    """A client table's `host_secrets`, checked: {ref: {env, source, hosts,
+    headers}}. Messages never quote a `source`: under a client's key they
+    reach the client, and a source names a path on this host."""
+    def bad(where, why):
+        _settings_bad(table, where, why)
+
+    if not isinstance(raw, dict):
+        bad("host_secrets", "a table of [" + table + ".host_secrets.REF] tables")
+    out, envs = {}, {}
+    for ref, spec in raw.items():
+        where = f"host_secrets.{ref}"
+        if not HOST_SECRET_REF.fullmatch(ref):
+            bad(where, "a ref is a-z first, then up to 31 of a-z 0-9 _ -")
+        if not isinstance(spec, dict):
+            bad(where, "a table with env, source, hosts and headers")
+        unknown = sorted(k for k in spec if k not in HOST_SECRET_KEYS)
+        if unknown:
+            bad(f"{where}.{unknown[0]}", f"not a host secret key; one of {', '.join(HOST_SECRET_KEYS)}")
+        env = spec.get("env")
+        if not isinstance(env, str) or not ENV_NAME.fullmatch(env):
+            bad(f"{where}.env", "a variable name (A-Z, 0-9, _)")
+        if env in HOST_SECRET_REFUSED_NAMES or env.startswith(HOST_SECRET_REFUSED_PREFIXES + (env_prefix,)):
+            bad(f"{where}.env", f"{env} would change how msb runs, or is another binding's "
+                f"(never {', '.join(HOST_SECRET_REFUSED_PREFIXES)}, the client's {env_prefix} or PATH-like names)")
+        if env in envs:
+            bad(f"{where}.env", f"{env} is also host_secrets.{envs[env]}'s")
+        envs[env] = ref
+        source = host_secret_source(spec.get("source"))
+        if source is None:
+            bad(f"{where}.source", '"file:/absolute/path" or "keyring:SERVICE/USERNAME"')
+        hosts = spec.get("hosts")
+        if not isinstance(hosts, list) or not hosts or any(
+                not isinstance(h, str) or not HOSTNAME.fullmatch(h) for h in hosts):
+            bad(f"{where}.hosts", 'a list of lowercase hostnames ("api.anthropic.com")')
+        headers = spec.get("headers")
+        if not isinstance(headers, list) or not 0 < len(headers) <= SECRET_HEADERS_MAX or any(
+                not isinstance(h, str) or not SECRET_HEADER.fullmatch(h) for h in headers):
+            # Required: without it msb substitutes into every header to those
+            # hosts, and one that reflects a header back would hand it out.
+            bad(f"{where}.headers", f"a list of 1 to {SECRET_HEADERS_MAX} header names "
+                '(like "authorization")')
+        out[ref] = {"env": env, "source": source, "hosts": list(dict.fromkeys(hosts)),
+                    "headers": list(dict.fromkeys(h.lower() for h in headers))}
+    return out
 
 
 def _settings_bad(table, key, why):
@@ -12860,6 +12962,7 @@ def client_settings(config, name, operator=None):
             if key in raw and raw[key] != fixed:
                 bad(key, f"fixed for Kandev at {toml_literal(fixed)} (protocol 1 does not change)")
         out.update({k: (list(v) if isinstance(v, list) else v) for k, v in KANDEV_FIXED.items()})
+        out["host_secrets"] = host_secrets_setting(table, raw.get("host_secrets", {}), out["env_prefix"])
         return out
 
     prefix = raw["name_prefix"] if "name_prefix" in raw else default_client_prefix(name)
@@ -12897,6 +13000,7 @@ def client_settings(config, name, operator=None):
             bad("body_secret_hosts", f"{host} is in none of allow_extra, rule_groups or private_names: "
                 "a placeholder may only travel to a host this client can reach")
     out["body_secret_hosts"] = list(hosts)
+    out["host_secrets"] = host_secrets_setting(table, raw.get("host_secrets", {}), env_prefix)
     return out
 
 
@@ -13327,6 +13431,11 @@ def kandev_record(name, entry, table=None, live=False, client=False):
         "generation": int(entry.get("generation", 0)),
         "ports": {str(g): h for g, h in sorted(ports.items())},
         "agentctl": {"running": running, "sha256": entry.get("agentctl_sha256", "")},
+        # Protocol 2's, where it binds any: by ref, as the host declared them.
+        **({"host_secrets": [{"name": binding_var(spec), "host_ref": ref} for ref, spec in
+                             zip(entry.get("host_secrets", []), entry.get("host_secret_binds", []),
+                                 strict=False)]}
+           if client and entry.get("host_secrets") else {}),
     }}
 
 
@@ -13488,6 +13597,135 @@ def managed_llm_env(entry):
         raise KandevError("unavailable", f"the operator's key for {', '.join(missing)} is not stored "
                           "on this host any more")
     return values
+
+
+def _host_secret_file(path):
+    """The one line in a host secret's file, or None: a regular file of this
+    user's, no wider than 0600 (a wider one is refused, never fixed)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK)
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_mode & 0o077 \
+                or st.st_size > HOST_SECRET_FILE_MAX:
+            return None
+        data = fh.read(HOST_SECRET_FILE_MAX + 1)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def host_secret_value(spec):
+    """A host secret's value, read now from its source, or None. Never
+    cached, never written: it lives in the one msb process it is for."""
+    kind, *where = spec["source"]
+    if kind == "file":
+        value = _host_secret_file(where[0])
+    else:
+        proc = _secret_tool(["lookup", "service", where[0], "username", where[1]])
+        value = proc.stdout if proc and proc.returncode == 0 else None
+    if value is None:
+        return None
+    value = value.removesuffix("\n").removesuffix("\r")
+    if not value or len(value) > 8192 or re.search(r"[\0\r\n]", value):
+        return None
+    return value
+
+
+def host_secret_available(spec):
+    """Whether a source has a value to give, asked without reading a
+    keyring's secret (`search` lists a locked item and never prompts), so
+    `health` never brings up an unlock prompt."""
+    kind, *where = spec["source"]
+    if kind == "file":
+        return host_secret_value(spec) is not None
+    proc = _secret_tool(["search", "service", where[0], "username", where[1]])
+    return bool(proc and proc.returncode == 0 and proc.stdout.lstrip().startswith("["))
+
+
+def host_secret_spec(ref, spec):
+    """The binding as msb takes it (secret_bind_spec()), headers always scoped."""
+    return secret_bind_spec(spec["env"], spec["hosts"], spec["headers"])
+
+
+def host_secret_values(refs, settings):
+    """{env: value} for these refs, read now. One that cannot be read fails
+    the verb with host_secret_unavailable naming the ref alone: never its
+    path, its keyring item, or why, which are the host's."""
+    out = {}
+    for ref in refs:
+        value = host_secret_value(settings["host_secrets"][ref])
+        if value is None:
+            raise KandevError("host_secret_unavailable", f"host secret {ref!r} cannot be read on this host")
+        out[settings["host_secrets"][ref]["env"]] = value
+    return out
+
+
+def managed_host_refs(raw, settings, dialect):
+    """Split a request's `secrets` into the client's own items and the refs
+    to the host's: an item with `host_ref` carries no value, names the env
+    the host declares for it and, if it states hosts or headers at all,
+    exactly the host's (as sets; never narrowed or widened). Protocol 1 has
+    no host secrets: its items all go to kandev_bound_values(), which wants
+    a value."""
+    if dialect.protocol != 2 or not isinstance(raw, list):
+        return raw, []
+    own, refs = [], []
+    declared = settings.get("host_secrets", {})
+    for item in raw:
+        if not isinstance(item, dict) or "host_ref" not in item:
+            own.append(item)
+            continue
+        ref, name = item["host_ref"], item.get("name")
+        if "value" in item:
+            raise KandevError("invalid_config", f"secret {name!r}: value and host_ref together")
+        if not isinstance(ref, str) or ref not in declared:
+            raise KandevError("invalid_config", f"host_ref {str(ref)[:64]!r}: this host declares no such "
+                              f"host secret for {dialect.owner}")
+        spec = declared[ref]
+        if ref in refs:
+            raise KandevError("invalid_config", f"host_ref {ref!r} is given twice")
+        if name != spec["env"]:
+            raise KandevError("invalid_config", f"host_ref {ref!r}: its name is {spec['env']} on this host")
+        hosts, headers = item.get("hosts"), item.get("headers")
+        if hosts is not None and (not isinstance(hosts, list) or any(not isinstance(h, str) for h in hosts)
+                                  or set(hosts) != set(spec["hosts"])):
+            raise KandevError("invalid_config", f"host_ref {ref!r}: its hosts are the host's "
+                              f"({', '.join(spec['hosts'])}), not the request's")
+        if headers is not None and (
+                not isinstance(headers, list) or any(not isinstance(h, str) for h in headers)
+                or {h.lower() for h in headers} != set(spec["headers"])):
+            raise KandevError("invalid_config", f"host_ref {ref!r}: its headers are the host's "
+                              f"({', '.join(spec['headers'])}), not the request's")
+        refs.append(ref)
+    return own, refs
+
+
+def managed_host_secret_doc(settings):
+    """What `health` says of each host secret: never a value or a source."""
+    return [{"ref": ref, "env": spec["env"], "hosts": list(spec["hosts"]),
+             "headers": list(spec["headers"]), "available": host_secret_available(spec)}
+            for ref, spec in settings.get("host_secrets", {}).items()]
+
+
+def managed_host_secrets_held(entry, settings, dialect):
+    """The refs a sandbox binds, checked against the host's declarations
+    now: one removed, or changed since provision (msb keeps the binding it
+    was created with, so a narrowed one would not reach it), refuses the
+    start (host_secret_changed: purge and provision again) rather than run
+    on the old scope."""
+    refs = entry.get("host_secrets", [])
+    recorded = dict(zip(refs, entry.get("host_secret_binds", []), strict=False))
+    declared = settings.get("host_secrets", {})
+    changed = [r for r in refs if r not in declared or host_secret_spec(r, declared[r]) != recorded.get(r)]
+    if changed:
+        raise KandevError("host_secret_changed", f"this sandbox binds host secret {', '.join(changed)}, "
+                          "which this host "
+                          f"no longer declares for {dialect.owner} as it was: provision it again")
+    return refs
 
 
 # ------------------------------------------------- a client's intercept log
@@ -14675,9 +14913,16 @@ def managed_provision(args, config, settings, dialect):
     expires = parse_iso(req.get("expires_at"), "expires_at")
     if expires <= utc_now():
         raise KandevError("invalid_config", "expires_at is in the past")
-    values, bindings = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
+    own, refs = managed_host_refs(req.get("secrets"), settings, dialect)
+    values, bindings = kandev_bound_values(own, env_prefix=dialect.env_prefix)
     if any(not hosts for _, hosts, _ in bindings):
         raise KandevError("invalid_config", "every secret needs the hosts it may be sent to")
+    # The host's own secrets it named: bound with the host's hosts and headers.
+    host_envs = [settings["host_secrets"][r]["env"] for r in refs]
+    if set(host_envs) & set(values):
+        raise KandevError("invalid_config", f"secret {sorted(set(host_envs) & set(values))[0]} is also a "
+                          "host secret's")
+    host_binds = [host_secret_spec(r, settings["host_secrets"][r]) for r in refs]
     guest_env = req.get("env") or []
     if not isinstance(guest_env, list):
         raise KandevError("invalid_config", "env must be a list")
@@ -14686,7 +14931,7 @@ def managed_provision(args, config, settings, dialect):
         if not isinstance(item, dict) or not isinstance(item.get("value"), str):
             raise KandevError("invalid_config", "each env item is {name, value}")
         problem = kandev_name_problem(item.get("name"), dialect.env_prefix)
-        if problem or item["name"] in values:
+        if problem or item["name"] in values or item["name"] in host_envs:
             raise KandevError("invalid_config", f"env {problem or item['name'] + ' is also a secret'}")
         if "\n" in item["value"] or "\0" in item["value"] or len(item["value"]) > 4096:
             raise KandevError("invalid_config", f"env {item['name']}: one line of at most 4096 characters")
@@ -14732,6 +14977,9 @@ def managed_provision(args, config, settings, dialect):
     llm_binds = [f"{llm_key_var(n)}@{host}" for n, _, host, _ in llms if llm_key_var(n) in held]
     upstream_ca = managed_upstream_ca(req.get("upstream_ca"), settings, req.get("egress_allow"),
                                       callback[0] if callback else None, config)
+    # Read last, after every check, and before anything is written: a source
+    # with no value fails the provision with nothing made.
+    host_values = host_secret_values(refs, settings)
 
     with kandev_lock():
         table = msb_table()
@@ -14773,7 +15021,9 @@ def managed_provision(args, config, settings, dialect):
             PRIVATE=f"private_names = {toml_literal(private)}",
             HOST_HELD="\n".join((f"llms = {toml_literal([n for n, *_ in llms])}",
                                  f"llm_binds = {toml_literal(llm_binds)}",
-                                 f"upstream_ca = {toml_literal(sorted(upstream_ca))}")))
+                                 f"upstream_ca = {toml_literal(sorted(upstream_ca))}",
+                                 f"host_secrets = {toml_literal(refs)}",
+                                 f"host_secret_binds = {toml_literal(host_binds)}")))
         # The entry FIRST: a crash between here and the end leaves something
         # `reap` finds, never a VM nobody knows about. Kandev's entries keep
         # their own form (source = "kandev"), whichever protocol made them.
@@ -14814,7 +15064,10 @@ def managed_provision(args, config, settings, dialect):
     argv += ["--tls-intercept"]
     # A secret on another port needs interception there too (secret_ports()).
     # The flag REPLACES msb's default of 443, so 443 is always restated.
-    extra_ports = secret_ports(egress, bindings, [port for *_, port in llms])
+    extra_ports = secret_ports(egress, bindings + [(settings["host_secrets"][r]["env"],
+                                                    settings["host_secrets"][r]["hosts"], [])
+                                                   for r in refs],
+                               [port for *_, port in llms])
     for port in [443, *extra_ports] if extra_ports else []:
         argv += ["--tls-intercept-port", str(port)]
     # Each CA trusted for its one host, never VM-wide.
@@ -14839,14 +15092,14 @@ def managed_provision(args, config, settings, dialect):
     # An endpoint it uses receives the agent's whole transcript, so the
     # placeholders in it too: each joins every binding's passthrough.
     transcript = [host for _, _, host, _ in llms]
-    for spec in binds + llm_binds:
+    for spec in binds + llm_binds + host_binds:
         argv += ["--secret", body_passthrough(spec, dialect, transcript)]
-    if binds or llm_binds:
+    if binds or llm_binds or host_binds:
         argv += ["--secret-violation-action", "block-and-log"]
     for label in owner_labels(dialect.client, env):
         argv += ["--label", label]
     argv += ["--max-duration", f"{seconds}s", image]
-    proc = run(argv, env={**values, **held}, check=False, quiet=True)
+    proc = run(argv, env={**values, **held, **host_values}, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb create failed — the entry is left for reap or destroy")
     entry = read_toml(registry_path_for(name))
@@ -14953,9 +15206,10 @@ def managed_start(args, config, settings, dialect):
         # VM, so revoking it is refusing to start or refresh one that uses it.
         raise KandevError("denied", f"this sandbox uses {', '.join(gone)}, which {dialect.owner} is no "
                           f"longer granted ([{settings.get('table', 'kandev')}] llms)")
+    refs = managed_host_secrets_held(entry, settings, dialect)
     if state_of(name) == "running":
         if dialect.protocol == 2 and req.get("secrets"):
-            managed_rotate(name, entry, req, dialect)
+            managed_rotate(name, entry, req, settings, dialect)
         return record(name, entry)
     if state_of(name) == "absent":
         raise KandevError("not_found", "the sandbox's VM is gone")
@@ -14964,12 +15218,8 @@ def managed_start(args, config, settings, dialect):
         # sandbox, so revoking it is refusing to start one that has it.
         raise KandevError("denied", f"this sandbox has /dev/kvm, which {dialect.owner} is no longer "
                           f"allowed ([{settings.get('table', 'kandev')}] allow_nested_virt)")
-    given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
-    bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
-    if sorted(given) != sorted(bound):
-        # Never a half-bound start: a missing value would reach the guest's
-        # requests as the literal placeholder.
-        raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
+    given = managed_start_secrets(entry, req, settings, dialect)
+    given.update(host_secret_values(refs, settings))
     proc = run(["msb", "start", name], env={**given, **managed_llm_env(entry)}, check=False, quiet=True)
     if proc.returncode != 0:
         raise KandevError("unavailable", "msb start failed")
@@ -14979,7 +15229,25 @@ def managed_start(args, config, settings, dialect):
     return record(name, read_toml(registry_path_for(name)))
 
 
-def managed_rotate(name, entry, req, dialect):
+def managed_start_secrets(entry, req, settings, dialect):
+    """{name: value} of the client's own secrets a start sends: exactly
+    those the sandbox binds. Its host secrets' items may be left out, or
+    sent as at provision (each one the sandbox binds, as the host declares
+    it); their values are the host's to read."""
+    own, refs = managed_host_refs(req.get("secrets"), settings, dialect)
+    stray = [r for r in refs if r not in entry.get("host_secrets", [])]
+    if stray:
+        raise KandevError("invalid_config", f"host_ref {stray[0]!r}: this sandbox does not bind it")
+    given, _ = kandev_bound_values(own, env_prefix=dialect.env_prefix)
+    bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
+    if sorted(given) != sorted(bound):
+        # Never a half-bound start: a missing value would reach the guest's
+        # requests as the literal placeholder.
+        raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
+    return given
+
+
+def managed_rotate(name, entry, req, settings, dialect):
     """Protocol 2's `start` of a running sandbox, with its secrets: the new
     values reach it live, as rotate_running() does for the operator's, so a
     rotated token needs no restart. Exactly the secrets it binds, as at
@@ -14988,13 +15256,13 @@ def managed_rotate(name, entry, req, dialect):
     (msb 0.7.9+). The operator's endpoint keys are sent along, as stored
     now, so a key the operator replaced arrives too. All in one `msb
     modify`, the values in its environment only; a refusal is an error,
-    never a success that kept the old ones."""
-    given, _ = kandev_bound_values(req.get("secrets"), env_prefix=dialect.env_prefix)
-    bound = [binding_var(spec) for spec in entry.get("secret_binds", [])]
-    if sorted(given) != sorted(bound):
-        raise KandevError("invalid_config", "start needs exactly the secrets the sandbox binds")
-    given = {**given, **managed_llm_env(entry)}
-    bound += [binding_var(spec) for spec in entry.get("llm_binds", [])]
+    never a success that kept the old ones. Host secrets likewise, read
+    from their sources now."""
+    given = managed_start_secrets(entry, req, settings, dialect)
+    given.update(host_secret_values(entry.get("host_secrets", []), settings))
+    given.update(managed_llm_env(entry))
+    bound = [binding_var(spec) for key in ("secret_binds", "llm_binds", "host_secret_binds")
+             for spec in entry.get(key, [])]
     held = msb_secret_hosts(name) or {}
     argv = ["msb", "modify", name]
     for var in bound:
@@ -15581,7 +15849,8 @@ def managed_health(args, config, settings, dialect):
                             "tls": tls_holder(config) == dialect.client,
                             "allow_upstream_ca": settings["allow_upstream_ca"],
                             "llms": [managed_llm_doc(n, llm_endpoints(config)[n])
-                                     for n in settings["llms"]]}})
+                                     for n in settings["llms"]]},
+        "host_secrets": managed_host_secret_doc(settings)})
     totals = {k: settings[f"host_{k}"] for k in ("max_sandboxes", "max_cpus", "max_memory_mib")}
     if any(v is not None for v in totals.values()):
         count, cpus, mem = managed_usage(msb_table())
