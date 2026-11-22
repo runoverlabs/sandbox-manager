@@ -12641,12 +12641,13 @@ HOST_SECRET_FILE_MAX = 16 * 1024
 
 
 def host_secret_source(text):
-    """("file", path) or ("keyring", service, username) from a `source`, or None."""
+    """("file", path, "") or ("keyring", service, username) from a `source`,
+    or None: always three, so every reader unpacks one shape."""
     if not isinstance(text, str):
         return None
     if text.startswith("file:"):
         path = os.path.expanduser(text[len("file:"):])
-        return ("file", os.path.normpath(path)) if os.path.isabs(path) and "\0" not in path else None
+        return ("file", os.path.normpath(path), "") if os.path.isabs(path) and "\0" not in path else None
     found = HOST_SECRET_KEYRING.fullmatch(text)
     return ("keyring", found.group(1), found.group(2)) if found else None
 
