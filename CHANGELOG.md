@@ -8,6 +8,9 @@ release notes.
 
 ## [Unreleased]
 
+### Added
+- A managed client's request may bind a secret the host holds by name, without its value (`{"name", "host_ref"}`): `[clients.NAME.host_secrets.REF]` declares its `env`, its `source` (a `0600` file or a keyring item) and the only `hosts` and `headers` it is sent to, which a request cannot change. The value is read at every provision and start; a source with none answers `host_secret_unavailable`, and a start after the declaration changed answers `host_secret_changed` (purge and provision again). `health` lists each one (never its value or source) with the `host_secrets` feature.
+
 ## [0.13.0] - 2026-11-20
 
 ### Added

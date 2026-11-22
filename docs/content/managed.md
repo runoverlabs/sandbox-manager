@@ -51,6 +51,7 @@ key could not get past.
 | Egress | the ceiling: `rule_groups`, `allow_extra`, `private_names` (`["*"]` hands over all of it) | `egress_allow`, `private_names`, `callback`, within the ceiling | only what the sandbox allows |
 | The client's own secrets | – | values, hosts, and the only `headers` they go in; a new value live | holds a placeholder; the value goes into headers to those hosts alone |
 | Placeholders in bodies | `body_secret_hosts` | – | sent only there, never anywhere else |
+| Secrets the host holds | `host_secrets`: each one's source, `env`, `hosts` and `headers` | names one (`host_ref`), never its value; cannot change where it goes | holds a placeholder; the value goes into those headers to those hosts alone |
 | Model endpoints | `[llm.<name>]`: host, port, CA, private name and key, all stored here; `llms` grants them | picks granted ones (`llms`) | reaches them; never sees the key |
 | Trusting a CA | `allow_upstream_ca` (on); never for an endpoint whose key it holds | sends one for its own hosts (`upstream_ca`) | – |
 | `/dev/kvm` | `allow_nested_virt` | asks for it (`nested_virt`) | gets it only then |
@@ -117,6 +118,7 @@ groups, and is off until `enabled = true`.
 | `tls` | `false` | whether its key may install the proxy's certificate; see [below](#the-proxys-certificate). One client at most, and never set in Kandev's table |
 | `llms` | `[]` | `[llm.<name>]` endpoints of this host its provisions may pick; see [below](#model-endpoints) |
 | `allow_upstream_ca` | `true` | whether its provisions may send a CA to trust for one of their own hosts; see [below](#a-servers-own-ca) |
+| `host_secrets` | none | secrets this host holds that its provisions may bind by name, one `[clients.NAME.host_secrets.REF]` table each; see [below](#secrets-the-host-holds) |
 | `log_level` | unset | msb's `--log-level` for each sandbox it provisions: `error`, `warn`, `info`, `debug` or `trace`, written to that sandbox's `runtime.log` (at `debug` and `trace`, the intercept lines msbctl [keeps](#where-its-sandboxes-went)). msb keeps it for the sandbox's life, so a change reaches only sandboxes provisioned after it. Unset, no flag is passed and msb's own default holds. Kandev's table may set it too |
 
 Kandev's own table is `[kandev]`, or `[clients.kandev]`, but not both. Its
@@ -234,6 +236,59 @@ and a provision that names it (`"llms": ["qwen"]`) gets everything it takes:
 a path. Naming one that is not granted is `denied`; once a grant is revoked, a
 sandbox that uses it is refused `start`.
 
+## Secrets the host holds
+
+Some secrets a client must never hold. On an employee's laptop, the agent runs
+on the employee's own Claude subscription (`claude setup-token`), and those
+terms let no third party collect, store or pass the token on. So the host
+holds it and declares it, and a client's request names it without a value:
+
+```toml
+[clients.ci.host_secrets.claude]
+env     = "CLAUDE_CODE_OAUTH_TOKEN"            # the placeholder's name in the guest
+source  = "file:~/.config/runner/claude.token" # or "keyring:runner/claude"
+hosts   = ["api.anthropic.com"]                # where it is sent: the host's, not the client's
+headers = ["authorization"]                    # the only headers it goes in: required
+```
+
+`source` is a file, a regular one of this user's with mode `0600` or tighter
+(one line; a wider mode is refused, not fixed), or a keyring item with the
+attributes `service` and `username`, as Python's `keyring` and Go's
+`go-keyring` store them (or `secret-tool store --label=claude service runner
+username claude`). The value is read at every provision,
+`start` and live rotation, into the one `msb` process that needs it, and kept
+nowhere: not in the registry entry, not on the client's side.
+
+A provision binds it with `{"name": "CLAUDE_CODE_OAUTH_TOKEN", "host_ref":
+"claude"}` among its `secrets`:
+
+- `name` must be the `env` declared for that ref. A value with it is refused.
+- `hosts` and `headers` may be left out. Given, they must be exactly the
+  declared ones (in any order, headers in any case): otherwise a client could
+  have the token substituted toward its own server and read it back. Anything
+  else is `invalid_config`, never narrowed or widened.
+- A source with no value to give (missing, wrong mode, empty, the keyring has
+  no such item) is `host_secret_unavailable`, naming the ref and never the
+  path, and nothing is created or started.
+- A `start` may leave the ref out or send it as at provision. If the
+  declaration is gone, or its `env`, `hosts` or `headers` changed since
+  provision (msb keeps the binding it was created with), `start` answers
+  `host_secret_changed`, not `denied`: purge the sandbox and provision it
+  again.
+
+`env` may be any name the host declares, `CLAUDE_CODE_OAUTH_TOKEN` included,
+though that name and `ANTHROPIC_AUTH_TOKEN` stay reserved for a client's own
+secrets. It may not be one that changes how `msb` runs (`PATH`, `HOME` and the
+like, `MSB_`, `MSBCTL_`, `LD_`, `SSH_`, `XDG_`, `LC_`), an endpoint key
+(`LLM_KEY_`), or the client's `env_prefix`.
+
+`health` lists the feature `host_secrets`, and each declared one under
+`host_secrets`: `ref`, `env`, `hosts`, `headers` and `available`, whether its
+source has a value now (a keyring is asked without unlocking it). Never the
+value or the source. A record lists what it binds as `host_secrets`: `[{"name",
+"host_ref"}]`. Unlike a client's own secrets, which the host keeps no value of
+while a sandbox is stopped, a host secret stays where its owner keeps it.
+
 ## A server's own CA
 
 Every sandbox's HTTPS goes through msb's interceptor, which checks the server's
@@ -303,7 +358,8 @@ differences:
   `require_callback`, `body_secret_hosts`, `allow_nested_virt`, `tls`: whether
   this key installs the certificate, `allow_upstream_ca`, and `llms`, the
   [model endpoints](#model-endpoints) granted), the features `secret_headers`,
-  `live_secrets`, `llms`, `upstream_ca` and `secret_ports`, and `host_capacity` when
+  `live_secrets`, `llms`, `upstream_ca`, `secret_ports` and `host_secrets`,
+  `host_secrets` ([the host's own](#secrets-the-host-holds)), and `host_capacity` when
   `[managed]` sets totals. Its capacity, egress and proxy ports are the
   client's own. A client with no table answers `enabled: false`.
 - `provision` takes an optional `callback` `{host, port}` (`kandev_api` is the
@@ -348,6 +404,7 @@ differences:
   restarted: a rotated token reaches it now, not at its next start. Each
   binding keeps its hosts and header scope. A refusal is `unavailable`, and
   the sandbox keeps the old values; with no secrets, `start` answers as before.
+  Its [host secrets](#secrets-the-host-holds) are read again from their sources.
   Protocol 1's `start` still answers a running sandbox without touching it.
 - `tls install` is only the key's of the client [given it](#the-proxys-certificate).
   `restart-proxy` and `self-update` are not here: they act for the whole host,

@@ -2282,5 +2282,205 @@ class SecretPorts(ManagedTest):
         self.assertEqual(create_flags(self.msb_calls("create")[0]["argv"], "--tls-intercept-port"), [])
 
 
+PLANTED_HOST = "planted-host-subscription-token"
+CLAUDE_REF = {"name": "CLAUDE_CODE_OAUTH_TOKEN", "host_ref": "claude"}
+
+
+class HostSecrets(ManagedTest):
+    """[clients.NAME.host_secrets.REF]: a secret the host holds, bound into a
+    client's sandbox by ref, whose value the client never sees, and whose
+    hosts and headers the client cannot change."""
+
+    env_keys = ("NPM_TOKEN", "LLM_KEY", "CLAUDE_CODE_OAUTH_TOKEN")
+
+    def setUp(self):
+        # Outside self.tmp, so assert_nowhere_on_disk() looks everywhere else.
+        where = tempfile.mkdtemp(prefix="msbctl-hostsecret-")
+        self.addCleanup(shutil.rmtree, where, True)
+        self.token = os.path.join(where, "claude.token")
+        self.write_token(PLANTED_HOST)
+        self.ci_table = CI + self.declare()
+        super().setUp()
+
+    def declare(self, **over):
+        spec = {"env": '"CLAUDE_CODE_OAUTH_TOKEN"', "source": f'"file:{self.token}"',
+                "hosts": '["api.anthropic.com"]', "headers": '["authorization"]'}
+        spec.update(over)
+        return "\n[clients.ci.host_secrets.claude]\n" + "".join(
+            f"{k} = {v}\n" for k, v in spec.items() if v is not None)
+
+    def write_token(self, value, mode=0o600):
+        with open(self.token, "w", encoding="utf-8") as fh:
+            fh.write(value + "\n")
+        os.chmod(self.token, mode)
+
+    def secrets(self, *extra):
+        return [{"name": "LLM_KEY", "value": PLANTED_CI, "hosts": ["llm.example.org"]}, *extra]
+
+    def start_input(self, *extra):
+        return json.dumps({"secrets": self.secrets(*extra)}) + "\n"
+
+    def test_bound_by_ref_the_value_read_on_the_host(self):
+        rec = self.ci_provision(secrets=self.secrets(CLAUDE_REF))
+        call = self.msb_calls("create")[0]
+        self.assertEqual(create_flags(call["argv"], "--secret"), [
+            "LLM_KEY:passthrough=[llm.example.org]@llm.example.org",
+            "CLAUDE_CODE_OAUTH_TOKEN:headers=[authorization],passthrough=[llm.example.org]@api.anthropic.com"])
+        self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], PLANTED_HOST)
+        self.assert_not_in_argv(PLANTED_HOST)
+        self.assert_nowhere_on_disk(PLANTED_HOST)
+        self.assertEqual(rec["host_secrets"], [{"name": "CLAUDE_CODE_OAUTH_TOKEN", "host_ref": "claude"}])
+        entry = self.m.read_toml(self.entry_path("c-e1"))
+        self.assertEqual((entry["host_secrets"], entry["host_secret_binds"], entry["secret_binds"]), (
+            ["claude"], ["CLAUDE_CODE_OAUTH_TOKEN:headers=[authorization]@api.anthropic.com"],
+            ["LLM_KEY@llm.example.org"]))
+        # Stated as the host declares it (in any order, any case of header): the same.
+        self.ci_provision("e2", operation_id="op-c2", secrets=self.secrets(
+            {**CLAUDE_REF, "hosts": ["api.anthropic.com"], "headers": ["Authorization"]}))
+        self.assertEqual(self.msb_calls("create")[1]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], PLANTED_HOST)
+
+    def test_without_a_ref_nothing_of_it(self):
+        rec = self.ci_provision()
+        self.assertNotIn("host_secrets", rec)
+        self.assertNotIn("CLAUDE_CODE_OAUTH_TOKEN", self.msb_calls("create")[0]["env"])
+
+    def test_what_a_request_may_not_change(self):
+        for label, item in (
+                ("wider hosts", {**CLAUDE_REF, "hosts": ["api.anthropic.com", "evil.example.org"]}),
+                ("other hosts", {**CLAUDE_REF, "hosts": ["evil.example.org"]}),
+                ("fewer headers", {**CLAUDE_REF, "headers": []}),
+                ("wider headers", {**CLAUDE_REF, "headers": ["authorization", "x-echo"]}),
+                ("a value too", {**CLAUDE_REF, "value": "x"}),
+                ("another name", {**CLAUDE_REF, "name": "MY_TOKEN"}),
+                ("no such ref", {**CLAUDE_REF, "host_ref": "nope"}),
+                ("not a string", {**CLAUDE_REF, "host_ref": ["claude"]})):
+            with self.subTest(label):
+                self.ci_error("invalid_config", "managed", "provision", "e1",
+                              stdin=ci_request(secrets=self.secrets(item)))
+        self.ci_error("invalid_config", "managed", "provision", "e1",
+                      stdin=ci_request(secrets=self.secrets(CLAUDE_REF, CLAUDE_REF)))
+        # Its env is still reserved for a client's OWN secret.
+        self.ci_error("invalid_config", "managed", "provision", "e1", stdin=ci_request(secrets=self.secrets(
+            {"name": "CLAUDE_CODE_OAUTH_TOKEN", "value": "x", "hosts": ["evil.example.org"]})))
+        self.assertEqual(self.msb_calls("create"), [])
+        self.assertFalse(os.path.exists(self.entry_path("c-e1")))
+
+    def test_protocol_1_has_none(self):
+        self.ci_table = CI + self.declare().replace("clients.ci", "kandev")
+        self.configure()
+        self.error("invalid_config", "provision", "6f1c2b9e", stdin=request(
+            secrets=[{"name": "CLAUDE_CODE_OAUTH_TOKEN", "host_ref": "claude"}]))
+        self.assertNotIn("host_secrets", self.ok("health")["features"])
+
+    def test_an_unreadable_source_starts_nothing_and_names_no_path(self):
+        for label, prepare in (("missing", lambda: os.remove(self.token)),
+                               ("group-readable", lambda: self.write_token(PLANTED_HOST, 0o640)),
+                               ("empty", lambda: self.write_token("")),
+                               ("two lines", lambda: self.write_token("a\nb"))):
+            with self.subTest(label):
+                prepare()
+                error = self.ci_error("host_secret_unavailable", "managed", "provision", "e1",
+                                      stdin=ci_request(secrets=self.secrets(CLAUDE_REF)))
+                self.assertIn("claude", error["message"])
+                self.assertNotIn(self.token, error["message"])
+                self.assertEqual(self.msb_calls("create"), [])
+                self.assertFalse(os.path.exists(self.entry_path("c-e1")))
+                self.write_token(PLANTED_HOST)
+
+    def test_health_lists_it_without_its_value_or_source(self):
+        doc = self.ci_ok("managed", "health")
+        self.assertIn("host_secrets", doc["features"])
+        self.assertEqual(doc["host_secrets"], [{
+            "ref": "claude", "env": "CLAUDE_CODE_OAUTH_TOKEN", "hosts": ["api.anthropic.com"],
+            "headers": ["authorization"], "available": True}])
+        self.assertNotIn(PLANTED_HOST, json.dumps(doc))
+        self.assertNotIn(self.token, json.dumps(doc))
+        os.remove(self.token)
+        self.assertFalse(self.ci_ok("managed", "health")["host_secrets"][0]["available"])
+
+    def test_start_reads_it_again(self):
+        self.ci_provision(secrets=self.secrets(CLAUDE_REF))
+        self.ci_ok("stop", "c-e1", "--json")
+        self.write_token(PLANTED_HOST + "-new")
+        # The ref may be left out of a start, or sent as at provision.
+        self.ci_ok("managed", "start", "e1", stdin=self.start_input())
+        self.assertEqual(self.msb_calls("start")[-1]["env"]["CLAUDE_CODE_OAUTH_TOKEN"], PLANTED_HOST + "-new")
+        self.ci_ok("stop", "c-e1", "--json")
+        self.ci_ok("managed", "start", "e1", stdin=self.start_input(CLAUDE_REF))
+        self.ci_ok("stop", "c-e1", "--json")
+        starts = len(self.msb_calls("start"))
+        os.remove(self.token)
+        self.ci_error("host_secret_unavailable", "managed", "start", "e1", stdin=self.start_input())
+        self.assertEqual(len(self.msb_calls("start")), starts)
+
+    def test_a_start_cannot_add_or_change_one(self):
+        self.ci_provision()
+        self.ci_ok("stop", "c-e1", "--json")
+        self.ci_error("invalid_config", "managed", "start", "e1", stdin=self.start_input(CLAUDE_REF))
+        self.ci_error("invalid_config", "managed", "start", "e1", stdin=self.start_input(
+            {**CLAUDE_REF, "hosts": ["evil.example.org"]}))
+
+    def test_a_declaration_changed_or_gone_refuses_the_start(self):
+        self.ci_provision(secrets=self.secrets(CLAUDE_REF))
+        self.ci_ok("stop", "c-e1", "--json")
+        for label, table in (("narrowed", CI + self.declare(headers='["x-api-key"]')),
+                             ("gone", CI)):
+            with self.subTest(label):
+                self.ci_table = table
+                self.configure()
+                # Not `denied`, which a client takes as final: it purges and provisions again.
+                self.assertIn("claude", self.ci_error("host_secret_changed", "managed", "start", "e1",
+                                                      stdin=self.start_input())["message"])
+                self.assertEqual(len(self.msb_calls("start")), 0)
+
+    def test_rotation_brings_the_current_value(self):
+        self.ci_provision(secrets=self.secrets(CLAUDE_REF))
+        self.write_token(PLANTED_HOST + "-new")
+        self.ci_ok("managed", "start", "e1", stdin=self.start_input())
+        [call] = self.msb_calls("modify")
+        self.assertEqual(call["argv"][-2:], ["--secret", "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com"])
+        self.assertEqual(call["env"]["CLAUDE_CODE_OAUTH_TOKEN"], PLANTED_HOST + "-new")
+
+    def test_declarations_are_checked(self):
+        for label, over, words in (
+                ("no headers", {"headers": None}, "headers"),
+                ("empty headers", {"headers": "[]"}, "headers"),
+                ("no hosts", {"hosts": None}, "hosts"),
+                ("a relative file", {"source": '"file:claude.token"'}, "source"),
+                ("another scheme", {"source": '"env:CLAUDE"'}, "source"),
+                ("PATH", {"env": '"PATH"'}, "env"),
+                ("LD_", {"env": '"LD_PRELOAD"'}, "env"),
+                ("an endpoint key", {"env": '"LLM_KEY_QWEN"'}, "env"),
+                ("the client's prefix", {"env": '"CI_TOKEN"'}, "env"),
+                ("an unknown key", {"value": '"x"'}, "value")):
+            with self.subTest(label):
+                self.ci_table = CI + self.declare(**over)
+                self.configure()
+                message = self.ci_error("invalid_config", "managed", "health")["message"]
+                self.assertIn(words, message)
+                self.assertNotIn(self.token, message)
+
+    def test_a_keyring_source(self):
+        spec = {"env": "T", "source": self.m.host_secret_source("keyring:runner/claude"),
+                "hosts": ["api.anthropic.com"], "headers": ["authorization"]}
+        self.assertEqual(spec["source"], ("keyring", "runner", "claude"))
+        calls = []
+
+        def tool(argv, value=""):
+            calls.append(argv)
+            out = "[/org/freedesktop/secrets/collection/login/7]\n" if argv[0] == "search" else PLANTED_HOST
+            return mock.Mock(returncode=0, stdout=out)
+
+        with mock.patch.object(self.m, "_secret_tool", tool):
+            self.assertEqual(self.m.host_secret_value(spec), PLANTED_HOST)
+            self.assertTrue(self.m.host_secret_available(spec))
+        # service + username: what Python's keyring and Go's go-keyring store.
+        self.assertEqual(calls, [["lookup", "service", "runner", "username", "claude"],
+                                 ["search", "service", "runner", "username", "claude"]])
+        with mock.patch.object(self.m, "_secret_tool", lambda argv, value="": None):
+            self.assertIsNone(self.m.host_secret_value(spec))
+            self.assertFalse(self.m.host_secret_available(spec))
+
+
 if __name__ == "__main__":
     main()

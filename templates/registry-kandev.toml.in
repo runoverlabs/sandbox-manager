@@ -71,6 +71,9 @@ kandev_api_ip = {{API_IP}}
 # provision picked from the client's `llms` grant (their rule, port, CA and
 # private name came from those tables), the bindings of the keys this host
 # stores for them (values read from global.env at every start, never here),
-# and the hosts the request sent a CA for (kept in the state dir until the
-# sandbox is removed).
+# the hosts the request sent a CA for (kept in the state dir until the
+# sandbox is removed), and the host secrets it named by `host_ref`
+# ([clients.NAME.host_secrets.REF]) with their bindings as declared then:
+# values read from each one's source at every start, never here, and a
+# start refused once the declaration is gone or differs.
 {{HOST_HELD}}
